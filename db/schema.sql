@@ -122,15 +122,13 @@ ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
 ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('admin','cajero','cliente'));
 
 -- 'anulada': venta cancelada a mano. Nunca se factura, no aparece en reintentos ni en reportes. No se borra la fila.
-ALTER TABLE sales DROP CONSTRAINT IF EXISTS sales_status_check;
-ALTER TABLE sales ADD CONSTRAINT sales_status_check
-  CHECK (status IN ('pending','invoicing','invoiced','failed','revisar','anulada'));
+-- (La restricción sales_status_check se define UNA sola vez, más abajo, con la lista completa de estados. NO volver a
+--  crearla aquí con una lista parcial: al re-ejecutar este archivo fallaría si ya hay ventas en estados nuevos.)
 
 -- Desde cuándo está en 'invoicing': si pasa de 10 min se manda a 'revisar' (servidor caído a mitad de facturar)
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS invoicing_started_at TIMESTAMPTZ;
 
-ALTER TABLE logs DROP CONSTRAINT IF EXISTS logs_type_check;
-ALTER TABLE logs ADD CONSTRAINT logs_type_check CHECK (type IN ('venta','factura','sync','login','error','admin','seguridad'));
+-- (logs_type_check: igual, se define una sola vez al final de este archivo con la lista completa de tipos.)
 
 -- ---------------------------------------------------------------------------
 -- Etapa 5B: autoservicio con pago electrónico (ePayco)

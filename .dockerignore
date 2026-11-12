@@ -1,0 +1,17 @@
+node_modules
+.next
+.git
+.gitignore
+.env*
+!.env.production.example
+*.md
+docs
+backups
+tsconfig.tsbuildinfo
+npm-debug.log*
+Dockerfile
+docker-compose.yml
+.dockerignore
+.claude
+rclone
+deploy

@@ -41,5 +41,10 @@ yarn-error.log*
 next-env.d.ts
 
 !.env.example
+!.env.production.example
 
 .claude/
+
+# respaldos y configuración de rclone del servidor (contienen datos y llaves: nunca a git)
+/backups/
+/rclone/

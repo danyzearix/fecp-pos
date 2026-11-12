@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import pg from "pg";
 
 if (!process.env.DATABASE_URL) {
-  console.error("Falta DATABASE_URL en .env.local");
+  console.error("Falta DATABASE_URL (en .env.local o en el entorno).");
   process.exit(1);
 }
 

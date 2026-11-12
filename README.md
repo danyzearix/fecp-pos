@@ -6,6 +6,10 @@ funcionamiento sin internet en la caja (las ventas se guardan en el equipo y se 
 
 **Stack:** Next.js 16 (App Router) + TypeScript + Tailwind CSS · PostgreSQL (`pg`, SQL directo) · `bcryptjs` · `jose` · `qrcode`.
 
+> **En producción** el sistema corre en un servidor con Docker detrás de Traefik, en **https://pos.fecp.me**. Todo el procedimiento
+> (instalación, comprobaciones, respaldos y restauración) está en **[DEPLOY.md](DEPLOY.md)**. Las secciones 1–6 de este README son para
+> trabajar en un equipo local de desarrollo.
+
 ---
 
 ## 1. Requisitos
@@ -121,19 +125,23 @@ Ajusta la ruta si tu Chrome está en otra carpeta.
 **Caja** (ventana propia, sin barras del navegador, e imprime la tirilla sin diálogo):
 
 ```
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --app=http://127.0.0.1:3000/caja --kiosk-printing --user-data-dir="C:\FECP-POS-Chrome"
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --app=https://pos.fecp.me/caja --kiosk-printing --user-data-dir="C:\FECP-POS-Chrome"
 ```
 
 **Autoservicio** (modo kiosco real: pantalla completa, sin barras y sin forma de salir con el mouse):
 
 ```
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --kiosk --app=http://127.0.0.1:3000/kiosco --user-data-dir="C:\FECP-KIOSCO-Chrome"
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --kiosk --app=https://pos.fecp.me/kiosco --user-data-dir="C:\FECP-KIOSCO-Chrome"
 ```
 
 Agrega `--kiosk-printing` al del autoservicio solo si pusiste `KIOSCO_IMPRESORA=true`.
 
+> **⚠ Al pasar a `https://pos.fecp.me`, todas las cajas y el kiosco deben iniciar sesión de nuevo.** La sesión (cookie) y el tema
+> claro/oscuro son por dirección: no se trasladan desde `127.0.0.1`. Sustituye los accesos directos viejos por estos y entra una vez con tu usuario
+> (en el kiosco, con el usuario del rol Cliente).
+
 Notas:
-- **Usa `127.0.0.1`, no `localhost`**: ePayco rechaza `localhost` como dirección de regreso (sección 10).
+- **Desarrollo local:** para trabajar en tu equipo usa `http://127.0.0.1:3000/caja` y `/kiosco` (la misma línea cambiando la dirección). **Usa `127.0.0.1`, no `localhost`**: ePayco rechaza `localhost` como dirección de regreso (sección 10). Con el dominio real no hay ese problema.
 - `--user-data-dir` crea un perfil aparte, así la opción se aplica aunque tengas otro Chrome abierto (si no, Chrome la ignora).
   La primera vez tendrás que iniciar sesión en ese perfil. Usa **perfiles distintos** para la caja y el kiosco: cada uno guarda su
   propia sesión (y su propio tema claro/oscuro).
@@ -267,7 +275,8 @@ Pantalla táctil para el rol **Cliente**: búsqueda por nombre/SKU, lector de c�
 | `npm run db:seed` | Crear administrador y Consumidor final |
 | `npm run report:iva` | Genera `docs/productos-iva-diferente.csv` (IVA distinto entre WooCommerce y Siigo) |
 | `npm run siigo:pruebas` | Lista los documentos de PRUEBA creados en Siigo para anularlos |
-| `npm run build` / `npm start` | Producción |
+| `npm run build` / `npm start` | Producción local (sin Docker) |
+| `deploy/backup.sh` / `deploy/restore.sh` | Respaldo y restauración en el servidor (ver [DEPLOY.md](DEPLOY.md), sección 5) |
 
 **Dejar la base en cero antes del deploy** (borra **ventas, líneas de venta, referencias de pago y logs**; conserva productos, usuarios, clientes y configuración, y reinicia la numeración `K01`/`E01`):
 
@@ -278,6 +287,8 @@ Pantalla táctil para el rol **Cliente**: búsqueda por nombre/SKU, lector de c�
 Es irreversible. Haz una copia antes si dudas (`pg_dump`). Si quieres también borrar los clientes de prueba, agrega `customers` al `TRUNCATE` (cuidado: Consumidor final lo recrea `npm run db:seed`).
 
 ## 13. Pasar a facturación y cobros reales
+
+> En el servidor las variables se editan en `.env.production` y se aplican con `docker compose up -d` (ver [DEPLOY.md](DEPLOY.md)). Los modos de prueba (`SIIGO_TEST_MODE`, `EPAYCO_TEST_MODE`) vienen en `true` por defecto.
 
 1. Completa `RESOLUCION_DIAN_*`, `NEGOCIO_*` y `POS_ADDRESS`.
 2. Confirma en **Configuración** que el vendedor y el comprobante `SIIGO_DOCUMENT_ID` existen.

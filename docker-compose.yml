@@ -1,0 +1,89 @@
+# FECP POS — despliegue detrás de Traefik (que YA corre en el servidor con network_mode host; aquí no se toca).
+#
+# SIEMPRE se usa con:  docker compose --env-file .env.production <comando>
+# (Compose NO lee .env.production solo para las ${...} de este archivo; sin --env-file saldrían vacías.
+#  Las ${VAR:?...} de abajo hacen que falle con un mensaje claro en vez de arrancar mal.)
+#
+# - No se publica ningún puerto, no hay network_mode host, ni privileged, ni docker.sock.
+# - Redes PROPIAS del POS (no se usa ninguna red existente, ni la de n8n):
+#     fecp_pos_internal  (internal: true) -> app <-> db. Sin salida a internet ni acceso desde fuera.
+#     fecp_pos_web                        -> solo la app. Traefik (en el host) llega a la app por esta red;
+#                                            también es la que usa la app para salir a Siigo/ePayco/WooCommerce.
+# - Todos los nombres llevan el prefijo fecp-pos / fecp_pos para no chocar con n8n ni Traefik.
+
+name: fecp-pos
+
+services:
+  app:
+    build: .
+    image: fecp-pos:latest
+    container_name: fecp-pos-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env.production
+    environment:
+      TZ: America/Bogota
+      # La clave se toma de .env.production (por eso POSTGRES_PASSWORD debe ser hexadecimal: va dentro de una URL).
+      DATABASE_URL: postgresql://${POSTGRES_USER:?falta POSTGRES_USER}:${POSTGRES_PASSWORD:?falta POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:?falta POSTGRES_DB}
+    networks:
+      - internal
+      - web
+    # Endurecimiento: sin capacidades de Linux ni elevación de privilegios (la app no necesita ninguna)
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Límites para no quitarle memoria a n8n (el servidor no tiene swap). En reposo la app usa ~100 MB.
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    labels:
+      - traefik.enable=true
+      # La app está en dos redes: se indica CUÁL usa Traefik para alcanzarla.
+      - traefik.docker.network=fecp_pos_web
+      - traefik.http.routers.fecp-pos-web.rule=Host(`${POS_DOMAIN:?falta POS_DOMAIN}`)
+      - traefik.http.routers.fecp-pos-web.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}
+      - traefik.http.routers.fecp-pos-web.tls=true
+      - traefik.http.routers.fecp-pos-web.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.fecp-pos-web.service=fecp-pos-web
+      - traefik.http.services.fecp-pos-web.loadbalancer.server.port=3000
+
+  db:
+    image: postgres:16-alpine
+    container_name: fecp-pos-db
+    restart: unless-stopped
+    # Zona horaria de Colombia también en la base (el código ya usa 'America/Bogota' de forma explícita en cada consulta)
+    command: ["postgres", "-c", "timezone=America/Bogota", "-c", "log_timezone=America/Bogota"]
+    environment:
+      TZ: America/Bogota
+      POSTGRES_USER: ${POSTGRES_USER:?falta POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?falta POSTGRES_DB}
+    volumes:
+      - fecp_pos_pgdata:/var/lib/postgresql/data
+    networks:
+      - internal      # SOLO la red interna: la base no está en fecp_pos_web ni en ninguna otra
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Sin "ports:" a propósito: la base no se expone ni al servidor ni a internet.
+
+networks:
+  internal:
+    name: fecp_pos_internal
+    internal: true
+  web:
+    name: fecp_pos_web
+
+volumes:
+  fecp_pos_pgdata:
+    name: fecp_pos_pgdata
