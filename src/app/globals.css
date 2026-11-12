@@ -1,26 +1,263 @@
 @import "tailwindcss";
 
+/* ===========================================================================
+   COLORES DEL SISTEMA — ÚNICO lugar donde se definen.
+   Los componentes NO escriben colores sueltos: usan las utilidades generadas
+   abajo (bg-surface, text-fg, border-line, bg-brand…), que cambian solas en
+   modo oscuro. Para agregar o ajustar un color, edítalo aquí y nada más.
+
+   Tema claro = el de la caja. Tema oscuro = clase .dark en <html>
+   (la pone el script del layout antes del primer pintado, sin parpadeo).
+   =========================================================================== */
+
+/* El modo oscuro se activa por CLASE (.dark en <html>), no por el tema del sistema:
+   la preferencia es por dispositivo y se guarda en localStorage. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: light;
+
+  /* --- Superficies --- */
+  --app: #f3f4f6; /* fondo de la página */
+  --surface: #ffffff; /* tarjetas, tablas, modales, barras */
+  --subtle: #f9fafb; /* encabezados de tabla y zonas suaves */
+  --hover: #f3f4f6; /* fondo al pasar el mouse / tocar */
+  --line: #e5e7eb; /* bordes y separadores */
+  --field: #d1d5db; /* borde de campos de formulario */
+
+  /* --- Texto (nada visible por debajo de #6b7280, salvo placeholders) --- */
+  --fg: #1f2937; /* texto principal */
+  --body: #374151; /* etiquetas */
+  --soft: #4b5563; /* valores y textos de apoyo */
+  --dim: #6b7280; /* secundario (el más claro permitido) */
+  --faint: #9ca3af; /* SOLO placeholders y pistas */
+
+  /* --- Marca --- */
+  --brand: #1a73e8; /* fondos y bordes azules (siempre con texto blanco) */
+  --brand-text: #1a73e8; /* títulos, enlaces y acentos sobre superficies */
+  --brand-soft: #eff6ff; /* avisos y chips azules */
+  --brand-line: #bfdbfe;
+  --brand-ink: #1e3a8a; /* texto dentro de un aviso azul */
+
+  /* --- Acción principal (verde) --- */
+  --go: #6cc04a;
+  --go-hover: #5db03c;
+
+  /* --- Estados (par: fondo suave + texto) --- */
+  --ok-soft: #dcfce7;
+  --ok-ink: #15803d;
+  --ok-line: #86efac;
+  --ok-dot: #22c55e;
+
+  --warn-soft: #fffbeb;
+  --warn-ink: #92400e;
+  --warn-line: #fcd34d;
+
+  --err: #dc2626; /* botón/toast rojo sólido (texto blanco) */
+  --err-soft: #fef2f2;
+  --err-ink: #b91c1c;
+  --err-line: #fca5a5;
+  --err-dot: #ef4444;
+
+  --review-soft: #ffedd5;
+  --review-ink: #9a3412;
+  --review-line: #fb923c;
+
+  --wait-soft: #e0f2fe;
+  --wait-ink: #075985;
+
+  --paid-soft: #d1fae5;
+  --paid-ink: #065f46;
+
+  --late-soft: #f3e8ff;
+  --late-ink: #6b21a8;
+
+  --off-soft: #e5e7eb; /* chip "anulada" / inactivo */
+  --off-ink: #4b5563;
+
+  /* --- Píldora oscura (toasts) --- */
+  --inverse: #1f2937;
+  --inverse-ink: #ffffff;
 }
 
+.dark {
+  color-scheme: dark;
+
+  --app: #111827;
+  --surface: #1f2937;
+  --subtle: #273244;
+  --hover: #2d3a4d;
+  --line: #374151;
+  --field: #4b5563;
+
+  --fg: #f9fafb;
+  --body: #e5e7eb;
+  --soft: #d1d5db;
+  --dim: #9ca3af;
+  --faint: #6b7280;
+
+  --brand: #2b73d8; /* elegido para que el texto blanco encima pase contraste AA (4.6:1) */
+  --brand-text: #7fb3ff; /* enlaces y acentos: contraste alto sobre fondo oscuro */
+  --brand-soft: #1e3356;
+  --brand-line: #2f4f7f;
+  --brand-ink: #cfe2ff;
+
+  --go: #5aa83f;
+  --go-hover: #4e9436;
+
+  --ok-soft: #14361f;
+  --ok-ink: #86efac;
+  --ok-line: #2f6b43;
+  --ok-dot: #22c55e;
+
+  --warn-soft: #3b2c0c;
+  --warn-ink: #fcd34d;
+  --warn-line: #8a6514;
+
+  --err: #dc2626;
+  --err-soft: #3d1618;
+  --err-ink: #fca5a5;
+  --err-line: #8c3034;
+  --err-dot: #ef4444;
+
+  --review-soft: #44240d;
+  --review-ink: #fdba74;
+  --review-line: #9a5420;
+
+  --wait-soft: #0b3550;
+  --wait-ink: #a5dbff;
+
+  --paid-soft: #0d3a2c;
+  --paid-ink: #6ee7b7;
+
+  --late-soft: #33204a;
+  --late-ink: #d8b4fe;
+
+  --off-soft: #374151;
+  --off-ink: #d1d5db;
+
+  --inverse: #e5e7eb;
+  --inverse-ink: #111827;
+}
+
+/* Las variables de arriba se publican como utilidades de Tailwind:
+   bg-app, bg-surface, text-fg, text-dim, border-line, bg-brand, text-ok-ink… */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  --color-app: var(--app);
+  --color-surface: var(--surface);
+  --color-subtle: var(--subtle);
+  --color-hover: var(--hover);
+  --color-line: var(--line);
+  --color-field: var(--field);
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --color-fg: var(--fg);
+  --color-body: var(--body);
+  --color-soft: var(--soft);
+  --color-dim: var(--dim);
+  --color-faint: var(--faint);
+
+  --color-brand: var(--brand);
+  --color-brand-text: var(--brand-text);
+  --color-brand-soft: var(--brand-soft);
+  --color-brand-line: var(--brand-line);
+  --color-brand-ink: var(--brand-ink);
+
+  --color-go: var(--go);
+  --color-go-hover: var(--go-hover);
+
+  --color-ok-soft: var(--ok-soft);
+  --color-ok-ink: var(--ok-ink);
+  --color-ok-line: var(--ok-line);
+  --color-ok-dot: var(--ok-dot);
+
+  --color-warn-soft: var(--warn-soft);
+  --color-warn-ink: var(--warn-ink);
+  --color-warn-line: var(--warn-line);
+
+  --color-err: var(--err);
+  --color-err-soft: var(--err-soft);
+  --color-err-ink: var(--err-ink);
+  --color-err-line: var(--err-line);
+  --color-err-dot: var(--err-dot);
+
+  --color-review-soft: var(--review-soft);
+  --color-review-ink: var(--review-ink);
+  --color-review-line: var(--review-line);
+
+  --color-wait-soft: var(--wait-soft);
+  --color-wait-ink: var(--wait-ink);
+
+  --color-paid-soft: var(--paid-soft);
+  --color-paid-ink: var(--paid-ink);
+
+  --color-late-soft: var(--late-soft);
+  --color-late-ink: var(--late-ink);
+
+  --color-off-soft: var(--off-soft);
+  --color-off-ink: var(--off-ink);
+
+  --color-inverse: var(--inverse);
+  --color-inverse-ink: var(--inverse-ink);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
+  background: var(--app);
+  color: var(--fg);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* ===========================================================================
+   TÁCTIL
+   =========================================================================== */
+
+/* Quita la espera del "doble toque para ampliar" en los controles: el toque responde al instante.
+   NO bloquea el zoom con dos dedos ni el del navegador (accesibilidad). */
+button,
+a,
+label,
+select,
+summary,
+input[type="checkbox"],
+input[type="radio"],
+[role="button"] {
+  touch-action: manipulation;
+}
+
+/* Sin el destello gris de Android al tocar (ya hay estados :active propios) */
+button,
+a,
+[role="button"] {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* En pantallas táctiles no hay mouse: lo que solo aparecía al pasar el cursor debe verse siempre.
+   (Los :hover de Tailwind ya no se aplican en punteros gruesos, pero esto cubre el resto.) */
+@media (hover: none) {
+  .only-hover {
+    opacity: 1 !important;
+    visibility: visible !important;
+  }
+}
+
+/* ===========================================================================
+   IMPRESIÓN — Todo lo que imprime esta app son tirillas de 80 mm.
+   La tirilla SIEMPRE sale en blanco y negro, aunque la pantalla esté en modo
+   oscuro (la vista de la tirilla ya fija sus colores con estilos en línea;
+   esto obliga además al fondo y al color heredados).
+   =========================================================================== */
+@page {
+  size: 80mm auto;
+  margin: 0;
+}
+
+@media print {
+  :root,
+  .dark {
+    color-scheme: light;
+  }
+  html,
+  body {
+    background: #fff !important;
+    color: #000 !important;
+  }
 }

@@ -1,9 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
-  cacheComponents: true,
-  partialPrefetching: true,
+  // Se desactivan cacheComponents/partialPrefetching: un POS es 100% dinámico
+  // y esa opción obliga a envolver cada dato dinámico en <Suspense>.
   turbopack: {
     rules: {
       "*.css": {
