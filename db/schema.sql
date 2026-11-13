@@ -211,3 +211,14 @@ CREATE TABLE IF NOT EXISTS sale_receipts (
 ALTER TABLE sale_receipts DROP CONSTRAINT IF EXISTS sale_receipts_status_check;
 ALTER TABLE sale_receipts ADD CONSTRAINT sale_receipts_status_check CHECK (status IN ('activo','pendiente','eliminado'));
 CREATE INDEX IF NOT EXISTS idx_sale_receipts_status ON sale_receipts (status);
+
+-- ---------------------------------------------------------------------------
+-- Verificación de pagos de ePayco: aviso del webhook sin referencia larga e intentos sin resolver
+-- ---------------------------------------------------------------------------
+-- El webhook a veces llega solo con la referencia CORTA (con la que ePayco no deja consultar la transacción). Se anota que
+-- llegó un aviso firmado, sin decidir nada; el panel lo muestra y la confirmación llega con la referencia larga.
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS webhook_hint_at   TIMESTAMPTZ;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS webhook_hint_ref  TEXT;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS webhook_hint_txid TEXT;
+-- Intentos de verificación que no se pudieron resolver (a los 60 pasa a "por revisar" para que un admin lo vea)
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS verify_attempts   INTEGER NOT NULL DEFAULT 0;

@@ -6,11 +6,16 @@
 //  - Un SEGUNDO pago aprobado de la misma venta (p. ej. pagó por QR y también en pantalla) NO toca la venta ni se factura:
 //    queda en payment_refs como 'duplicado' con el motivo "Pago duplicado de la venta X, reembolsar" y aparece en
 //    /admin/pagos-por-revisar → "Pagos duplicados".
+//  - "No pude verificar" NO es "no coincide": si la consulta a ePayco no se pudo resolver (red, error, referencia corta), la
+//    referencia NO se consume y la venta sigue esperando (outcome 'no_verificado'; el webhook responde 500 para que ePayco
+//    reintente). Solo lo que SÍ llegó y no coincide (monto, invoice, firma, modo de prueba, código) va a 'por revisar'.
+//    Tras MAX_UNRESOLVED intentos sin poder verificar, pasa a 'por revisar' para que un admin lo vea.
+//  - Un mismo pago visto con dos referencias (corta y larga) es el MISMO pago: no es un duplicado.
 //  - Nunca factura aquí: devuelve startInvoicing y quien llama arranca la facturación (etapa 4).
 import { pool, query } from "../db";
 import { writeLog } from "../log";
 import { transitionAllowed, transitionSale, type SaleStatus } from "../sale-states";
-import { EpaycoError, fetchTransaction, type NormalizedTx } from "./adapter";
+import { EpaycoError, fetchTransaction, isShortRef, isUnresolvedError, type EpaycoDiag, type NormalizedTx } from "./adapter";
 import { getEpaycoConfig } from "./config";
 import { judgeTransaction } from "./verify";
 
@@ -20,7 +25,10 @@ export class PaymentInputError extends Error {
   }
 }
 
-export type PaymentOutcome = "pagado" | "pendiente" | "rechazado" | "por_revisar" | "tardio" | "duplicado" | "en_proceso" | "ya_procesado";
+export type PaymentOutcome =
+  | "pagado" | "pendiente" | "rechazado" | "por_revisar" | "tardio" | "duplicado" | "en_proceso" | "ya_procesado"
+  /** la consulta a ePayco no se pudo resolver: la venta sigue esperando y se puede reintentar */
+  | "no_verificado";
 export type PaymentResult = {
   outcome: PaymentOutcome;
   saleStatus: string;
@@ -31,6 +39,8 @@ export type PaymentResult = {
 
 const REF_RE = /^[A-Za-z0-9_-]{4,64}$/;
 const MAX_REFS_PER_SALE = 5;
+/** Intentos de verificación que no se pudieron resolver antes de mandar la venta a revisión (para que no quede invisible). */
+const MAX_UNRESOLVED = 60;
 
 type SaleRow = { id: string; local_number: string; total: number; status: SaleStatus; source: string; payment_method: string };
 
@@ -55,6 +65,7 @@ const customerMessage = (o: PaymentOutcome, local: string): string => {
     case "duplicado":
       return `No pudimos confirmar su pago automáticamente. Acérquese a la caja con este número: ${local}.`;
     case "en_proceso":
+    case "no_verificado":
       return "Estamos verificando su pago. Espere un momento.";
     default:
       return "Este pago ya fue procesado.";
@@ -80,7 +91,8 @@ const result = async (saleId: string, outcome: PaymentOutcome, local: string, st
   return { outcome, saleStatus: s?.status ?? "desconocido", message: customerMessage(outcome, local), startInvoicing };
 };
 
-export const duplicateReason = (local: string) => `Pago duplicado de la venta ${local}, reembolsar`;
+export const duplicateReason = (local: string, txRef?: string | null) =>
+  `Pago duplicado de la venta ${local}, reembolsar${txRef ? ` (transacción ${txRef}: confirme en el panel de ePayco que es OTRO cobro antes de reembolsar)` : ""}`;
 
 const FROM_REF: Record<string, PaymentOutcome> = {
   aprobado: "pagado",
@@ -102,6 +114,8 @@ async function settle(p: {
   reason: string;
   tx?: NormalizedTx;
   amount?: number;
+  /** diagnóstico (solo códigos y nombres de campos) que se guarda cuando no hay transacción */
+  diag?: unknown;
 }): Promise<PaymentOutcome> {
   const c = await pool.connect();
   const exec = (t: string, v: unknown[]) => c.query(t, v);
@@ -135,8 +149,28 @@ async function settle(p: {
         );
         outcome = "tardio"; refOutcome = "tardio";
       } else {
-        // La venta ya está pagada/facturada/en revisión/anulada: este es un SEGUNDO pago. No se toca la venta ni se factura.
-        outcome = "duplicado"; refOutcome = "duplicado"; refReason = duplicateReason(p.localNumber);
+        // La venta ya está pagada/facturada/en revisión/anulada. ¿Es el MISMO pago visto con otra referencia (la corta y la
+        // larga son el mismo pago) o un SEGUNDO pago de verdad? Se compara la identidad de la transacción, no el texto de la referencia.
+        const same = p.tx
+          ? (
+              await c.query<{ same: boolean }>(
+                `SELECT (EXISTS (SELECT 1 FROM payment_refs WHERE sale_id = $1 AND ref_payco <> $2
+                                    AND (ref_payco = $3 OR detail->>'x_ref_payco' = $3 OR ($4::text IS NOT NULL AND detail->>'transaction_id' = $4)))
+                       OR EXISTS (SELECT 1 FROM sales WHERE id = $1 AND (payment_reference = $3 OR ($4::text IS NOT NULL AND epayco_transaction_id = $4)))) AS same`,
+                [p.saleId, p.ref, p.tx.refPayco, p.tx.transactionId]
+              )
+            ).rows[0]?.same
+          : false;
+        if (same && (cur === "pago_por_revisar" || cur === "pago_tardio")) {
+          // Ese pago YA dejó la venta en revisión (p. ej. la primera verificación falló). Sigue sin facturarse sola: decide un admin.
+          outcome = "por_revisar"; refOutcome = "por_revisar";
+          refReason = `Pago verificado, pero es el MISMO pago (ref. ${p.tx?.refPayco}) que ya dejó esta venta en revisión. Un administrador decide (Facturar si el dinero entró).`;
+        } else if (same) {
+          outcome = "ya_procesado"; refOutcome = "aprobado";
+          refReason = `Mismo pago ya registrado con otra referencia (ref. ${p.tx?.refPayco})`;
+        } else {
+          outcome = "duplicado"; refOutcome = "duplicado"; refReason = duplicateReason(p.localNumber, p.tx?.refPayco ?? null);
+        }
       }
     } else if (p.kind === "rejected") {
       if (cur === "esperando_pago") {
@@ -152,7 +186,7 @@ async function settle(p: {
 
     await c.query(
       `UPDATE payment_refs SET outcome = $2, reason = $3, amount = $4, detail = $5, finished_at = now() WHERE ref_payco = $1`,
-      [p.ref, refOutcome, refReason, p.amount ?? p.tx?.amount ?? null, p.tx ? JSON.stringify(detailOf(p.tx)) : null]
+      [p.ref, refOutcome, refReason, p.amount ?? p.tx?.amount ?? null, p.tx ? JSON.stringify(detailOf(p.tx)) : p.diag ? JSON.stringify({ diag: p.diag }) : null]
     );
     await c.query("COMMIT");
     return outcome;
@@ -167,6 +201,8 @@ async function settle(p: {
 /** Quién pide verificar: la pantalla de caja/kiosco, el webhook de ePayco, la página pública /pagar o un admin con la referencia a mano. */
 export type PaymentCheckSource = "kiosco" | "webhook" | "publica" | "admin";
 
+const g = globalThis as unknown as { __shortRefLogged?: Set<string> };
+
 export async function processPayment(saleId: string, refRaw: string, source: PaymentCheckSource): Promise<PaymentResult> {
   const ref = String(refRaw ?? "").trim();
   if (!REF_RE.test(ref)) throw new PaymentInputError(400, "ref_payco no válido");
@@ -174,6 +210,21 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
   const sale = await loadSale(saleId);
   // Cobros electrónicos: del kiosco o de la caja (los dos nacen en 'esperando_pago' y se verifican igual con ePayco)
   if (!sale || !["kiosco", "caja"].includes(sale.source) || sale.payment_method !== "epayco") throw new PaymentInputError(404, "Venta no encontrada");
+
+  // La consulta a ePayco SOLO funciona con la referencia larga. Con la corta (solo dígitos) no se llama a ePayco ni se
+  // consume nada: se espera la larga (la trae el navegador al volver de ePayco, o el admin desde el panel).
+  if (isShortRef(ref)) {
+    const seenKey = `${saleId}:${ref}`;
+    const logged = (g.__shortRefLogged ??= new Set());
+    if (!logged.has(seenKey)) {
+      if (logged.size > 2000) logged.clear();
+      logged.add(seenKey);
+      await writeLog("pago", `Verificación de ${sale.local_number} con la referencia CORTA (${ref}): no se consulta a ePayco; falta la referencia larga (ref_payco)`, {
+        level: "warn", detail: { sale_id: saleId, ref_kind: "corta", ref_len: ref.length, source },
+      });
+    }
+    return result(saleId, "no_verificado", sale.local_number);
+  }
 
   // ---- Reclamo atómico del ref_payco: se procesa una sola vez ----
   const claimed = await query<{ ref_payco: string }>(
@@ -210,12 +261,37 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
   // ---- Consultar a ePayco (adaptador) y juzgar ----
   let tx: NormalizedTx | null = null;
   let verdict;
+  let diag: (EpaycoDiag & { error_kind?: string; ref_kind?: string; ref_len?: number }) | undefined;
+  let unresolved = false;
   try {
     tx = await fetchTransaction(ref);
     verdict = judgeTransaction(tx, { local_number: sale.local_number, total: sale.total }, { saleId, testMode: getEpaycoConfig().testMode });
   } catch (e) {
+    if (e instanceof EpaycoError) diag = { ...e.diag, error_kind: e.kind, ref_kind: "larga", ref_len: ref.length };
     const reason = e instanceof EpaycoError ? `No se pudo verificar con ePayco (${e.kind}): ${e.message}` : `Error inesperado verificando el pago: ${e instanceof Error ? e.message : e}`;
     verdict = { kind: "review" as const, reason };
+    unresolved = isUnresolvedError(e);
+  }
+
+  // ---- No se pudo RESOLVER la consulta (red, error de ePayco, referencia no encontrada) ----
+  // No es "algo no coincide": no se consume la referencia ni se manda a revisión de inmediato; la venta sigue esperando.
+  if (unresolved) {
+    const att = await query<{ n: number }>(
+      "UPDATE sales SET verify_attempts = verify_attempts + 1 WHERE id = $1 AND status = 'esperando_pago' RETURNING verify_attempts AS n",
+      [saleId]
+    );
+    const attempts = att.rows[0]?.n ?? 0;
+    // Se registra el 1.º, 2.º, 3.º intento y luego cada 10.º (la pantalla de la caja reintenta cada 3 s)
+    if (attempts <= 3 || attempts % 10 === 0) {
+      await writeLog("pago", `No se pudo verificar el pago de ${sale.local_number} con ePayco (intento ${attempts}): ${verdict.kind === "review" ? verdict.reason : ""}`, {
+        level: "warn", detail: { sale_id: saleId, source, attempts, diag },
+      });
+    }
+    if (attempts < MAX_UNRESOLVED) {
+      await query("DELETE FROM payment_refs WHERE ref_payco = $1 AND outcome = 'procesando'", [ref]);
+      return result(saleId, "no_verificado", sale.local_number);
+    }
+    // Demasiados intentos sin poder verificar: a revisión, para que un admin lo vea (más abajo, por el camino de siempre)
   }
 
   if (verdict.kind === "pending") {
@@ -228,14 +304,30 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
 
   const kind = verdict.kind === "approved" ? "approved" : verdict.kind === "rejected" ? "rejected" : "review";
   let reason = verdict.kind === "approved" ? "Pago aprobado y verificado" : verdict.reason;
-  const outcome = await settle({ saleId, localNumber: sale.local_number, ref, kind, reason, tx: tx ?? undefined });
-  if (outcome === "duplicado") reason = duplicateReason(sale.local_number);
+  const outcome = await settle({ saleId, localNumber: sale.local_number, ref, kind, reason, tx: tx ?? undefined, diag });
+  if (outcome === "duplicado") reason = duplicateReason(sale.local_number, tx?.refPayco ?? null);
 
   await writeLog("pago", `Pago de ${sale.local_number}: ${outcome.toUpperCase()}${outcome === "pagado" ? "" : ` — ${reason}`}`, {
     level: outcome === "pagado" || outcome === "rechazado" ? "info" : "error",
-    detail: { sale_id: saleId, ref_payco: ref, outcome, reason, source, tx: tx ? detailOf(tx) : null },
+    detail: { sale_id: saleId, ref_payco: ref, outcome, reason, source, tx: tx ? detailOf(tx) : null, diag: tx ? undefined : diag },
   });
   return result(saleId, outcome, sale.local_number, outcome === "pagado");
+}
+
+/**
+ * Aviso firmado del webhook que llegó SIN la referencia larga: no se puede consultar a ePayco, así que NO se decide nada.
+ * Solo se deja constancia en la venta (si el monto coincide) para que el panel la muestre como "aviso recibido, falta la
+ * referencia larga". La confirmación llega por el navegador (que sí recibe ref_payco) o la hace un admin desde el panel.
+ */
+export async function recordWebhookHint(p: { saleId: string; ref: string; txId: string; amountRaw: string }): Promise<boolean> {
+  const amount = Number(String(p.amountRaw).replace(/,/g, ""));
+  if (!Number.isFinite(amount)) return false;
+  const r = await query(
+    `UPDATE sales SET webhook_hint_at = now(), webhook_hint_ref = $2, webhook_hint_txid = $3
+      WHERE id = $1 AND status IN ('esperando_pago','pago_fallido') AND abs(total - $4::numeric) < 0.005`,
+    [p.saleId, p.ref.slice(0, 40), p.txId.slice(0, 60), amount]
+  );
+  return (r.rowCount ?? 0) > 0;
 }
 
 /** Cobros que no se confirmaron en 10 minutos → pago_fallido ("tiempo agotado"). Se ejecuta al consultar el estado. */

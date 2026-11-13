@@ -260,6 +260,12 @@ Los reportes **no cuentan** `esperando_pago`, `pago_fallido`, `pago_por_revisar`
 1. Define `APP_PUBLIC_URL=https://tu-dominio` (con HTTPS) y reinicia.
 2. El cobro se crea con la URL del webhook. ePayco avisa **sin depender del navegador**: exige `x_signature` válida, ubica la venta por `x_id_invoice` y **vuelve a consultar** a ePayco (no confía en el contenido del aviso). Es idempotente: ePayco puede reintentar.
 
+**Referencia corta y larga (importante).** ePayco identifica cada pago con dos referencias: la **larga** (`ref_payco`, 24 caracteres hexadecimales) y la **corta** (`x_ref_payco`, solo dígitos, la "Referencia Davipay"). La consulta a ePayco para verificar un pago **solo funciona con la larga**; con la corta responde un error. Por eso:
+- Si el webhook trae `ref_payco` (larga), se consulta y se verifica como siempre.
+- Si llega **solo con la corta**, el sistema **no decide nada**: anota que llegó un aviso firmado (se ve en *Pagos por revisar* → "sin la referencia larga") y la confirmación llega por el navegador (que sí recibe `ref_payco` al volver de ePayco) o la hace el admin desde el panel.
+- Si la consulta **no se pudo resolver** (ePayco caído, error de red, referencia no encontrada), la venta **no** pasa a "por revisar": sigue esperando y la referencia no se consume, así que se puede reintentar (el webhook responde 500 para que ePayco reintente). Solo tras 60 intentos sin poder verificar pasa a "por revisar", para que un admin la vea. Lo que **sí llega y no coincide** (monto, factura, `x_extra1`, modo de prueba, código distinto de 1, firma) va a "por revisar" como siempre.
+- El mismo pago visto con las dos referencias es **un solo pago**, no un duplicado. Un pago es duplicado solo si es **otra transacción**; aun así, antes de reembolsar confirme en el panel de ePayco.
+
 Sin el webhook (modo local), la confirmación depende de que el navegador vuelva con el `ref_payco`; si no vuelve, el admin usa **Cobros sin confirmar** (arriba).
 
 ### Tarjeta de prueba

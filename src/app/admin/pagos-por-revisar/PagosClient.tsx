@@ -22,6 +22,9 @@ export type PagoRow = {
   cashier: string;
   refund_by: string | null;
   refs: { ref: string; outcome: string; reason: string | null }[];
+  /** llegó un aviso FIRMADO del webhook, pero sin la referencia larga (no se pudo consultar a ePayco) */
+  webhook_hint_at: string | null;
+  webhook_hint_ref: string | null;
 };
 
 /** Un SEGUNDO pago aprobado de una venta que ya estaba pagada (p. ej. por QR y en pantalla). Nunca se factura. */
@@ -49,6 +52,17 @@ function Customer({ r }: { r: PagoRow }) {
     <div>
       <div>{r.customer_name ?? "Consumidor final"}</div>
       {r.customer_id && <div className="text-[12px] text-dim">{r.customer_id}</div>}
+    </div>
+  );
+}
+
+/** Aviso firmado del webhook que no se pudo confirmar (falta la referencia larga). No decide nada: es una pista para el admin. */
+function WebhookHint({ r }: { r: PagoRow }) {
+  if (!r.webhook_hint_at) return null;
+  return (
+    <div className="mt-1 text-[12px] rounded-md bg-brand-soft text-brand-ink px-2 py-1 max-w-xs break-words">
+      ePayco avisó de un pago ({when(r.webhook_hint_at)}, ref. corta {r.webhook_hint_ref ?? "—"}) pero <b>sin la referencia larga</b>: el sistema no pudo confirmarlo.
+      Verifique en el panel de ePayco y pegue aquí la referencia larga.
     </div>
   );
 }
@@ -256,6 +270,7 @@ export default function PagosClient({ review, unconfirmed, refunds, duplicates }
                     <td className="px-4 py-2 max-w-sm">
                       <span className={`px-2 py-0.5 rounded-full text-[12px] font-semibold ${statusInfo(r.status).cls}`}>{statusInfo(r.status).label}</span>
                       <div className="text-[12px] text-soft mt-1 break-words">{r.payment_failure_reason ?? "—"}</div>
+                      <WebhookHint r={r} />
                     </td>
                     <td className="px-4 py-2"><Refs r={r} /></td>
                     <td className="px-4 py-2"><ReviewActions r={r} onDone={refresh} /></td>
@@ -356,6 +371,7 @@ export default function PagosClient({ review, unconfirmed, refunds, duplicates }
                     <td className="px-4 py-2">
                       <span className={`px-2 py-0.5 rounded-full text-[12px] font-semibold ${statusInfo(r.status).cls}`}>{statusInfo(r.status).label}</span>
                       {r.payment_failure_reason && <div className="text-[12px] text-soft mt-1 max-w-xs break-words">{r.payment_failure_reason}</div>}
+                      <WebhookHint r={r} />
                     </td>
                     <td className="px-4 py-2"><VerifyBox r={r} onDone={refresh} /></td>
                   </tr>

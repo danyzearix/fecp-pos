@@ -7,15 +7,43 @@
 //  - Respuesta: { success, data: { x_ref_payco (número corto), x_id_invoice, x_amount (número), x_currency_code,
 //    x_cod_response (número), x_response, x_test_request ("TRUE"/"FALSE"), x_signature, x_extra1, ... } }.
 //  - La firma SHA-256(P_CUST_ID_CLIENTE^P_KEY^x_ref_payco^x_transaction_id^x_amount^x_currency_code) coincidió.
+//  - Con la referencia corta (o una desconocida) responde HTTP 200 con un sobre de ERROR distinto:
+//    { status:false, message:"Error de datos o conexión.", data:{ status:"error", description } }  (OBSERVADO el 2026-11-13).
+//    Se reconoce y se lanza EpaycoError('notfound'): "no se pudo resolver", NO "no coincide".
+// Documentación oficial (docs.davipay.com > "Páginas de Respuesta y Confirmación"): el endpoint aparece solo con un ejemplo
+// curl y una referencia larga; NO documenta la estructura de la respuesta ni la autenticación, y advierte que no es confiable
+// para el estado final. Lo anterior es comportamiento OBSERVADO, no documentado.
 // Si falta un campo imprescindible o el formato cambia, se lanza EpaycoError('format'): NO se factura ("por revisar").
 import crypto from "node:crypto";
 import { getEpaycoConfig } from "./config";
 
+/** Diagnóstico de una consulta fallida: SOLO códigos y NOMBRES de campos. Nunca el cuerpo ni valores (datos personales). */
+export type EpaycoDiag = {
+  http?: number;
+  content_type?: string | null;
+  elapsed_ms?: number;
+  /** nombres de los campos del primer nivel de la respuesta */
+  envelope_keys?: string[];
+  /** nombres de los campos dentro de "data" */
+  data_keys?: string[];
+};
+
 export class EpaycoError extends Error {
-  constructor(public kind: "network" | "http" | "format" | "auth" | "config", message: string) {
+  /**
+   * kind:
+   *  - "network":  no se pudo conectar / se agotó el tiempo
+   *  - "http":     ePayco respondió un código HTTP que no es 2xx
+   *  - "notfound": ePayco respondió, pero con su sobre de ERROR (p. ej. se consultó con la referencia corta)
+   *  - "format":   respondió algo que parece una transacción pero le faltan campos
+   *  - "auth" | "config": problemas de llaves (no se arreglan reintentando)
+   */
+  constructor(public kind: "network" | "http" | "notfound" | "format" | "auth" | "config", message: string, public diag?: EpaycoDiag) {
     super(message);
   }
 }
+
+/** ¿La consulta NO se pudo resolver (puede ser pasajero o de referencia), en vez de haber respondido algo que no coincide? */
+export const isUnresolvedError = (e: unknown): e is EpaycoError => e instanceof EpaycoError && (e.kind === "network" || e.kind === "http" || e.kind === "notfound");
 
 /** Transacción normalizada (lo único que el resto del sistema conoce de ePayco) */
 export type NormalizedTx = {
@@ -38,12 +66,32 @@ export type NormalizedTx = {
 
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * La consulta de validación SOLO funciona con la referencia LARGA (24 hex, la de ?ref_payco=...). La corta ("Referencia
+ * Davipay", solo dígitos, p. ej. 393617357) responde un sobre de error. Esta función reconoce la corta.
+ */
+export const isShortRef = (ref: string) => /^\d{1,12}$/.test(ref.trim());
+
+/** Solo NOMBRES de campos (nunca valores), con un filtro de forma por si ePayco mandara llaves raras. */
+const keyNames = (o: unknown): string[] =>
+  isObj(o) ? Object.keys(o).filter((k) => /^[A-Za-z0-9_.-]{1,48}$/.test(k)).slice(0, 80) : [];
+const shapeDiag = (body: unknown): EpaycoDiag => ({ envelope_keys: keyNames(body), data_keys: isObj(body) ? keyNames(body.data) : [] });
 const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : typeof v === "number" && Number.isFinite(v) ? String(v) : null);
 
 /** Convierte la respuesta de ePayco (con o sin envoltorio {success, data}) en NormalizedTx, o lanza EpaycoError('format'). */
 export function normalizeTransaction(body: unknown): NormalizedTx {
   if (!isObj(body)) throw new EpaycoError("format", "La respuesta de ePayco no es un objeto JSON");
-  if (body.success === false) throw new EpaycoError("http", `ePayco respondió success=false${str(body.text_response) ? `: ${str(body.text_response)}` : ""}`);
+  // Sobres de ERROR conocidos: { success:false, ... } y { status:false, message, data:{ status:"error", description } }
+  // (el segundo es el que devuelve la consulta con la referencia corta). No son una transacción: NO se intenta leer campos.
+  const isErrorEnvelope = body.success === false || body.status === false || (isObj(body.data) && body.data.status === "error");
+  if (isErrorEnvelope) {
+    throw new EpaycoError(
+      "notfound",
+      "ePayco respondió con un error y no entregó la transacción (la consulta solo funciona con la referencia larga ref_payco)",
+      shapeDiag(body)
+    );
+  }
   const d = isObj(body.data) ? body.data : body;
 
   const ref = str(d.x_ref_payco) ?? str(d.ref_payco);
@@ -60,7 +108,7 @@ export function normalizeTransaction(body: unknown): NormalizedTx {
     !currency && "x_currency_code",
     !Number.isInteger(cod) && "x_cod_response",
   ].filter(Boolean);
-  if (missing.length) throw new EpaycoError("format", `Respuesta de ePayco sin campos obligatorios: ${missing.join(", ")}`);
+  if (missing.length) throw new EpaycoError("format", `Respuesta de ePayco sin campos obligatorios: ${missing.join(", ")}`, shapeDiag(body));
 
   const amount = Number(String(amountRaw).replace(/,/g, ""));
   if (!Number.isFinite(amount)) throw new EpaycoError("format", "x_amount no es un número");
@@ -105,23 +153,24 @@ export function signatureMatches(got: string, expected: string): boolean {
 // ---------------------------------------------------------------------------
 // HTTP
 // ---------------------------------------------------------------------------
-async function http(url: string, init: RequestInit): Promise<{ status: number; json: unknown }> {
+async function http(url: string, init: RequestInit): Promise<{ status: number; json: unknown; contentType: string | null; elapsedMs: number }> {
   const cfg = getEpaycoConfig();
   let res: Response;
+  const t0 = Date.now();
   try {
     res = await fetch(url, { ...init, signal: AbortSignal.timeout(cfg.timeoutMs), cache: "no-store", redirect: "manual" });
   } catch (e) {
     const timeout = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
-    throw new EpaycoError("network", timeout ? "ePayco no respondió a tiempo" : `No se pudo conectar con ePayco: ${e instanceof Error ? e.message : e}`);
+    throw new EpaycoError("network", timeout ? "ePayco no respondió a tiempo" : `No se pudo conectar con ePayco: ${e instanceof Error ? e.message : e}`, { elapsed_ms: Date.now() - t0 });
   }
   const text = await res.text().catch(() => "");
   let json: unknown = null;
   try {
     json = text ? JSON.parse(text) : null;
   } catch {
-    if (res.ok) throw new EpaycoError("format", "ePayco devolvió una respuesta que no es JSON");
+    if (res.ok) throw new EpaycoError("format", "ePayco devolvió una respuesta que no es JSON", { http: res.status, content_type: res.headers.get("content-type"), elapsed_ms: Date.now() - t0 });
   }
-  return { status: res.status, json };
+  return { status: res.status, json, contentType: res.headers.get("content-type"), elapsedMs: Date.now() - t0 };
 }
 
 // Token de APIFY en memoria (se renueva al vencer o si ePayco responde 401)
@@ -194,10 +243,17 @@ export async function createCheckoutSession(input: {
 /** Consulta de la transacción por ref_payco (servidor a servidor). NUNCA se usan datos que mande el navegador. */
 export async function fetchTransaction(refPayco: string): Promise<NormalizedTx> {
   const cfg = getEpaycoConfig();
-  const { status, json } = await http(`${cfg.validationUrl}/${encodeURIComponent(refPayco)}`, {
+  const { status, json, contentType, elapsedMs } = await http(`${cfg.validationUrl}/${encodeURIComponent(refPayco)}`, {
     method: "GET",
     headers: { "Content-Type": "application/json" },
   });
-  if (status < 200 || status >= 300) throw new EpaycoError("http", `ePayco respondió HTTP ${status} al consultar la transacción`);
-  return normalizeTransaction(json);
+  const base: EpaycoDiag = { http: status, content_type: contentType, elapsed_ms: elapsedMs };
+  if (status < 200 || status >= 300) throw new EpaycoError("http", `ePayco respondió HTTP ${status} al consultar la transacción`, { ...base, ...shapeDiag(json) });
+  try {
+    return normalizeTransaction(json);
+  } catch (e) {
+    // Se agrega el código HTTP y el tiempo al diagnóstico (los nombres de campos ya vienen de normalizeTransaction)
+    if (e instanceof EpaycoError) e.diag = { ...base, ...e.diag };
+    throw e;
+  }
 }

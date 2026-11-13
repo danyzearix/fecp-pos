@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 
 const SELECT = `
   SELECT s.id, s.local_number, s.status, s.source, s.total::float8 AS total, s.created_at, s.payment_failure_reason,
-         s.epayco_ref, s.payment_reference, s.notify_email, s.refund_requested_at,
+         s.epayco_ref, s.payment_reference, s.notify_email, s.refund_requested_at, s.webhook_hint_at, s.webhook_hint_ref,
          c.identification AS customer_id,
          COALESCE(NULLIF(c.company_name,''), NULLIF(trim(c.first_name || ' ' || c.last_name),'')) AS customer_name,
          u.name AS cashier, ru.name AS refund_by,
@@ -21,7 +21,7 @@ const SELECT = `
     LEFT JOIN customers c ON c.id = s.customer_id
    WHERE s.payment_method = 'epayco'`;
 
-const toRow = (r: Record<string, unknown>): PagoRow => ({ ...(r as unknown as PagoRow), created_at: new Date(r.created_at as string).toISOString(), refund_requested_at: r.refund_requested_at ? new Date(r.refund_requested_at as string).toISOString() : null });
+const toRow = (r: Record<string, unknown>): PagoRow => ({ ...(r as unknown as PagoRow), created_at: new Date(r.created_at as string).toISOString(), refund_requested_at: r.refund_requested_at ? new Date(r.refund_requested_at as string).toISOString() : null, webhook_hint_at: r.webhook_hint_at ? new Date(r.webhook_hint_at as string).toISOString() : null });
 
 export default async function PagosPorRevisarPage() {
   await requirePage("/admin");

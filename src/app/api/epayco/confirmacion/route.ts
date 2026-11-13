@@ -1,8 +1,8 @@
 import { after, NextResponse } from "next/server";
 import { query } from "@/lib/db";
-import { expectedSignature, EpaycoError, signatureMatches } from "@/lib/epayco/adapter";
+import { expectedSignature, EpaycoError, isShortRef, signatureMatches } from "@/lib/epayco/adapter";
 import { publicModeEnabled } from "@/lib/epayco/config";
-import { PaymentInputError, processPayment } from "@/lib/epayco/process";
+import { PaymentInputError, processPayment, recordWebhookHint } from "@/lib/epayco/process";
 import { writeLog } from "@/lib/log";
 import { invoiceSale } from "@/lib/siigo/invoice";
 
@@ -11,8 +11,13 @@ export const maxDuration = 60;
 /**
  * WEBHOOK de confirmación de ePayco (servidor a servidor). APAGADO mientras APP_PUBLIC_URL esté vacío (modo local).
  *  - Exige x_signature válida (SHA-256 con P_CUST_ID_CLIENTE y P_KEY).
- *  - Aun con firma válida NO confía en el contenido: ubica la venta por x_id_invoice y vuelve a consultar a ePayco
- *    con el ref_payco (mismo camino que el kiosco: monto, invoice, modo de prueba, estado).
+ *  - Aun con firma válida NO confía en el contenido: la firma NO cubre el estado, el invoice ni el modo de prueba. Por eso
+ *    ubica la venta por x_id_invoice y vuelve a consultar a ePayco con el ref_payco LARGO (mismo camino que el kiosco: monto,
+ *    invoice, modo de prueba, estado, firma de la respuesta).
+ *  - La consulta SOLO funciona con la referencia larga. Si el aviso llega solo con la corta (x_ref_payco), no se consulta ni se
+ *    decide nada: se deja constancia del aviso firmado en la venta y se responde 200; la confirmación llega por el navegador
+ *    (ref_payco al volver de ePayco) o desde el panel del admin.
+ *  - Si la consulta no se pudo resolver (red, error de ePayco), responde 500 para que ePayco REINTENTE; no se manda a revisión.
  *  - Idempotente: ePayco puede reintentar; cada ref_payco se procesa una sola vez.
  *  - Responde 200 rápido y sin redirecciones (requisito de ePayco); la facturación corre después.
  */
@@ -37,15 +42,24 @@ async function handle(req: Request) {
   }
 
   const ref = f.x_ref_payco ?? ""; // número corto: entra en la firma
-  // Para CONSULTAR a ePayco hace falta el id largo (ref_payco); con el número corto la consulta falla
-  const lookupRef = f.ref_payco || f.x_ref_payco || "";
+  // Para CONSULTAR a ePayco hace falta el id largo (ref_payco, 24 hex); con el número corto la consulta devuelve un error.
+  // Se toma la primera referencia que NO sea corta (ref_payco o, si ePayco la mandara ahí, x_ref_payco). Puede no haber ninguna.
+  const longRef = [f.ref_payco, f.x_ref_payco].map((v) => (v ?? "").trim()).find((v) => v && !isShortRef(v)) ?? "";
   const txId = f.x_transaction_id ?? "";
   const amount = f.x_amount ?? "";
   const currency = f.x_currency_code ?? "";
   const sig = f.x_signature ?? "";
   const invoice = f.x_id_invoice ?? f.x_id_factura ?? "";
-  // Se registra lo mínimo (nunca la firma ni llaves)
-  const seen = { ref_payco: ref, invoice, amount, response: f.x_response ?? null, test: f.x_test_request ?? null };
+  // Se registra lo mínimo (nunca la firma, llaves ni datos personales). "fields" son solo los NOMBRES de los campos recibidos.
+  const seen = {
+    ref_payco: ref,
+    invoice,
+    amount,
+    response: f.x_response ?? null,
+    test: f.x_test_request ?? null,
+    has_long_ref: !!longRef,
+    fields: Object.keys(f).filter((k) => /^[A-Za-z0-9_]{1,40}$/.test(k)).slice(0, 80),
+  };
 
   if (!ref || !txId || !amount || !currency || !sig || !invoice) {
     await writeLog("pago", "Webhook ePayco con campos incompletos", { level: "warn", detail: seen });
@@ -72,8 +86,21 @@ async function handle(req: Request) {
   const saleId = sale.rows[0].id;
   await writeLog("pago", `Webhook ePayco recibido para ${invoice}`, { detail: { sale_id: saleId, ...seen } });
 
+  // Sin referencia larga no se puede consultar a ePayco: solo se deja constancia del aviso firmado (no se decide nada)
+  if (!longRef) {
+    const hinted = await recordWebhookHint({ saleId, ref, txId, amountRaw: amount });
+    await writeLog(
+      "pago",
+      `Webhook firmado de ${invoice} SIN referencia larga (ref_payco): no se puede consultar a ePayco. La confirmación debe llegar por el navegador o desde Admin → Pagos por revisar${hinted ? "" : " (aviso no anotado: la venta ya no espera o el monto no coincide)"}`,
+      { level: "warn", detail: { sale_id: saleId, hinted, ...seen } }
+    );
+    return new NextResponse("OK", { status: 200 }); // reintentar no ayudaría: llegaría igual sin la referencia larga
+  }
+
   try {
-    const r = await processPayment(saleId, lookupRef, "webhook");
+    const r = await processPayment(saleId, longRef, "webhook");
+    // La consulta a ePayco no se pudo resolver: 500 para que ePayco reintente (la referencia NO se consumió)
+    if (r.outcome === "no_verificado") return new NextResponse("Verificación pendiente", { status: 500 });
     if (r.startInvoicing) {
       after(() => invoiceSale(saleId).catch((e) => writeLog("factura", `Error facturando pago electrónico: ${e instanceof Error ? e.message : e}`, { level: "error", detail: { sale_id: saleId } })));
     }
