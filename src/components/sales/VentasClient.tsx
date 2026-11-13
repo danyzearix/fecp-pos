@@ -7,11 +7,19 @@ import { printTicket } from "@/lib/client/print";
 import { formatCOP } from "@/lib/money";
 import type { Role } from "@/lib/permissions";
 import { paymentLabel } from "@/lib/payments";
-import type { SaleListRow } from "@/lib/sales";
+import type { ReceiptFilter, SaleListRow } from "@/lib/sales";
+import { missingRequiredReceipt, ReceiptCell } from "./ReceiptViewer";
 import SaleActionButton from "./SaleActionButton";
 import { statusInfo } from "./status";
 
 const fmtTime = new Intl.DateTimeFormat("es-CO", { hour: "2-digit", minute: "2-digit", timeZone: "America/Bogota" });
+
+const RECEIPT_FILTERS: [ReceiptFilter, string][] = [
+  ["todos", "Todas"],
+  ["con", "Con comprobante"],
+  ["sin", "Sin comprobante"],
+  ["pendiente", "Comprobante pendiente"],
+];
 
 export default function VentasClient({
   user,
@@ -29,12 +37,13 @@ export default function VentasClient({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [open, setOpen] = useState<string | null>(null); // fila con el error desplegado (solo admin)
+  const [receiptFilter, setReceiptFilter] = useState<ReceiptFilter>("todos");
 
   const load = useCallback(
     async (silent = false) => {
       if (!silent) setLoading(true);
       try {
-        const res = await fetch(`/api/sales?date=${date}`, { cache: "no-store" });
+        const res = await fetch(`/api/sales?date=${date}&comprobante=${receiptFilter}`, { cache: "no-store" });
         if (res.status === 401) {
           window.location.href = "/login";
           return;
@@ -49,7 +58,7 @@ export default function VentasClient({
         setLoading(false);
       }
     },
-    [date]
+    [date, receiptFilter]
   );
 
   useEffect(() => {
@@ -111,6 +120,20 @@ export default function VentasClient({
           </div>
         </div>
 
+        {/* Filtro de comprobantes */}
+        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Filtrar por comprobante">
+          {RECEIPT_FILTERS.map(([id, name]) => (
+            <button
+              key={id}
+              onClick={() => setReceiptFilter(id)}
+              aria-pressed={receiptFilter === id}
+              className={`px-3 min-h-11 rounded-lg border text-[13px] font-medium ${receiptFilter === id ? "bg-brand border-brand text-white" : "bg-surface border-field text-body hover:bg-hover"}`}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+
         {error && <div className="text-[14px] bg-err-soft text-err-ink rounded-lg px-4 py-2">{error}</div>}
 
         {/* ---------- Celular y tablet vertical: una tarjeta por venta ---------- */}
@@ -118,7 +141,10 @@ export default function VentasClient({
           {sales.map((s) => {
             const st = statusInfo(s.status);
             return (
-              <div key={s.id} className={`bg-surface rounded-xl border border-line p-3 space-y-2 ${s.status === "anulada" ? "opacity-60" : ""}`}>
+              <div
+                key={s.id}
+                className={`rounded-xl border p-3 space-y-2 ${s.status === "anulada" ? "opacity-60" : ""} ${missingRequiredReceipt(s) ? "bg-warn-soft border-warn-line" : "bg-surface border-line"}`}
+              >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="font-semibold text-fg">{s.invoice_name ?? s.local_number}</div>
@@ -139,6 +165,7 @@ export default function VentasClient({
                   </div>
                   <div className="text-xl font-bold text-fg">{formatCOP(s.total)}</div>
                 </div>
+                <ReceiptCell s={s} isAdmin={isAdmin} onChanged={() => load(true)} />
                 <div className="flex items-center gap-2 flex-wrap pt-1">
                   <button onClick={() => printTicket(s.id)} className="px-3 min-h-11 rounded-lg border border-field text-[14px] font-medium text-body">
                     Reimprimir
@@ -171,6 +198,7 @@ export default function VentasClient({
                 <th className="px-3 py-2">Cliente</th>
                 <th className="px-3 py-2 text-right">Total</th>
                 <th className="px-3 py-2">Medio de pago</th>
+                <th className="px-3 py-2">Comprobante</th>
                 <th className="px-3 py-2">Cajero</th>
                 <th className="px-3 py-2">Estado</th>
                 <th className="px-3 py-2">Acciones</th>
@@ -182,7 +210,7 @@ export default function VentasClient({
                 const canSeeError = isAdmin && !!s.last_error;
                 return (
                   <FragmentRow key={s.id}>
-                    <tr className={s.status === "anulada" ? "text-dim" : ""}>
+                    <tr className={`${s.status === "anulada" ? "text-dim" : ""} ${missingRequiredReceipt(s) ? "bg-warn-soft" : ""}`}>
                       <td className="px-3 py-2 whitespace-nowrap">{fmtTime.format(new Date(s.created_at))}</td>
                       <td className="px-3 py-2 whitespace-nowrap">{s.local_number}</td>
                       <td className="px-3 py-2 whitespace-nowrap font-medium">{s.invoice_name ?? "—"}</td>
@@ -194,6 +222,9 @@ export default function VentasClient({
                       <td className="px-3 py-2">
                         <div className="leading-tight">{paymentLabel(s.payment_method)}</div>
                         {s.payment_reference && <div className="text-[12px] text-dim">Ref. {s.payment_reference}</div>}
+                      </td>
+                      <td className="px-3 py-2">
+                        <ReceiptCell s={s} isAdmin={isAdmin} onChanged={() => load(true)} />
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap">{s.cashier_name}</td>
                       <td className="px-3 py-2 whitespace-nowrap">
@@ -221,7 +252,7 @@ export default function VentasClient({
                     </tr>
                     {open === s.id && s.last_error && (
                       <tr className="bg-err-soft">
-                        <td colSpan={9} className="px-4 py-2 text-[13px] text-err-ink whitespace-pre-wrap break-words">
+                        <td colSpan={10} className="px-4 py-2 text-[13px] text-err-ink whitespace-pre-wrap break-words">
                           {s.last_error}
                         </td>
                       </tr>
@@ -231,14 +262,14 @@ export default function VentasClient({
               })}
               {!loading && sales.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="px-4 py-10 text-center text-dim">
+                  <td colSpan={10} className="px-4 py-10 text-center text-dim">
                     No hay ventas en este día.
                   </td>
                 </tr>
               )}
               {loading && (
                 <tr>
-                  <td colSpan={9} className="px-4 py-10 text-center text-dim">
+                  <td colSpan={10} className="px-4 py-10 text-center text-dim">
                     Cargando…
                   </td>
                 </tr>

@@ -14,6 +14,8 @@ export type PublicInfo = {
   status: string;
   invoice_name: string | null;
   can_pay: boolean;
+  /** el cobro se pasó a "pagar en pantalla" en la caja/kiosco: este enlace ya no sirve */
+  channel_changed?: boolean;
   message: string;
   test: boolean;
   expires_at: string | null;
@@ -140,7 +142,7 @@ export default function PagarClient({ code, mode, initial }: { code: string; mod
             <p className="text-[12px] text-dim">Pago seguro con ePayco (tarjetas, PSE, Nequi y más).</p>
           </div>
         )}
-        {waiting && !info.can_pay && <p className="text-[14px] text-dim">El tiempo para pagar se agotó.</p>}
+        {waiting && !info.can_pay && !info.channel_changed && <p className="text-[14px] text-dim">El tiempo para pagar se agotó.</p>}
         {error && <p className="text-[14px] text-err-ink">{error}</p>}
 
         {mode === "respuesta" && info.status === "pago_fallido" && (

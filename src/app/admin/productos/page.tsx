@@ -3,6 +3,9 @@ import { query } from "@/lib/db";
 import { formatCOP } from "@/lib/money";
 import { getSetting, SETTING_LAST_SYNC } from "@/lib/settings";
 import SyncButton from "./SyncButton";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = { title: "Productos" };
 
 type Row = {
   id: number;

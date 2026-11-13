@@ -17,6 +17,7 @@ import {
 import {
   enqueue,
   flushQueue,
+  getQueue,
   markError,
   nextLocalNumber,
   pendingCount,
@@ -24,6 +25,7 @@ import {
   sendSale,
 } from "@/lib/client/queue";
 import { printTicket } from "@/lib/client/print";
+import { deletePendingReceipt, flushReceipts, savePendingReceipt, uploadReceipt } from "@/lib/client/receipts";
 import { beepError, beepOk } from "@/lib/client/sound";
 import { finePointer } from "@/lib/client/pointer";
 import { newUuid } from "@/lib/client/uuid";
@@ -290,6 +292,15 @@ export default function CajaClient({
         })),
       };
 
+      // El comprobante (si hay) se guarda en este equipo (IndexedDB) ANTES de enviar la venta: si no hay conexión, se sube
+      // después, cuando la venta ya exista en el servidor.
+      let receiptStored = false;
+      if (r.receipt) {
+        receiptStored = await savePendingReceipt({ saleId: sale.id, localNumber: sale.local_number, blob: r.receipt, createdAt: Date.now() })
+          .then(() => true)
+          .catch(() => false);
+      }
+
       // La venta queda guardada en este equipo ANTES de enviarla
       enqueue({ sale, cashierName: user.name, queuedAt: Date.now(), state: "pendiente" });
       setCart([]);
@@ -303,6 +314,19 @@ export default function CajaClient({
       if (res.kind === "ok") {
         removeFromQueue(sale.id);
         showToast(`Venta ${sale.local_number} registrada`, "ok");
+        if (r.receipt) {
+          // La venta ya existe: subir el comprobante ahora (si falla la red, queda en el equipo y se reintenta solo)
+          const blob = r.receipt;
+          void uploadReceipt(sale.id, blob).then((u) => {
+            if (u.kind === "ok") void deletePendingReceipt(sale.id).catch(() => {});
+            else if (u.kind === "rejected") {
+              void deletePendingReceipt(sale.id).catch(() => {});
+              showToast(`El comprobante de ${sale.local_number} no se guardó: ${u.error}. Adjúntelo desde Ventas.`, "err");
+            } else if (!receiptStored) {
+              showToast(`No se pudo guardar el comprobante de ${sale.local_number}. Adjúntelo desde Ventas.`, "err");
+            }
+          });
+        }
         if (res.status === "invoiced") printTicket(sale.id);
         else setLocalTicket(buildTicketFromSale(sale, user.name));
       } else if (res.kind === "rejected") {
@@ -333,9 +357,10 @@ export default function CajaClient({
   }, [localTicket]);
 
   // ---- Enviar ventas pendientes: al iniciar, al volver la conexión y cada 30 s ----
+  // Primero las ventas; después los comprobantes guardados en el equipo (solo los de ventas que ya llegaron al servidor).
   useEffect(() => {
-    const run = () =>
-      flushQueue(
+    const run = async () => {
+      await flushQueue(
         (q, r) => {
           setPending(pendingCount());
           if (r.status === "invoiced") {
@@ -344,6 +369,10 @@ export default function CajaClient({
         },
         (q, err) => showToast(`La venta ${q.sale.local_number} fue rechazada: ${err}`, "err")
       );
+      await flushReceipts(new Set(getQueue().map((q) => q.sale.id)), (p, err) =>
+        showToast(`El comprobante de ${p.localNumber} no se pudo subir: ${err}. Adjúntelo desde Ventas.`, "err")
+      );
+    };
     run();
     const iv = setInterval(run, 30_000);
     window.addEventListener("online", run);

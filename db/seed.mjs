@@ -30,11 +30,13 @@ const ask = (q, hide = false) =>
 
 const name = (await ask("Nombre del administrador: ")) || "Administrador";
 const email = (await ask("Correo del administrador: ")).toLowerCase();
-const password = await ask("Contraseña (mín. 8 caracteres): ", true);
+// Siempre crea un ADMINISTRADOR: mínimo 12 caracteres (misma regla que src/lib/password-rules.ts)
+const ADMIN_MIN_PASSWORD = 12;
+const password = await ask(`Contraseña (mín. ${ADMIN_MIN_PASSWORD} caracteres): `, true);
 rl.close();
 
-if (!email.includes("@") || password.length < 8) {
-  console.error("Correo inválido o contraseña muy corta.");
+if (!email.includes("@") || password.length < ADMIN_MIN_PASSWORD) {
+  console.error(`Correo inválido o contraseña muy corta (un administrador necesita al menos ${ADMIN_MIN_PASSWORD} caracteres).`);
   process.exit(1);
 }
 

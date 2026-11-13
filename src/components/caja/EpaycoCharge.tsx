@@ -3,6 +3,9 @@
 // Cobro con ePayco (checkout onpage) desde la CAJA. Usa los mismos endpoints y la misma verificación del kiosco:
 // el navegador solo manda productos y cantidades; el servidor calcula el total, verifica el pago con ePayco y factura.
 // Lo que reporte ePayco al navegador (hooks / ref_payco) es solo una PISTA: nunca marca la venta como pagada.
+// Canales (uno a la vez, lo hace cumplir el servidor):
+//   - "qr" (predeterminado en la caja si hay dominio público): QR hacia /pagar/<código>; NO se abre la ventana en pantalla.
+//   - "pantalla": checkout onpage de ePayco en este equipo; el enlace del celular queda cerrado.
 import { useCallback, useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { findRef, openOnpageCheckout, shapeOf } from "@/components/kiosco/epayco-client";
@@ -10,7 +13,20 @@ import { printTicket } from "@/lib/client/print";
 import { formatCOP, type CartLine } from "@/lib/money";
 import type { CheckoutResult } from "./CheckoutModal";
 
-export type EpaycoSale = { id: string; local: string; total: number; sessionId: string; expiresAt: string; test: boolean; payUrl?: string | null };
+export type PayChannel = "qr" | "pantalla";
+export type EpaycoSale = {
+  id: string;
+  local: string;
+  total: number;
+  /** sesión del checkout en pantalla (null mientras el canal sea QR) */
+  sessionId: string | null;
+  expiresAt: string;
+  test: boolean;
+  /** enlace del celular (solo con canal QR) */
+  payUrl?: string | null;
+  channel?: PayChannel;
+  qrAvailable?: boolean;
+};
 export type EpaycoStart =
   | { mode: "new"; cart: CartLine[]; result: CheckoutResult; total: number }
   | { mode: "resume"; sale: EpaycoSale; ref: string | null };
@@ -67,6 +83,8 @@ export default function EpaycoCharge({
   const [manualRef, setManualRef] = useState("");
   const [manualMsg, setManualMsg] = useState("");
   const [onLocalhost] = useState(() => typeof location !== "undefined" && location.hostname === "localhost");
+  const [switching, setSwitching] = useState(false);
+  const [switchError, setSwitchError] = useState("");
 
   const saleRef = useRef<EpaycoSale | null>(resume ? start.sale : null);
   const refPayco = useRef<string | null>(resume ? start.ref : null); // solo una PISTA: el servidor la verifica con ePayco
@@ -120,6 +138,10 @@ export default function EpaycoCharge({
   // ---------------------------------------------------------------- abrir el checkout
   const startCheckout = useCallback(async (s: EpaycoSale) => {
     setPhase("pagando");
+    if (!s.sessionId) {
+      setClosed(true);
+      return;
+    }
     setClosed(false);
     try {
       reopen.current = await openOnpageCheckout(s.sessionId, s.test, {
@@ -139,6 +161,47 @@ export default function EpaycoCharge({
       void fetch(`/api/kiosco/pagos/${s.id}/hooks`, { method: "POST", headers: json, body: JSON.stringify({ hook: "open_error", keys: [e instanceof Error ? e.message.slice(0, 60) : "error"], refFound: false }) }).catch(() => {});
     }
   }, []);
+
+  /** Empieza a cobrar por el canal del cobro: en pantalla abre el checkout; con QR solo muestra el código. */
+  const begin = useCallback(
+    (s: EpaycoSale) => {
+      if (s.channel === "qr") {
+        reopen.current = null;
+        setClosed(true);
+        setPhase("pagando");
+      } else void startCheckout(s);
+    },
+    [startCheckout]
+  );
+
+  /** Cambia de canal EN EL SERVIDOR (el anterior queda cerrado) y luego en la pantalla. */
+  const switchChannel = useCallback(
+    async (to: PayChannel) => {
+      const s = saleRef.current;
+      if (!s || switching) return;
+      setSwitching(true);
+      setSwitchError("");
+      try {
+        const r = await fetch(`/api/kiosco/pagos/${s.id}/canal`, { method: "POST", headers: json, body: JSON.stringify({ channel: to }) });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          setSwitchError(d.error ?? "No se pudo cambiar el medio de pago.");
+          return;
+        }
+        const next: EpaycoSale = { ...s, channel: d.channel, sessionId: d.session_id ?? null, payUrl: d.pay_url ?? null };
+        saleRef.current = next;
+        hooksLogged.current = new Set();
+        saveSale(next);
+        setSale(next);
+        begin(next);
+      } catch {
+        setSwitchError("Sin conexión. Intente de nuevo.");
+      } finally {
+        setSwitching(false);
+      }
+    },
+    [begin, switching]
+  );
 
   // ---------------------------------------------------------------- crear el cobro
   const createPayment = useCallback(async () => {
@@ -163,7 +226,10 @@ export default function EpaycoCharge({
         finish({ tone: "error", title: "No se pudo iniciar el cobro", message: d.error ?? "Intente de nuevo.", paid: false, retry: true });
         return;
       }
-      const s: EpaycoSale = { id: d.sale_id, local: d.local_number, total: d.total, sessionId: d.session_id, expiresAt: d.expires_at, test: !!d.test, payUrl: d.pay_url ?? null };
+      const s: EpaycoSale = {
+        id: d.sale_id, local: d.local_number, total: d.total, sessionId: d.session_id ?? null, expiresAt: d.expires_at, test: !!d.test,
+        payUrl: d.pay_url ?? null, channel: d.channel === "qr" ? "qr" : "pantalla", qrAvailable: !!d.qr_available,
+      };
       saleRef.current = s;
       refPayco.current = null;
       hooksLogged.current = new Set();
@@ -172,11 +238,11 @@ export default function EpaycoCharge({
       setSale(s);
       // Si los precios cambiaron desde que se armó el carrito, se avisa antes de cobrar
       if (Math.abs(s.total - start.total) > 0.01) setPhase("confirmar_total");
-      else void startCheckout(s);
+      else begin(s);
     } catch {
       finish({ tone: "error", title: "Sin conexión", message: "No se pudo conectar con el servidor. Intente de nuevo.", paid: false, retry: true });
     }
-  }, [start, finish, startCheckout]);
+  }, [start, finish, begin]);
 
   useEffect(() => {
     if (start.mode !== "new" || started.current) return;
@@ -211,13 +277,14 @@ export default function EpaycoCharge({
     return () => window.removeEventListener("message", onMsg);
   }, []);
 
-  // ---------------------------------------------------------------- QR del enlace de pago (solo con APP_PUBLIC_URL)
+  // ---------------------------------------------------------------- QR del enlace de pago (solo con canal QR)
   const [qr, setQr] = useState<string | null>(null);
-  const payUrl = sale?.payUrl ?? null;
+  const isQr = sale?.channel === "qr";
+  const payUrl = isQr ? sale?.payUrl ?? null : null;
   useEffect(() => {
     if (!payUrl) return;
     let alive = true;
-    QRCode.toDataURL(payUrl, { margin: 1, width: 200 })
+    QRCode.toDataURL(payUrl, { margin: 1, width: 260 })
       .then((u) => alive && setQr(u))
       .catch(() => {});
     return () => {
@@ -342,7 +409,7 @@ export default function EpaycoCharge({
                 <button onClick={cancel} className="px-5 py-3 rounded-lg border border-field text-[14px] font-medium text-body">
                   Cancelar
                 </button>
-                <button onClick={() => void startCheckout(sale)} className="px-6 py-3 rounded-lg bg-brand text-white text-[15px] font-bold">
+                <button onClick={() => begin(sale)} className="px-6 py-3 rounded-lg bg-brand text-white text-[15px] font-bold">
                   Cobrar {formatCOP(sale.total)}
                 </button>
               </div>
@@ -355,19 +422,25 @@ export default function EpaycoCharge({
                 <div className="text-[13px] font-semibold text-body">Total a pagar</div>
                 <div className="text-4xl font-extrabold">{formatCOP(sale.total)}</div>
               </div>
-              <p className="text-[15px]">
-                {closed ? "La ventana de pago está cerrada. Si el cliente aún no pagó, ábrala de nuevo." : "El cliente está pagando en la ventana de ePayco…"}
-              </p>
+              {isQr ? (
+                <div className="rounded-lg border border-line bg-white px-3 py-3 space-y-1">
+                  {qr ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={qr} alt="QR para pagar desde el celular" className="mx-auto w-56 h-56 max-w-full" />
+                  ) : (
+                    <div className="mx-auto w-56 h-56 max-w-full grid place-items-center text-[13px] text-gray-600">Generando el QR…</div>
+                  )}
+                  <p className="text-[14px] font-semibold text-gray-900">El cliente escanea el QR y paga en su celular</p>
+                </div>
+              ) : (
+                <p className="text-[15px]">
+                  {closed ? "La ventana de pago está cerrada. Si el cliente aún no pagó, ábrala de nuevo." : "El cliente está pagando en la ventana de ePayco…"}
+                </p>
+              )}
               <p className="text-[13px] text-dim">
                 Esperando la confirmación · vence en <b>{mmss}</b>
               </p>
-              {payUrl && qr && (
-                <div className="rounded-lg border border-line bg-subtle px-3 py-3 space-y-1">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={qr} alt="QR para pagar desde el celular" className="mx-auto w-40 h-40" />
-                  <p className="text-[12px] text-dim">O que el cliente escanee el QR y pague desde su celular.</p>
-                </div>
-              )}
+              {switchError && <p className="text-[13px] text-err-ink">{switchError}</p>}
               {onLocalhost && (
                 <p className="text-[12px] text-warn-ink bg-warn-soft border border-warn-line rounded-lg px-3 py-2">
                   Está usando <b>localhost</b>: ePayco no puede devolver a esta pantalla al terminar. Abra la caja en <b>http://127.0.0.1:3000</b>.
@@ -394,12 +467,30 @@ export default function EpaycoCharge({
                 </details>
               )}
               <div className="flex flex-wrap gap-3 justify-center pt-1">
-                {closed && (
+                {isQr && (
+                  <button
+                    onClick={() => void switchChannel("pantalla")}
+                    disabled={switching}
+                    className="px-5 py-3 min-h-11 rounded-lg border border-brand text-brand-text text-[14px] font-semibold hover:bg-brand-soft disabled:opacity-50"
+                  >
+                    {switching ? "Cambiando…" : "Pagar en esta pantalla"}
+                  </button>
+                )}
+                {!isQr && closed && (
                   <button
                     onClick={() => (reopen.current ? reopen.current() : void startCheckout(sale))}
                     className="px-5 py-3 rounded-lg bg-brand text-white text-[14px] font-bold"
                   >
                     Abrir el pago de nuevo
+                  </button>
+                )}
+                {!isQr && closed && sale.qrAvailable && (
+                  <button
+                    onClick={() => void switchChannel("qr")}
+                    disabled={switching}
+                    className="px-5 py-3 min-h-11 rounded-lg border border-brand text-brand-text text-[14px] font-semibold hover:bg-brand-soft disabled:opacity-50"
+                  >
+                    {switching ? "Cambiando…" : "Pagar con el celular (QR)"}
                   </button>
                 )}
                 {!askCancel ? (

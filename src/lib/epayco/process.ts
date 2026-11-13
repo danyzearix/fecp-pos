@@ -3,6 +3,9 @@
 //  - El servidor consulta a ePayco por su cuenta; nada que mande el navegador cuenta como prueba de pago.
 //  - Solo un veredicto 'approved' marca la venta como 'pagado'. Fallas, formatos raros o datos que no coinciden
 //    la dejan en 'pago_por_revisar'. Un pago aprobado DESPUÉS de vencer el cobro queda en 'pago_tardio'.
+//  - Un SEGUNDO pago aprobado de la misma venta (p. ej. pagó por QR y también en pantalla) NO toca la venta ni se factura:
+//    queda en payment_refs como 'duplicado' con el motivo "Pago duplicado de la venta X, reembolsar" y aparece en
+//    /admin/pagos-por-revisar → "Pagos duplicados".
 //  - Nunca factura aquí: devuelve startInvoicing y quien llama arranca la facturación (etapa 4).
 import { pool, query } from "../db";
 import { writeLog } from "../log";
@@ -77,6 +80,8 @@ const result = async (saleId: string, outcome: PaymentOutcome, local: string, st
   return { outcome, saleStatus: s?.status ?? "desconocido", message: customerMessage(outcome, local), startInvoicing };
 };
 
+export const duplicateReason = (local: string) => `Pago duplicado de la venta ${local}, reembolsar`;
+
 const FROM_REF: Record<string, PaymentOutcome> = {
   aprobado: "pagado",
   rechazado: "rechazado",
@@ -91,6 +96,7 @@ const FROM_REF: Record<string, PaymentOutcome> = {
  */
 async function settle(p: {
   saleId: string;
+  localNumber: string;
   ref: string;
   kind: "approved" | "rejected" | "review";
   reason: string;
@@ -104,6 +110,7 @@ async function settle(p: {
     const cur = (await c.query<{ status: SaleStatus }>("SELECT status FROM sales WHERE id = $1 FOR UPDATE", [p.saleId])).rows[0]?.status;
     let outcome: PaymentOutcome;
     let refOutcome: string;
+    let refReason = p.reason;
 
     if (p.kind === "approved") {
       if (cur === "esperando_pago") {
@@ -128,8 +135,8 @@ async function settle(p: {
         );
         outcome = "tardio"; refOutcome = "tardio";
       } else {
-        // La venta ya está pagada/facturada/en revisión/anulada: este es un SEGUNDO pago. No se toca la venta.
-        outcome = "duplicado"; refOutcome = "duplicado";
+        // La venta ya está pagada/facturada/en revisión/anulada: este es un SEGUNDO pago. No se toca la venta ni se factura.
+        outcome = "duplicado"; refOutcome = "duplicado"; refReason = duplicateReason(p.localNumber);
       }
     } else if (p.kind === "rejected") {
       if (cur === "esperando_pago") {
@@ -145,7 +152,7 @@ async function settle(p: {
 
     await c.query(
       `UPDATE payment_refs SET outcome = $2, reason = $3, amount = $4, detail = $5, finished_at = now() WHERE ref_payco = $1`,
-      [p.ref, refOutcome, p.reason, p.amount ?? p.tx?.amount ?? null, p.tx ? JSON.stringify(detailOf(p.tx)) : null]
+      [p.ref, refOutcome, refReason, p.amount ?? p.tx?.amount ?? null, p.tx ? JSON.stringify(detailOf(p.tx)) : null]
     );
     await c.query("COMMIT");
     return outcome;
@@ -220,8 +227,9 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
   }
 
   const kind = verdict.kind === "approved" ? "approved" : verdict.kind === "rejected" ? "rejected" : "review";
-  const reason = verdict.kind === "approved" ? "Pago aprobado y verificado" : verdict.reason;
-  const outcome = await settle({ saleId, ref, kind, reason, tx: tx ?? undefined });
+  let reason = verdict.kind === "approved" ? "Pago aprobado y verificado" : verdict.reason;
+  const outcome = await settle({ saleId, localNumber: sale.local_number, ref, kind, reason, tx: tx ?? undefined });
+  if (outcome === "duplicado") reason = duplicateReason(sale.local_number);
 
   await writeLog("pago", `Pago de ${sale.local_number}: ${outcome.toUpperCase()}${outcome === "pagado" ? "" : ` — ${reason}`}`, {
     level: outcome === "pagado" || outcome === "rechazado" ? "info" : "error",

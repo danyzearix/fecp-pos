@@ -5,6 +5,7 @@ import { writeLog } from "./log";
 import { cartTotals, lineAmounts, round2 } from "./money";
 import { getPosConfig } from "./config";
 import { itemToLine } from "./ticket";
+import { receiptRequired, type ReceiptStatus } from "./receipt-rules";
 import {
   CONSUMIDOR_FINAL_ID,
   ID_TYPES,
@@ -198,6 +199,11 @@ export async function createSale(sale: SaleIn, cashierId: number): Promise<Creat
     );
 
     const inserted = (ins.rowCount ?? 0) > 0;
+    // Transferencia: el comprobante es obligatorio. La foto se sube DESPUÉS de que la venta exista (puede venir de la cola
+    // sin conexión); mientras no llegue, la venta queda con "Comprobante pendiente".
+    if (inserted && receiptRequired(sale.payment_method)) {
+      await client.query("INSERT INTO sale_receipts (sale_id, status) VALUES ($1, 'pendiente') ON CONFLICT (sale_id) DO NOTHING", [sale.id]);
+    }
     if (inserted) {
       for (const it of sale.items) {
         await client.query(
@@ -328,17 +334,42 @@ export type SaleListRow = {
   status: string;
   created_at: string;
   last_error: string | null;
+  /** comprobante de pago: null = sin comprobante */
+  receipt_status: ReceiptStatus | null;
+  receipt_uploaded_at: string | null;
+  receipt_uploaded_by: string | null;
+  receipt_deleted_at: string | null;
+  /** fecha de la venta (Bogotá), para el nombre del archivo descargado */
+  sale_day: string;
 };
 
-export async function listSales(date: string, cashierId: number | null): Promise<SaleListRow[]> {
-  const { rows } = await query<SaleListRow & { c_first: string | null; c_last: string | null; c_company: string | null }>(
+/** Filtro de comprobante en el historial */
+export type ReceiptFilter = "todos" | "con" | "sin" | "pendiente";
+export const isReceiptFilter = (v: unknown): v is ReceiptFilter => v === "todos" || v === "con" || v === "sin" || v === "pendiente";
+
+export async function listSales(date: string, cashierId: number | null, receipt: ReceiptFilter = "todos"): Promise<SaleListRow[]> {
+  // "Con comprobante" = tiene foto (o la tuvo y se eliminó por retención); "Pendiente" = transferencia aún sin foto;
+  // "Sin comprobante" = nunca tuvo (ni pendiente).
+  const rf =
+    receipt === "con" ? "AND r.status IN ('activo','eliminado')" :
+    receipt === "pendiente" ? "AND r.status = 'pendiente'" :
+    receipt === "sin" ? "AND r.sale_id IS NULL" : "";
+  const { rows } = await query<
+    Omit<SaleListRow, "receipt_uploaded_at" | "receipt_deleted_at"> & {
+      c_first: string | null; c_last: string | null; c_company: string | null; receipt_uploaded_at: Date | null; receipt_deleted_at: Date | null;
+    }
+  >(
     `SELECT s.id, s.local_number, s.invoice_name, s.total::float8 AS total, s.payment_method, s.payment_reference,
             s.status, s.last_error, COALESCE(s.created_at_device, s.created_at) AS created_at, u.name AS cashier_name,
-            c.identification AS customer_identification, c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company
+            c.identification AS customer_identification, c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company,
+            r.status AS receipt_status, r.uploaded_at AS receipt_uploaded_at, ru.name AS receipt_uploaded_by, r.deleted_at AS receipt_deleted_at,
+            ${SALE_DAY_SQL}::text AS sale_day
        FROM sales s
        JOIN users u ON u.id = s.cashier_id
        LEFT JOIN customers c ON c.id = s.customer_id
-      WHERE ${SALE_DAY_SQL} = $1::date AND ($2::int IS NULL OR s.cashier_id = $2)
+       LEFT JOIN sale_receipts r ON r.sale_id = s.id
+       LEFT JOIN users ru ON ru.id = r.uploaded_by
+      WHERE ${SALE_DAY_SQL} = $1::date AND ($2::int IS NULL OR s.cashier_id = $2) ${rf}
       ORDER BY COALESCE(s.created_at_device, s.created_at) DESC
       LIMIT 500`,
     [date, cashierId]
@@ -349,6 +380,10 @@ export async function listSales(date: string, cashierId: number | null): Promise
       id: r.id, local_number: r.local_number, invoice_name: r.invoice_name, total: r.total,
       payment_method: r.payment_method, payment_reference: r.payment_reference, cashier_name: r.cashier_name,
       status: r.status, last_error: r.last_error, created_at: new Date(r.created_at).toISOString(),
+      receipt_status: r.receipt_status ?? null, receipt_uploaded_by: r.receipt_uploaded_by ?? null,
+      receipt_uploaded_at: r.receipt_uploaded_at ? new Date(r.receipt_uploaded_at).toISOString() : null,
+      receipt_deleted_at: r.receipt_deleted_at ? new Date(r.receipt_deleted_at).toISOString() : null,
+      sale_day: r.sale_day,
       customer_identification: isCF ? CONSUMIDOR_FINAL_ID : r.customer_identification,
       customer_name: isCF ? "Consumidor final" : r.c_company || [r.c_first, r.c_last].filter(Boolean).join(" ") || r.customer_identification,
     };

@@ -171,3 +171,43 @@ CREATE INDEX IF NOT EXISTS idx_payment_refs_outcome ON payment_refs (outcome);
 
 ALTER TABLE logs DROP CONSTRAINT IF EXISTS logs_type_check;
 ALTER TABLE logs ADD CONSTRAINT logs_type_check CHECK (type IN ('venta','factura','sync','login','error','admin','seguridad','pago'));
+
+-- ---------------------------------------------------------------------------
+-- Canales de pago de ePayco (uno a la vez) y pagos duplicados
+-- ---------------------------------------------------------------------------
+-- 'qr' = el cliente paga en su celular con /pagar/<código>; 'pantalla' = checkout onpage en el equipo (caja/kiosco).
+-- Solo UNO está abierto: cambiar de canal cierra el otro (el enlace muestra "Este cobro fue cambiado").
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS pay_channel            TEXT;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS pay_channel_changed_at TIMESTAMPTZ;
+ALTER TABLE sales DROP CONSTRAINT IF EXISTS sales_pay_channel_check;
+ALTER TABLE sales ADD CONSTRAINT sales_pay_channel_check CHECK (pay_channel IS NULL OR pay_channel IN ('qr','pantalla'));
+
+-- Un SEGUNDO pago aprobado de la misma venta (outcome 'duplicado') nunca se factura: queda para reembolso en Pagos por revisar.
+ALTER TABLE payment_refs ADD COLUMN IF NOT EXISTS refund_requested_at TIMESTAMPTZ;
+ALTER TABLE payment_refs ADD COLUMN IF NOT EXISTS refund_requested_by INTEGER;
+
+-- ---------------------------------------------------------------------------
+-- Comprobantes de pago (foto del voucher o de la transferencia). Ver src/lib/receipts.ts
+-- ---------------------------------------------------------------------------
+-- Una fila por venta (una imagen por venta). Estados:
+--   'pendiente' = transferencia registrada sin foto todavía (llega después, p. ej. desde la cola sin conexión)
+--   'activo'    = hay archivo (file_path relativo a RECEIPTS_DIR; nombre UUID, nunca el del navegador)
+--   'eliminado' = el archivo se borró por retención (RECEIPT_RETENTION_DAYS); el registro se conserva con deleted_at
+CREATE TABLE IF NOT EXISTS sale_receipts (
+  sale_id        UUID PRIMARY KEY REFERENCES sales(id),
+  status         TEXT NOT NULL,
+  file_path      TEXT,
+  mime_type      TEXT,
+  size_bytes     INTEGER,      -- después de comprimir
+  original_bytes INTEGER,      -- lo que mandó el navegador
+  width          INTEGER,
+  height         INTEGER,
+  uploaded_at    TIMESTAMPTZ,
+  uploaded_by    INTEGER REFERENCES users(id),
+  deleted_at     TIMESTAMPTZ,  -- fecha de eliminación por retención
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE sale_receipts DROP CONSTRAINT IF EXISTS sale_receipts_status_check;
+ALTER TABLE sale_receipts ADD CONSTRAINT sale_receipts_status_check CHECK (status IN ('activo','pendiente','eliminado'));
+CREATE INDEX IF NOT EXISTS idx_sale_receipts_status ON sale_receipts (status);

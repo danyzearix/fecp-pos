@@ -7,7 +7,8 @@ export const maxDuration = 60;
 
 /**
  * Crea un cobro electrónico. Lo usan el kiosco (rol cliente → venta 'kiosco') y la caja (cajero/admin → venta 'caja').
- * Acepta productos y cantidades; el total lo calcula el servidor.
+ * Acepta productos y cantidades; el total lo calcula el servidor. El cobro nace con UN canal abierto:
+ * caja → QR en el celular (si hay dominio público); kiosco → checkout en pantalla.
  */
 export async function POST(req: Request) {
   const g = await guardApi(req);
@@ -18,11 +19,12 @@ export async function POST(req: Request) {
   return NextResponse.json({
     sale_id: r.saleId,
     local_number: r.localNumber,
-    session_id: r.sessionId, // lo usa el navegador para abrir el checkout de ePayco (no es una llave)
+    session_id: r.sessionId, // solo en canal "pantalla": lo usa el navegador para abrir el checkout de ePayco (no es una llave)
     total: r.total,
     expires_at: r.expiresAt,
     test: r.testMode,
-    // Solo para la caja: el kiosco no muestra el enlace (el pay_token completo es el "código" de quien paga desde el celular)
-    pay_url: sourceForRole(g.user.role) === "caja" ? r.payUrl : null,
+    channel: r.channel,
+    qr_available: r.qrAvailable,
+    pay_url: r.payUrl, // solo en canal "qr"
   });
 }

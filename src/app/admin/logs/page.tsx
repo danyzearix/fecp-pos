@@ -1,6 +1,9 @@
 import { requirePage } from "@/lib/auth";
 import { query } from "@/lib/db";
 import { isDateStr, todayBogota } from "@/lib/sales";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = { title: "Logs" };
 
 type Row = { id: number; level: string; type: string; message: string; detail: unknown; created_at: Date; user_name: string | null };
 

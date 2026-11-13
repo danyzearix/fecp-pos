@@ -5,7 +5,7 @@ import LinkNotFound from "../LinkNotFound";
 import PagarClient from "../PagarClient";
 
 export const dynamic = "force-dynamic";
-export const metadata: Metadata = { title: "Resultado del pago — FECP", robots: { index: false, follow: false } };
+export const metadata: Metadata = { title: "Resultado del pago", robots: { index: false, follow: false } };
 
 /**
  * PÚBLICA (sin sesión): a esta página vuelve ePayco al cliente (?ref_payco=...). OJO: llegar aquí NO significa que pagó.
@@ -20,7 +20,7 @@ export default async function RespuestaPage({ params }: { params: Promise<{ code
       code={code}
       mode="respuesta"
       initial={{
-        local_number: s.local_number, total: s.total, status: s.status, invoice_name: s.invoice_name, can_pay: s.can_pay,
+        local_number: s.local_number, total: s.total, status: s.status, invoice_name: s.invoice_name, can_pay: s.can_pay, channel_changed: s.channel_changed,
         message: s.status === "esperando_pago" ? "Verificando su pago…" : publicMessage(s.status), test: getEpaycoConfig().testMode, expires_at: s.expires_at,
       }}
     />

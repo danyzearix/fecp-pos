@@ -13,7 +13,7 @@ Internet ─443─▶ Traefik (host) ─▶ red fecp_pos_web ─▶ fecp-pos-app
 |---|---|
 | Contenedores | `fecp-pos-app`, `fecp-pos-db` |
 | Redes | `fecp_pos_internal` (`internal: true`, app↔db), `fecp_pos_web` (solo la app) |
-| Volumen | `fecp_pos_pgdata` |
+| Volúmenes | `fecp_pos_pgdata` (base de datos), `fecp_pos_uploads` (comprobantes de pago, montado en `/app/uploads` de la app) |
 | Router / servicio de Traefik | `fecp-pos-web` |
 | Proyecto de Compose | `fecp-pos` |
 
@@ -47,7 +47,7 @@ Si falta una variable, el error dice cuál (`falta POSTGRES_PASSWORD`, `falta PO
 ```bash
 # 2) Servicios, volumen e imagen
 dc config --services        # esperado: app  y  db
-dc config --volumes         # esperado: fecp_pos_pgdata
+dc config --volumes         # esperado: fecp_pos_pgdata  y  fecp_pos_uploads
 
 # 3) No debe haber puertos publicados, host network, privileged, docker.sock ni capacidades extra (esperado: NO imprime nada)
 dc config | grep -nE '^\s*(ports|network_mode|privileged|pid|cap_add|devices):|docker\.sock|/var/run'
@@ -120,9 +120,23 @@ Si la sincronización se corta, revisa los tiempos de respuesta (`respondingTime
 ### 2.4 Actualizar a una versión nueva
 ```bash
 cd /docker/fecp-pos
+sudo /docker/fecp-pos/deploy/backup.sh   # respaldo antes de actualizar
 git pull                         # o copia los archivos nuevos
-dc build && dc up -d             # recrea solo fecp-pos-app (y db si cambió)
+dc build && dc up -d             # recrea solo fecp-pos-app (y db si cambió); crea los volúmenes nuevos si faltan
 dc exec app node db/setup.mjs    # aplica cambios de tablas si los hay (idempotente: no borra datos)
+```
+Si `.env.production.example` trae variables nuevas, cópialas a tu `.env.production` (y vuelve a `dc up -d`).
+
+### 2.4.1 Scripts de `db/` en el servidor
+La imagen incluye `db/` (`setup`, `seed`, `iva-report`, `siigo-test-docs`). Para los reportes se usa un contenedor **temporal**
+(`run --rm`), con `--no-deps` (no toca la base ni la app en marcha) y **`-l traefik.enable=false`** (si no, Traefik le mandaría
+tráfico de la web mientras dura):
+```bash
+# Documentos de PRUEBA creados en Siigo (para anularlos antes de abrir)
+dc run --rm --no-deps -l traefik.enable=false app node db/siigo-test-docs.mjs
+
+# Productos con IVA distinto entre WooCommerce y Siigo → CSV guardado FUERA del contenedor (en /docker/fecp-pos)
+dc run --rm -T --no-deps -l traefik.enable=false app node db/iva-report.mjs --stdout > productos-iva-diferente.csv
 ```
 
 ### 2.5 Comandos útiles (todos limitados al POS)
@@ -232,8 +246,9 @@ Diagnóstico, en orden:
 `deploy/backup.sh` hace cada corrida:
 1. `pg_dump` comprimido desde `fecp-pos-db` → `/docker/fecp-pos/backups/fecp_pos_AAAAMMDD_HHMMSS.dump` (permisos 600).
 2. Verifica que el archivo se pueda leer.
-3. Borra los respaldos locales de más de **14 días** (`BACKUP_RETENTION_DAYS`).
-4. Si `BACKUP_RCLONE_REMOTE` está definido, lo envía **cifrado** a Backblaze B2. Si el envío falla, sale con error (código 3) y el respaldo local queda.
+3. **Comprobantes de pago** (volumen `fecp_pos_uploads`) → `fecp_pos_AAAAMMDD_HHMMSS_comprobantes.tar.gz`, con el **mismo nombre base**: los dos archivos forman un solo respaldo. Si no se pudo (p. ej. la app estaba detenida), la base igual queda respaldada y el script termina con código 4.
+4. Borra los respaldos locales de más de **14 días** (`BACKUP_RETENTION_DAYS`).
+5. Si `BACKUP_RCLONE_REMOTE` está definido, envía **los dos archivos cifrados** a Backblaze B2. Si el envío falla, sale con error (código 3) y el respaldo local queda.
 
 **rclone no se instala en el servidor:** corre como contenedor efímero (`rclone/rclone`, se borra al terminar) y su configuración vive en `/docker/fecp-pos/rclone/rclone.conf`.
 
@@ -269,7 +284,7 @@ Dentro de rclone:
 En `.env.production`:
 ```
 BACKUP_RCLONE_REMOTE=fecp-b2-cifrado:pos
-BACKUP_REMOTE_RETENTION_DAYS=          # opcional (p. ej. 60). Vacío = no se borra nada en B2
+BACKUP_REMOTE_RETENTION_DAYS=180       # NO más de RECEIPT_RETENTION_DAYS (ver 5.7). Vacío = no se borra nada en B2
 ```
 ```bash
 sudo /docker/fecp-pos/deploy/backup.sh                       # a mano, una vez
@@ -291,7 +306,7 @@ sudo crontab -e
 ```bash
 sudo /docker/fecp-pos/deploy/restore.sh /docker/fecp-pos/backups/fecp_pos_20261112_031500.dump --probar
 ```
-Restaura en una base temporal, muestra cuántos usuarios/productos/ventas contiene y la borra. **Hazlo de vez en cuando**: un respaldo no probado no es un respaldo.
+Restaura en una base temporal, muestra cuántos usuarios/productos/ventas contiene y la borra; si junto al `.dump` está su `_comprobantes.tar.gz`, verifica que no esté dañado y cuenta las fotos. **Hazlo de vez en cuando**: un respaldo no probado no es un respaldo.
 
 **Si el respaldo está solo en B2 (cifrado):**
 ```bash
@@ -302,7 +317,7 @@ Restaura en una base temporal, muestra cuántos usuarios/productos/ventas contie
 sudo docker run --rm -v /docker/fecp-pos/rclone:/config/rclone rclone/rclone:1.68.2 ls fecp-b2-cifrado:pos
 # c) Bajar y descifrar uno a la carpeta de respaldos:
 sudo docker run --rm -v /docker/fecp-pos/rclone:/config/rclone -v /docker/fecp-pos/backups:/data rclone/rclone:1.68.2 \
-  copy fecp-b2-cifrado:pos/fecp_pos_20261112_031500.dump /data
+  copy fecp-b2-cifrado:pos /data --include 'fecp_pos_20261112_031500*'      # el .dump y su _comprobantes.tar.gz
 # d) Verificar y luego restaurar:
 sudo /docker/fecp-pos/deploy/restore.sh /docker/fecp-pos/backups/fecp_pos_20261112_031500.dump --probar
 ```
@@ -312,6 +327,12 @@ sudo /docker/fecp-pos/deploy/restore.sh /docker/fecp-pos/backups/fecp_pos_202611
 sudo /docker/fecp-pos/deploy/restore.sh /docker/fecp-pos/backups/fecp_pos_20261112_031500.dump
 ```
 Pide escribir `RESTAURAR`. Hace antes un respaldo de seguridad de lo actual, **detiene y vuelve a arrancar solo `fecp-pos-app`** (`docker compose stop app` / `start app` del proyecto `fecp-pos`), restaura en una sola transacción (si algo falla, la base queda como estaba).
+Si está el `_comprobantes.tar.gz` del mismo respaldo, **reemplaza también las fotos** del volumen `fecp_pos_uploads` (las extrae primero aparte y solo si salió bien reemplaza; usa la imagen del POS, como usuario `node` y sin red). Si no está, las fotos actuales no se tocan.
+
+### 5.7 Comprobantes y retención de 180 días
+- La app borra sola (tarea diaria, con bloqueo en la base para no correr dos veces) los **archivos** de comprobantes con más de `RECEIPT_RETENTION_DAYS` (180) días desde la fecha de la venta. El registro queda como *Eliminado por retención* con su fecha, y en **Admin → Logs** queda cuántos borró.
+- Como cada respaldo lleva las fotos, **`BACKUP_REMOTE_RETENTION_DAYS` no debe superar 180**: si fuera mayor, una foto ya eliminada en el POS seguiría existiendo en Backblaze más tiempo del permitido. Con 180 en los dos, ninguna copia vive más de ~180 días (+ la retención local de 14).
+- Si Backblaze tiene activado *versionado* o *Object Lock* en el bucket, también limita ahí la vida de los archivos ocultos/borrados (*Lifecycle Settings*) a ≤ 180 días.
 
 **Servidor nuevo desde cero:** repite la sección 2 hasta `dc up -d`, **omite `seed.mjs`**, y ejecuta `restore.sh` con el respaldo.
 
@@ -321,7 +342,8 @@ Pide escribir `RESTAURAR`. Hace antes un respaldo de seguridad de lo actual, **d
 1. Prueba de punta a punta con los modos de prueba (caja, kiosco, enlace de pago, regreso a la caja, factura de prueba en Siigo).
 2. Deja la base en cero (README sección 12; en Docker). **Irreversible**: haz antes un respaldo (`deploy/backup.sh`).
    ```bash
-   dc exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "TRUNCATE payment_refs, sale_items, sales, logs RESTART IDENTITY; ALTER SEQUENCE kiosk_sale_seq RESTART WITH 1;"'
+   dc exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "TRUNCATE sale_receipts, payment_refs, sale_items, sales, logs RESTART IDENTITY; ALTER SEQUENCE kiosk_sale_seq RESTART WITH 1;"'
+   dc exec app sh -c 'rm -rf /app/uploads/comprobantes/*'      # y las fotos de prueba
    ```
 3. Pasa a real **solo cuando lo decidas** (README sección 13: `SIIGO_TEST_MODE=false`, `EPAYCO_TEST_MODE=false`, `EPAYCO_SIIGO_PAYMENT_ID` real). Tras editar `.env.production`: `dc up -d` recrea la app con los valores nuevos.
 4. **Las cajas y el kiosco deben iniciar sesión de nuevo** (la sesión es por dirección; cambian de `127.0.0.1` a `pos.fecp.me`). Actualiza sus accesos directos de Chrome (README, sección 7).

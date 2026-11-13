@@ -18,7 +18,13 @@ import ExitDialog from "./ExitDialog";
 
 type Screen = "tienda" | "datos" | "confirmar_total" | "pagando" | "procesando" | "resultado";
 type Outcome = { tone: "ok" | "warn" | "error"; title: string; message: string; localNumber?: string; invoice?: string | null; retry: boolean };
-type Sale = { id: string; local: string; total: number; sessionId: string; expiresAt: string; test: boolean };
+// Canal de pago (uno a la vez; lo hace cumplir el servidor): en el kiosco el predeterminado es "pantalla" (checkout de
+// ePayco aquí mismo) y "qr" (pagar en el celular) es la opción secundaria, solo si hay dominio público.
+type PayChannel = "qr" | "pantalla";
+type Sale = {
+  id: string; local: string; total: number; sessionId: string | null; expiresAt: string; test: boolean;
+  channel?: PayChannel; qrAvailable?: boolean; payUrl?: string | null;
+};
 type StatusResp = { status: string; payment_status: string | null; local_number: string; invoice_name: string | null };
 
 const IDLE_RESET_MS = 180_000; // 3 minutos sin actividad → vacía el carrito y vuelve al inicio
@@ -70,6 +76,8 @@ export default function KioscoClient({
   const [secondsLeft, setSecondsLeft] = useState(0);
   const [localTicket, setLocalTicket] = useState<{ data: TicketData; config: PosConfig; qr: string | null } | null>(null);
   const [startDismissed, setStartDismissed] = useState(false); // ya tocaron "Toque para iniciar"
+  const [switching, setSwitching] = useState(false);
+  const [payQr, setPayQr] = useState<string | null>(null); // imagen del QR del enlace (solo con canal QR)
   const { isFull, toggle: toggleFullscreen } = useFullscreen();
   const goFullscreen = useCallback(async () => {
     if (!document.fullscreenElement) await toggleFullscreen();
@@ -132,6 +140,7 @@ export default function KioscoClient({
     hooksLogged.current = new Set();
     saveSale(null);
     setCheckoutClosed(false);
+    setPayQr(null);
     setOutcome(null);
     setIdleWarn(false);
     setScreen("tienda");
@@ -400,6 +409,12 @@ export default function KioscoClient({
   const startCheckout = useCallback(
     async (s: Sale) => {
       setScreen("pagando");
+      if (s.channel === "qr" || !s.sessionId) {
+        // Canal QR: no se abre la ventana de ePayco en el kiosco
+        reopen.current = null;
+        setCheckoutClosed(true);
+        return;
+      }
       setCheckoutClosed(false);
       try {
         reopen.current = await openOnpageCheckout(s.sessionId, s.test, {
@@ -421,6 +436,41 @@ export default function KioscoClient({
     [showToast]
   );
 
+  /** Cambia el canal EN EL SERVIDOR (el anterior queda cerrado) y luego en la pantalla. */
+  async function switchChannel(to: PayChannel) {
+    const s = saleRef.current;
+    if (!s || switching) return;
+    setSwitching(true);
+    try {
+      const r = await fetch(`/api/kiosco/pagos/${s.id}/canal`, { method: "POST", headers: json, body: JSON.stringify({ channel: to }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) return showToast(d.error ?? "No se pudo cambiar la forma de pago.", "err");
+      const next: Sale = { ...s, channel: d.channel, sessionId: d.session_id ?? null, payUrl: d.pay_url ?? null };
+      saleRef.current = next;
+      hooksLogged.current = new Set();
+      saveSale(next);
+      setSale(next);
+      void startCheckout(next);
+    } catch {
+      showToast("Sin conexión. Intente de nuevo.", "err");
+    } finally {
+      setSwitching(false);
+    }
+  }
+
+  // QR del enlace de pago (solo cuando el canal activo es QR)
+  const qrUrl = sale?.channel === "qr" ? sale.payUrl ?? null : null;
+  useEffect(() => {
+    if (!qrUrl) return;
+    let alive = true;
+    QRCode.toDataURL(qrUrl, { margin: 1, width: 320 })
+      .then((u) => alive && setPayQr(u))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [qrUrl]);
+
   async function createPayment() {
     setBusy(true);
     setFormError("");
@@ -434,6 +484,7 @@ export default function KioscoClient({
           checkout_type: type,
           customer: buildCustomerFromForm(form, type),
           notify_email: form.email.trim() || undefined,
+          channel: "pantalla", // en el kiosco se paga aquí mismo; el QR es la opción secundaria
         }),
       });
       const d = await res.json().catch(() => ({}));
@@ -442,7 +493,10 @@ export default function KioscoClient({
         setBusy(false);
         return;
       }
-      const s: Sale = { id: d.sale_id, local: d.local_number, total: d.total, sessionId: d.session_id, expiresAt: d.expires_at, test: !!d.test };
+      const s: Sale = {
+        id: d.sale_id, local: d.local_number, total: d.total, sessionId: d.session_id ?? null, expiresAt: d.expires_at, test: !!d.test,
+        channel: d.channel === "qr" ? "qr" : "pantalla", qrAvailable: !!d.qr_available, payUrl: d.pay_url ?? null,
+      };
       saleRef.current = s;
       refPayco.current = null;
       hooksLogged.current = new Set();
@@ -664,16 +718,39 @@ export default function KioscoClient({
           {screen === "pagando" && sale && (
             <Center>
               {sale.test && <div className="rounded-xl bg-warn-soft border border-warn-line text-warn-ink px-5 py-2 text-lg font-semibold">MODO DE PRUEBA: no se cobra dinero real</div>}
-              <h1 className="text-3xl font-bold">Complete el pago en la ventana de ePayco</h1>
+              <h1 className="text-3xl font-bold">{sale.channel === "qr" ? "Escanee el código con su celular para pagar" : "Complete el pago en la ventana de ePayco"}</h1>
               <div className="text-5xl font-extrabold text-brand-text">{formatCOP(sale.total)}</div>
+              {sale.channel === "qr" && (
+                <div className="rounded-2xl bg-white p-4 border border-line">
+                  {payQr ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={payQr} alt="QR para pagar desde el celular" className="w-64 h-64 max-w-full" />
+                  ) : (
+                    <div className="w-64 h-64 max-w-full grid place-items-center text-gray-600">Generando el código…</div>
+                  )}
+                </div>
+              )}
               <p className="text-[18px] text-soft">Compra <b>{sale.local}</b> · Tiempo restante <b>{mmss}</b></p>
               <p className="text-[16px] text-dim max-w-xl">Esta pantalla se actualiza sola cuando el pago sea aprobado. No toque nada más.</p>
-              <div className="flex gap-4">
+              <div className="flex flex-wrap justify-center gap-4">
                 <button onClick={reset} className="px-8 py-4 rounded-xl border border-field text-xl font-medium text-body bg-surface">Cancelar compra</button>
-                {checkoutClosed && (
-                  <button onClick={() => { setCheckoutClosed(false); if (reopen.current) reopen.current(); else void startCheckout(sale); }} className="px-8 py-4 rounded-xl bg-brand text-white text-xl font-semibold">
-                    Abrir el pago de nuevo
+                {sale.channel === "qr" ? (
+                  <button onClick={() => void switchChannel("pantalla")} disabled={switching} className="px-8 py-4 rounded-xl bg-brand text-white text-xl font-semibold disabled:opacity-50">
+                    {switching ? "Cambiando…" : "Pagar en esta pantalla"}
                   </button>
+                ) : (
+                  checkoutClosed && (
+                    <>
+                      <button onClick={() => { setCheckoutClosed(false); if (reopen.current) reopen.current(); else void startCheckout(sale); }} className="px-8 py-4 rounded-xl bg-brand text-white text-xl font-semibold">
+                        Abrir el pago de nuevo
+                      </button>
+                      {sale.qrAvailable && (
+                        <button onClick={() => void switchChannel("qr")} disabled={switching} className="px-8 py-4 rounded-xl border border-brand text-brand-text text-xl font-semibold bg-surface disabled:opacity-50">
+                          {switching ? "Cambiando…" : "Pagar con el celular (QR)"}
+                        </button>
+                      )}
+                    </>
+                  )
                 )}
               </div>
             </Center>

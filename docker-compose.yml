@@ -27,6 +27,10 @@ services:
       TZ: America/Bogota
       # La clave se toma de .env.production (por eso POSTGRES_PASSWORD debe ser hexadecimal: va dentro de una URL).
       DATABASE_URL: postgresql://${POSTGRES_USER:?falta POSTGRES_USER}:${POSTGRES_PASSWORD:?falta POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:?falta POSTGRES_DB}
+    # Comprobantes de pago: volumen PROPIO del POS, fuera de public/ (no se sirve directo: solo por el endpoint autenticado).
+    # La carpeta /app/uploads de la imagen ya pertenece al usuario node; Docker copia esos permisos al crear el volumen.
+    volumes:
+      - fecp_pos_uploads:/app/uploads
     networks:
       - internal
       - web
@@ -87,3 +91,5 @@ networks:
 volumes:
   fecp_pos_pgdata:
     name: fecp_pos_pgdata
+  fecp_pos_uploads:
+    name: fecp_pos_uploads

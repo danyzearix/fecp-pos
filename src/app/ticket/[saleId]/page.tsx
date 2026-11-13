@@ -1,5 +1,8 @@
 import TicketPage from "@/components/ticket/TicketPage";
 import { requirePage } from "@/lib/auth";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = { title: "Tirilla" };
 
 // Tirilla de 80 mm. Los datos los pide el navegador a /api/sales/[id], que también valida permisos.
 export default async function Page({ params }: { params: Promise<{ saleId: string }> }) {

@@ -5,22 +5,23 @@ import { epaycoMissingEnv, getEpaycoConfig } from "@/lib/epayco/config";
 import { createSaleSession } from "@/lib/epayco/session";
 import { writeLog } from "@/lib/log";
 import { browserOrigin } from "@/lib/origin";
-import { findPublicSale } from "@/lib/pay-link";
+import { CHANNEL_CHANGED_MESSAGE, findPublicSale } from "@/lib/pay-link";
 import { rateLimited } from "@/lib/rate-limit";
 import { epaycoInvoicingBlocker } from "@/lib/siigo/payment";
 
 export const maxDuration = 60;
 
 /**
- * PÚBLICO (sin sesión). Crea una sesión de ePayco NUEVA para pagar esta venta desde el celular. La sesión original (la de la
- * caja o el kiosco) vuelve a SU pantalla; esta vuelve a /pagar/<código>/respuesta. El monto sale de NUESTRA base de datos.
- * Solo si la venta sigue 'esperando_pago' y no ha vencido.
+ * PÚBLICO (sin sesión). Crea una sesión de ePayco para pagar esta venta desde el celular; vuelve a /pagar/<código>/respuesta.
+ * El monto sale de NUESTRA base de datos. Solo si la venta sigue 'esperando_pago', no ha vencido y su canal activo es QR.
  */
 export async function POST(req: Request, ctx: { params: Promise<{ code: string }> }) {
   const { code } = await ctx.params;
   if (rateLimited(`pagar:sesion:${code.slice(0, 12)}`, 10, 10 * 60_000)) return NextResponse.json({ error: "Demasiados intentos. Espere unos minutos." }, { status: 429 });
   const s = await findPublicSale(code);
   if (!s) return NextResponse.json({ error: "Enlace no válido" }, { status: 404 });
+  // El enlace solo sirve mientras el canal activo del cobro sea QR (validado aquí, en el servidor)
+  if (s.channel_changed) return NextResponse.json({ error: CHANNEL_CHANGED_MESSAGE }, { status: 409 });
   if (!s.can_pay) return NextResponse.json({ error: "Esta compra ya no admite pago desde este enlace" }, { status: 409 });
 
   if (epaycoMissingEnv().length || epaycoInvoicingBlocker()) {

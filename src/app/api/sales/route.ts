@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
 import { writeLog } from "@/lib/log";
-import { createSale, isDateStr, listSales, parseSale, todayBogota, yesterdayBogota } from "@/lib/sales";
+import { createSale, isDateStr, isReceiptFilter, listSales, parseSale, todayBogota, yesterdayBogota } from "@/lib/sales";
 import { invoiceSale, sweepStuckInvoicing } from "@/lib/siigo/invoice";
 
 export const maxDuration = 180; // creación de factura hasta 120 s + consulta de estado DIAN
@@ -58,7 +58,8 @@ export async function GET(req: Request) {
   const param = new URL(req.url).searchParams.get("date");
   const today = todayBogota();
   const date = isDateStr(param) && (isAdmin || param === today || param === yesterdayBogota()) ? param : today;
-  const rows = await listSales(date, isAdmin ? null : user.uid);
+  const rf = new URL(req.url).searchParams.get("comprobante");
+  const rows = await listSales(date, isAdmin ? null : user.uid, isReceiptFilter(rf) ? rf : "todos");
 
   const sales = isAdmin ? rows : rows.map((r) => ({ ...r, last_error: null }));
   return NextResponse.json({ date, role: user.role, sales }, { headers: { "Cache-Control": "no-store" } });

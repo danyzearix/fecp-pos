@@ -48,3 +48,6 @@ next-env.d.ts
 # respaldos y configuración de rclone del servidor (contienen datos y llaves: nunca a git)
 /backups/
 /rclone/
+
+# comprobantes de pago guardados en desarrollo (nunca a git)
+/uploads/

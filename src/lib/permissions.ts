@@ -46,6 +46,8 @@ const CAJA_API: ApiRule[] = [
   ["GET", /^\/api\/sales$/], // historial (el cajero solo recibe las suyas del día: se filtra en el endpoint)
   ["POST", /^\/api\/sales$/],
   ["GET", new RegExp(`^/api/sales/${UUID}$`)], // datos de tirilla (reimprimir)
+  // Comprobante de pago: ver/descargar y adjuntar. El endpoint aplica la regla: admin todos; cajero solo los suyos de hoy/ayer.
+  [["GET", "POST"], new RegExp(`^/api/sales/${UUID}/comprobante$`)],
   ["POST", /^\/api\/sync\/products\/incremental$/],
 ];
 
@@ -58,6 +60,7 @@ const CAJA_EPAYCO_API: ApiRule[] = [
   ["GET", new RegExp(`^/api/kiosco/pagos/${UUID}$`)],
   ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/confirmar$`)],
   ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/hooks$`)],
+  ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/canal$`)], // QR en el celular ↔ en pantalla (uno a la vez)
 ];
 
 export const API_BY_ROLE: Record<Role, ApiRule[]> = {
@@ -79,6 +82,7 @@ export const API_BY_ROLE: Record<Role, ApiRule[]> = {
     ["POST", /^\/api\/kiosco\/pagos$/],
     ["GET", new RegExp(`^/api/kiosco/pagos/${UUID}$`)],
     ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/confirmar$`)],
+    ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/canal$`)],
   ],
 };
 

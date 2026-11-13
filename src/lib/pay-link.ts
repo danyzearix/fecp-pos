@@ -15,7 +15,11 @@ export type PublicSale = {
   invoice_name: string | null;
   expires_at: string | null;
   can_pay: boolean;
+  /** el cobro sigue abierto pero se pasó a "pagar en pantalla": este enlace ya no sirve */
+  channel_changed: boolean;
 };
+
+export const CHANNEL_CHANGED_MESSAGE = "Este cobro fue cambiado, pide uno nuevo en caja.";
 
 const MESSAGE: Record<string, string> = {
   esperando_pago: "Esperando su pago…",
@@ -31,8 +35,13 @@ const MESSAGE: Record<string, string> = {
   anulada: "Esta compra fue cancelada.",
 };
 export const publicMessage = (status: string) => MESSAGE[status] ?? "Procesando…";
+/** Mensaje para el cliente según el estado y el canal (si se cambió a "en pantalla", el enlace ya no sirve). */
+export const publicMessageFor = (s: Pick<PublicSale, "status" | "channel_changed">) => (s.channel_changed ? CHANNEL_CHANGED_MESSAGE : publicMessage(s.status));
 
-/** Busca la venta por su código. Solo ventas de pago electrónico. Vence los cobros que ya pasaron de tiempo. */
+/**
+ * Busca la venta por su código. Solo ventas de pago electrónico. Vence los cobros que ya pasaron de tiempo.
+ * Solo se puede pagar por aquí si el canal activo del cobro es QR (un cobro nunca tiene los dos canales abiertos).
+ */
 export async function findPublicSale(code: string): Promise<PublicSale | null> {
   if (!PAY_CODE_RE.test(code)) return null;
   const first = await query<{ id: string }>("SELECT id FROM sales WHERE pay_token = $1 AND payment_method = 'epayco'", [code]);
@@ -40,8 +49,9 @@ export async function findPublicSale(code: string): Promise<PublicSale | null> {
   await expireWaitingPayments(first.rows[0].id).catch(() => {});
   const { rows } = await query<{
     id: string; local_number: string; status: string; payment_status: string | null; total: number; invoice_name: string | null; payment_expires_at: Date | null;
+    pay_channel: string | null;
   }>(
-    "SELECT id, local_number, status, payment_status, total::float8 AS total, invoice_name, payment_expires_at FROM sales WHERE id = $1",
+    "SELECT id, local_number, status, payment_status, total::float8 AS total, invoice_name, payment_expires_at, pay_channel FROM sales WHERE id = $1",
     [first.rows[0].id]
   );
   const s = rows[0];
@@ -55,6 +65,7 @@ export async function findPublicSale(code: string): Promise<PublicSale | null> {
     total: s.total,
     invoice_name: s.invoice_name,
     expires_at: exp?.toISOString() ?? null,
-    can_pay: s.status === "esperando_pago" && !!exp && exp.getTime() > Date.now(),
+    can_pay: s.status === "esperando_pago" && !!exp && exp.getTime() > Date.now() && s.pay_channel === "qr",
+    channel_changed: s.status === "esperando_pago" && s.pay_channel !== "qr",
   };
 }

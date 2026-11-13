@@ -28,8 +28,12 @@ ENV NODE_ENV=production \
     PORT=3000 \
     TZ=America/Bogota
 
-# Base de datos de zonas horarias (Alpine no la trae) para que TZ=America/Bogota funcione en el sistema
-RUN apk add --no-cache tzdata
+# Base de datos de zonas horarias (Alpine no la trae) para que TZ=America/Bogota funcione en el sistema.
+# /app/uploads: punto de montaje del volumen de comprobantes, de propiedad de node (Docker copia el dueño al crear el volumen).
+RUN apk add --no-cache tzdata \
+ && mkdir -p /app/uploads/comprobantes \
+ && chown -R node:node /app/uploads \
+ && chmod 700 /app/uploads /app/uploads/comprobantes
 
 # Servidor autocontenido de Next (incluye pg, bcryptjs, jose y qrcode, que la app ya usa)
 COPY --from=build --chown=node:node /app/.next/standalone ./

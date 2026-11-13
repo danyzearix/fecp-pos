@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getEpaycoConfig } from "@/lib/epayco/config";
-import { findPublicSale, publicMessage } from "@/lib/pay-link";
+import { findPublicSale, publicMessageFor } from "@/lib/pay-link";
 import { rateLimited } from "@/lib/rate-limit";
 
 /** PÚBLICO (sin sesión). Estado de una venta por su código de pago. Solo lee nuestra base de datos. */
@@ -12,7 +12,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ code: string }
   return NextResponse.json(
     {
       local_number: s.local_number, total: s.total, status: s.status, payment_status: s.payment_status, invoice_name: s.invoice_name,
-      expires_at: s.expires_at, can_pay: s.can_pay, test: getEpaycoConfig().testMode, message: publicMessage(s.status),
+      expires_at: s.expires_at, can_pay: s.can_pay, channel_changed: s.channel_changed, test: getEpaycoConfig().testMode, message: publicMessageFor(s),
     },
     { headers: { "Cache-Control": "no-store" } }
   );

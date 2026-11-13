@@ -81,7 +81,7 @@ Abre `.env.local` y completa los valores. **Nunca subas este archivo a un reposi
 
 ```powershell
 npm run db:setup     # crea/actualiza las tablas (se puede repetir sin perder datos)
-npm run db:seed      # crea el administrador (pide correo y contraseña) y el cliente Consumidor final
+npm run db:seed      # crea el administrador (pide correo y contraseña, mín. 12 caracteres) y el cliente Consumidor final
 ```
 
 ## 6. Ejecutar
@@ -187,6 +187,8 @@ Aparte de los roles, hay páginas **públicas** (sin sesión): `/pagar/<código>
 
 **Administradores:** nadie puede desactivarse ni cambiarse el rol a sí mismo, y el sistema siempre conserva al menos un administrador activo (se valida con un candado en la base de datos).
 
+**Contraseñas:** administrador **mínimo 12 caracteres**; cajero y cliente, mínimo 8. Se valida en el servidor al crear usuarios, al restablecer contraseñas y en `npm run db:seed`.
+
 ## 10. Pagos electrónicos (ePayco / Davipay)
 
 ### Cómo se cobra
@@ -203,7 +205,7 @@ Hay dos puertas de entrada y **el mismo camino de verificación**:
 Flujo (siempre igual):
 
 1. El navegador **solo manda productos y cantidades**. El servidor calcula precios, IVA y total desde la base de datos, guarda la venta en **`esperando_pago`** y crea la sesión de cobro en ePayco. El cobro vence a los **10 minutos**.
-2. Se abre el checkout de ePayco en la propia pantalla (modo *onpage*). Al terminar, ePayco devuelve al navegador a la pantalla con `?ref_payco=…`.
+2. El cliente paga por **un solo canal a la vez** (ver *Canales de pago* abajo): con el **QR** en su celular (`/pagar/<código>`) o **en esta pantalla** (checkout *onpage* de ePayco). Al terminar, ePayco devuelve al navegador con `?ref_payco=…`.
 3. Ese `ref_payco` es **solo una pista**: el **servidor** consulta a ePayco por su cuenta y exige: `x_cod_response = 1` (aprobada), `x_id_invoice` igual a nuestra venta, `x_amount` igual al total de la base de datos, moneda COP, `x_test_request` coherente con `EPAYCO_TEST_MODE` y firma válida (`P_CUST_ID_CLIENTE` + `P_KEY`).
 4. Solo entonces la venta pasa a **`pagado`** y se factura en Siigo con el mismo flujo de siempre (sección 14). **Nunca** se marca pagada porque el navegador volvió a una página de “éxito”.
 5. Cada `ref_payco` se procesa **una sola vez** (reclamo atómico en la tabla `payment_refs`).
@@ -220,6 +222,17 @@ Estados de una venta electrónica:
 
 Pendiente ≠ fallido: si ePayco dice “pendiente”, el cobro sigue esperando. “Rechazada” es definitiva: “intentar de nuevo” crea una venta nueva.
 
+### Canales de pago (uno a la vez)
+
+| | Caja | Kiosco |
+|---|---|---|
+| Predeterminado | **Pagar con el celular (QR)** | **Pagar en esta pantalla** |
+| Secundario | Botón **Pagar en esta pantalla** | Botón **Pagar con el celular (QR)** (cuando la ventana de ePayco está cerrada) |
+
+- Sin `APP_PUBLIC_URL` solo existe **en pantalla** (un celular no puede abrir `127.0.0.1`).
+- El canal vive en la base de datos (`sales.pay_channel`) y lo hacen cumplir los endpoints: con QR **no** se abre el checkout en la pantalla; con "en pantalla" el enlace `/pagar/<código>` **deja de servir** y muestra *“Este cobro fue cambiado, pide uno nuevo en caja”*. Cada cambio queda en los logs (tipo `pago`).
+- **Doble pago:** si aun así llegan dos pagos aprobados para la misma venta (p. ej. alguien ya estaba pagando por el canal anterior), el primero se procesa normal y el segundo **no se factura**: queda con el motivo *“Pago duplicado de la venta X, reembolsar”* en **Pagos por revisar → Pagos duplicados**.
+
 Los reportes **no cuentan** `esperando_pago`, `pago_fallido`, `pago_por_revisar` ni `pago_tardio` en “recaudado” ni “facturado”; los pagos por revisar salen en una línea aparte con un enlace al panel.
 
 ### Pagos por revisar (`/admin/pagos-por-revisar`, solo admin)
@@ -228,6 +241,7 @@ Los reportes **no cuentan** `esperando_pago`, `pago_fallido`, `pago_por_revisar`
   - **Facturar** (pide confirmación): el admin confirma que el dinero **sí entró** en el panel de ePayco; la venta pasa a `pagado` y se factura.
   - **Marcar para reembolso** (pide confirmación): solo deja constancia (fecha y quién). **El reembolso real se hace en el panel de ePayco.** La venta no se factura y queda fuera de todos los reportes.
 - **Cobros sin confirmar (últimos 7 días):** por si el cliente **sí pagó** pero la pantalla no recibió la referencia (se cerró el navegador, se cortó la conexión…). El admin pega el enlace `…?ref_payco=…` o la referencia larga y el servidor la verifica con ePayco con las mismas reglas. Si el cobro ya había vencido, el pago aprobado pasa a `pago_tardio` para decidir.
+- **Pagos duplicados:** segundos pagos aprobados de una venta que ya estaba pagada. Nunca se facturan ni cuentan como recaudado. **Marcar para reembolso** deja constancia; el reembolso se hace en ePayco.
 - **Marcadas para reembolso:** historial de constancias.
 
 > La referencia que sirve para consultar a ePayco es la **larga** (24 caracteres hexadecimales, la que viene en `?ref_payco=`). El número corto “Referencia Davipay” (p. ej. `393429259`) **no** sirve para verificar.
@@ -237,7 +251,7 @@ Los reportes **no cuentan** `esperando_pago`, `pago_fallido`, `pago_por_revisar`
 - **`/pagar/<código>`** — el cliente paga **esa** compra desde su celular. El `<código>` son 48 caracteres aleatorios (`pay_token`) imposibles de adivinar; la página solo muestra el número de compra, el total y el estado.
 - **`/pagar/<código>/respuesta`** — a donde ePayco devuelve al cliente al terminar. Llegar aquí **no** significa que pagó: la página manda la referencia al servidor y muestra el estado real.
 - Sus endpoints (`/api/pagar/<código>…`) no exigen sesión, limitan los intentos por código, verifican **siempre** con ePayco y nunca devuelven datos del cliente ni detalles técnicos. No aparecen en buscadores (`noindex`).
-- El **QR** con el enlace sale en el panel de cobro de la caja **solo si `APP_PUBLIC_URL` está definido** (un celular no puede abrir `127.0.0.1` del equipo de la caja).
+- El **QR** con el enlace sale **solo con el canal QR activo** y **solo si `APP_PUBLIC_URL` está definido** (un celular no puede abrir `127.0.0.1` del equipo de la caja). Si el cobro se pasó a "en pantalla", el enlace muestra *“Este cobro fue cambiado, pide uno nuevo en caja”*.
 
 ### Webhook de confirmación
 
@@ -267,6 +281,23 @@ Pantalla táctil para el rol **Cliente**: búsqueda por nombre/SKU, lector de c�
 - **Tema:** el kiosco no tiene botón de modo oscuro; usa el que el administrador haya dejado en ese equipo.
 - **Equipo del kiosco:** usa una cuenta de Windows restringida y el acceso directo de la **sección 7**.
 
+## 11b. Comprobantes de pago (foto con la cámara web)
+
+Evidencia para auditoría. **No reemplaza** la referencia ni la casilla *“Verifiqué el pago en el datáfono o en la cuenta de FECP”*.
+
+| Medio | Comprobante |
+|---|---|
+| Transferencia (Nequi/Bancolombia/otra) | **Obligatorio**: no se puede confirmar la venta sin la foto |
+| Tarjeta débito / crédito (datáfono) | Opcional |
+| Efectivo, ePayco | No aplica |
+
+- **Captura:** en el modal de cobro, **Tomar foto del comprobante** abre la cámara (vista previa → *Capturar* → *Repetir* / *Usar esta foto*) y muestra la miniatura. Si no hay cámara o Chrome la bloquea, ofrece **Subir imagen desde el equipo** y explica cómo permitir la cámara (candado junto a la dirección → *Cámara* → *Permitir*). La cámara exige **https** (o `127.0.0.1`).
+- **Sin conexión:** la foto se guarda con la venta en el equipo (**IndexedDB**) y se sube sola cuando vuelve la conexión, **después** de que la venta exista en el servidor. Mientras no llegue, la transferencia queda **“Comprobante pendiente”**.
+- **Guardado:** fuera de `public/` (en Docker, volumen `fecp_pos_uploads`; en desarrollo, `uploads/comprobantes`), con nombre aleatorio (UUID). El servidor valida el tipo **por el contenido** (JPG, PNG o WebP), máximo **10 MB**, una imagen por venta (**solo un admin** la reemplaza), y la recomprime con `sharp`: máx. 1600 px por lado, JPEG ~75, **sin metadatos** (EXIF, GPS…).
+- **Historial (`/ventas`):** botón **Ver comprobante** en cada venta que lo tenga → visor grande con fecha, medio, referencia, quién lo subió y **Descargar** (`comprobante-C01-000123-2026-11-12.jpg`). Filtros: *Con comprobante*, *Sin comprobante*, *Comprobante pendiente*. Las transferencias sin foto se resaltan en amarillo. Desde ahí también se puede **Adjuntar comprobante** a ventas viejas o pendientes.
+- **Permisos:** admin, todos; cajero, solo los de sus ventas de **hoy y ayer** (la misma regla de reimprimir); rol cliente, nunca. Se sirven por un endpoint autenticado (`Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`) y **cada vista o descarga queda en los logs**.
+- **Retención:** una tarea diaria dentro de la app borra los archivos con más de `RECEIPT_RETENTION_DAYS` (**180**) días desde la fecha de la venta; el registro queda como *“Eliminado por retención el <fecha>”*. Los respaldos (ver DEPLOY.md) también incluyen las fotos.
+
 ## 12. Comandos útiles
 
 | Comando | Para qué |
@@ -281,7 +312,8 @@ Pantalla táctil para el rol **Cliente**: búsqueda por nombre/SKU, lector de c�
 **Dejar la base en cero antes del deploy** (borra **ventas, líneas de venta, referencias de pago y logs**; conserva productos, usuarios, clientes y configuración, y reinicia la numeración `K01`/`E01`):
 
 ```powershell
-& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -d fecp_pos -c "TRUNCATE payment_refs, sale_items, sales, logs RESTART IDENTITY; ALTER SEQUENCE kiosk_sale_seq RESTART WITH 1;"
+& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -d fecp_pos -c "TRUNCATE sale_receipts, payment_refs, sale_items, sales, logs RESTART IDENTITY; ALTER SEQUENCE kiosk_sale_seq RESTART WITH 1;"
+Remove-Item -Recurse -Force .\uploads\comprobantes\* -ErrorAction SilentlyContinue   # fotos de comprobantes de prueba
 ```
 
 Es irreversible. Haz una copia antes si dudas (`pg_dump`). Si quieres también borrar los clientes de prueba, agrega `customers` al `TRUNCATE` (cuidado: Consumidor final lo recrea `npm run db:seed`).

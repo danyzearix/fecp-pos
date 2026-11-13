@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import ReceiptCapture from "@/components/ReceiptCapture";
+import { receiptAllowed, receiptRequired } from "@/lib/receipt-rules";
 import { DEPTS, citiesOf, EMAIL_RE, nitDv, splitName } from "@/lib/client/customer-form";
 import { finePointer } from "@/lib/client/pointer";
 import { formatCOP, round2 } from "@/lib/money";
@@ -21,6 +23,8 @@ export type CheckoutResult = {
   paymentMethod: PaymentMethod;
   paymentReference: string | null;
   cashReceived: number | null;
+  /** foto del comprobante (ya reducida). Obligatoria en transferencia, opcional en tarjeta; null si no aplica. */
+  receipt: Blob | null;
 };
 
 type Props = {
@@ -80,6 +84,15 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
     setMethodState(m);
     setVerified(false);
   };
+  // Comprobante (evidencia para auditoría): NO reemplaza la referencia ni la casilla
+  const [receipt, setReceipt] = useState<Blob | null>(null);
+  const [camOpen, setCamOpen] = useState(false);
+  const receiptUrl = useMemo(() => (receipt ? URL.createObjectURL(receipt) : null), [receipt]);
+  useEffect(() => () => {
+    if (receiptUrl) URL.revokeObjectURL(receiptUrl);
+  }, [receiptUrl]);
+  const receiptOk = receiptAllowed(method);
+  const receiptMust = receiptRequired(method);
   // En táctil no se enfoca solo: el teclado en pantalla taparía el modal al abrirlo
   const [autoFocusFields] = useState(() => (typeof window === "undefined" ? false : finePointer()));
   const [online, setOnline] = useState(true);
@@ -167,6 +180,7 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
     if (method === "efectivo" && cash + 0.005 < totals.total) return "El valor recibido es menor al total";
     if (needsRef && !reference.trim()) return "Escribe la referencia o los últimos dígitos del comprobante";
     if (needsRef && !verified) return "Marca la casilla: verificaste el pago en el datáfono o en la cuenta";
+    if (receiptMust && !receipt) return "Toma la foto del comprobante (obligatoria en transferencias)";
     return null;
   }
   const error = validate();
@@ -204,16 +218,22 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
       paymentMethod: method,
       paymentReference: needsRef ? reference.trim() : null,
       cashReceived: method === "efectivo" ? cash : null,
+      receipt: receiptOk ? receipt : null,
     });
   }
 
   // Atajos del modal: F9 confirma, Esc cierra
+  const camOpenRef = useRef(false);
+  useEffect(() => {
+    camOpenRef.current = camOpen;
+  }, [camOpen]);
   const confirmRef = useRef(confirm);
   useEffect(() => {
     confirmRef.current = confirm;
   });
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (camOpenRef.current) return; // la cámara está abierta: ella maneja sus teclas
       if (e.key === "F9") {
         e.preventDefault();
         confirmRef.current();
@@ -436,6 +456,28 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
                   />
                   <span>Verifiqué el pago en el datáfono o en la cuenta de FECP</span>
                 </label>
+
+                {receiptOk && (
+                  <div className={`rounded-lg border px-3 py-2.5 space-y-2 ${receiptMust && !receipt ? "border-warn-line bg-warn-soft" : "border-line bg-subtle"}`}>
+                    <div className="text-[13px] font-semibold text-body">
+                      Comprobante {receiptMust ? <span className="text-err-ink">(obligatorio)</span> : <span className="text-dim font-normal">(opcional)</span>}
+                    </div>
+                    {receipt && receiptUrl ? (
+                      <div className="flex items-center gap-3">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={receiptUrl} alt="Comprobante" className="w-20 h-20 object-cover rounded-md border border-line bg-white" />
+                        <div className="flex flex-wrap gap-2">
+                          <button onClick={() => setCamOpen(true)} className="px-3 min-h-11 rounded-lg border border-field text-[13px] font-medium text-body bg-surface">Cambiar foto</button>
+                          <button onClick={() => setReceipt(null)} className="px-3 min-h-11 rounded-lg border border-field text-[13px] font-medium text-body bg-surface">Quitar</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button onClick={() => setCamOpen(true)} className="w-full px-4 min-h-12 rounded-lg border border-brand text-brand-text bg-surface text-[15px] font-semibold hover:bg-brand-soft">
+                        Tomar foto del comprobante
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -475,6 +517,17 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
             )}
           </div>
         </div>
+
+        {camOpen && (
+          <ReceiptCapture
+            title={receiptMust ? "Foto del comprobante de la transferencia" : "Foto del voucher del datáfono"}
+            onCancel={() => setCamOpen(false)}
+            onAccept={(b) => {
+              setReceipt(b);
+              setCamOpen(false);
+            }}
+          />
+        )}
 
         {/* Pie siempre visible (no se va con el scroll del contenido) */}
         <div className="px-4 sm:px-6 py-3 border-t border-line flex flex-wrap items-center gap-3 shrink-0">

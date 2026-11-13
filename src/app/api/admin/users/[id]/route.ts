@@ -1,3 +1,4 @@
+import { passwordError } from "@/lib/password-rules";
 import bcrypt from "bcryptjs";
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
@@ -56,9 +57,9 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     changes.push(`vendedor Siigo → ${s ?? "(usa el del .env)"}`);
   }
   if (b.password !== undefined) {
-    if (typeof b.password !== "string" || b.password.length < 8) {
-      return NextResponse.json({ error: "La contraseña debe tener al menos 8 caracteres" }, { status: 400 });
-    }
+    // Restablecer: el mínimo depende del rol que tendrá el usuario (administrador: 12; cajero y cliente: 8)
+    const pwdErr = passwordError(isRole(b.role) ? b.role : cur.role, b.password);
+    if (pwdErr || typeof b.password !== "string") return NextResponse.json({ error: pwdErr ?? "Contraseña no válida" }, { status: 400 });
     add("password_hash", await bcrypt.hash(b.password, 10));
     sets.push("failed_attempts = 0", "locked_until = NULL"); // restablecer también desbloquea la cuenta
     changes.push("contraseña restablecida");

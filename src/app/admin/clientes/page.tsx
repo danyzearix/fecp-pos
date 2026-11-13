@@ -1,6 +1,9 @@
 import { requirePage } from "@/lib/auth";
 import { query } from "@/lib/db";
 import { CONSUMIDOR_FINAL_ID } from "@/lib/sale-types";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = { title: "Clientes" };
 
 type Row = {
   id: number;

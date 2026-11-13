@@ -8,6 +8,9 @@ import { PAYMENT_METHODS } from "@/lib/payments";
 import { sweepStuckInvoicing } from "@/lib/siigo/invoice";
 import ConnectionTests from "./ConnectionTests";
 import ProblemSales, { type Problem } from "./ProblemSales";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = { title: "Configuración" };
 
 // Solo lectura. Los secretos NUNCA se muestran: solo si están definidos.
 const env = (k: string) => process.env[k] ?? "";

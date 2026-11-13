@@ -12,17 +12,23 @@ import { createSaleSession } from "./epayco/session";
 import { epaycoMissingEnv, getEpaycoConfig } from "./epayco/config";
 import { getPosConfig } from "./config";
 import { epaycoInvoicingBlocker } from "./siigo/payment";
+import { initialChannel, payUrlFor, qrAvailable, type PayChannel } from "./epayco/channel";
 
 export type KioskPayment = {
   saleId: string;
   localNumber: string;
-  sessionId: string;
+  /** sesión del checkout en pantalla; null si el cobro empieza por QR (la crea el celular) */
+  sessionId: string | null;
   total: number;
   expiresAt: string;
   testMode: boolean;
   payToken: string;
-  /** enlace público de pago (solo si APP_PUBLIC_URL está definido) */
+  /** enlace público de pago: SOLO si el canal activo es QR */
   payUrl: string | null;
+  /** canal abierto: 'qr' (celular) o 'pantalla' (checkout en el equipo). Nunca los dos. */
+  channel: PayChannel;
+  /** ¿se puede cambiar a QR? (hay dominio público) */
+  qrAvailable: boolean;
 };
 /** Quién crea el cobro: el kiosco (rol cliente) o un empleado desde la caja (cajero/admin). */
 export type PaymentSource = "kiosco" | "caja";
@@ -109,6 +115,9 @@ export async function createKioskPayment(input: {
   if (notifyRaw && !EMAIL_RE.test(notifyRaw)) return fail(400, "El correo no es válido");
   const notifyEmail = notifyRaw || null;
 
+  // ---- Canal: caja → QR por defecto; kiosco → en pantalla. Sin dominio público solo hay "pantalla". ----
+  const channel = initialChannel(source, b.channel);
+
   // ---- Guardar la venta en 'esperando_pago' ----
   const saleId = crypto.randomUUID();
   const payToken = crypto.randomBytes(24).toString("hex");
@@ -141,9 +150,9 @@ export async function createKioskPayment(input: {
 
     await client.query(
       `INSERT INTO sales (id, local_number, cashier_id, customer_id, checkout_type, subtotal, tax_total, total, payment_method,
-                          status, created_at_device, source, payment_status, payment_expires_at, pay_token, notify_email)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'epayco','esperando_pago',now(),$12,'esperando',$9,$10,$11)`,
-      [saleId, localNumber, input.userId, customerId, checkoutType, totals.subtotal, totals.tax, totals.total, expiresAt, payToken, notifyEmail, source]
+                          status, created_at_device, source, payment_status, payment_expires_at, pay_token, notify_email, pay_channel, pay_channel_changed_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'epayco','esperando_pago',now(),$12,'esperando',$9,$10,$11,$13,now())`,
+      [saleId, localNumber, input.userId, customerId, checkoutType, totals.subtotal, totals.tax, totals.total, expiresAt, payToken, notifyEmail, source, channel]
     );
     for (const l of lines) {
       await client.query(
@@ -160,7 +169,19 @@ export async function createKioskPayment(input: {
     client.release();
   }
 
-  // ---- Crear la sesión en ePayco ----
+  // ---- Canal QR: NO se abre el checkout en el equipo; la sesión la crea el celular al abrir /pagar/<código> ----
+  if (channel === "qr") {
+    await writeLog("pago", `Cobro creado${source === "caja" ? " en caja" : ""}: ${localNumber} por $${totals.total} (canal: QR en el celular)`, {
+      userId: input.userId,
+      detail: { sale_id: saleId, source, local_number: localNumber, total: totals.total, channel, test: cfg.testMode, items: lines.length },
+    });
+    return {
+      ok: true, saleId, localNumber, sessionId: null, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode,
+      payToken, payUrl: payUrlFor(payToken), channel, qrAvailable: true,
+    };
+  }
+
+  // ---- Canal en pantalla: crear la sesión en ePayco ----
   try {
     // El kiosco usa EPAYCO_RESPONSE_URL si existe (o su propia pantalla /kiosco); la caja siempre vuelve a /caja.
     // El kiosco se usa en http://127.0.0.1:3000 (la pantalla /kiosco redirige sola desde localhost).
@@ -171,11 +192,10 @@ export async function createKioskPayment(input: {
     await query("UPDATE sales SET epayco_session_id = $2 WHERE id = $1", [saleId, sessionId]);
     await writeLog("pago", `Cobro creado${source === "caja" ? " en caja" : ""}: ${localNumber} por $${totals.total}`, {
       userId: input.userId,
-      detail: { sale_id: saleId, source, local_number: localNumber, total: totals.total, session_id: sessionId, test: cfg.testMode, items: lines.length, response_url: responseUrl },
+      detail: { sale_id: saleId, source, local_number: localNumber, total: totals.total, session_id: sessionId, channel, test: cfg.testMode, items: lines.length, response_url: responseUrl },
     });
-    // Con dominio público (APP_PUBLIC_URL) el cliente también puede pagar desde su celular con este enlace (/pagar/<código>)
-    const payUrl = cfg.publicBaseUrl ? `${cfg.publicBaseUrl}/pagar/${payToken}` : null;
-    return { ok: true, saleId, localNumber, sessionId, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode, payToken, payUrl };
+    // En pantalla el enlace del celular está CERRADO: no se entrega (se abre solo si se cambia a QR)
+    return { ok: true, saleId, localNumber, sessionId, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode, payToken, payUrl: null, channel, qrAvailable: qrAvailable() };
   } catch (e) {
     const reason = e instanceof EpaycoError ? `No se pudo crear el cobro en ePayco (${e.kind}): ${e.message}` : `Error creando el cobro: ${e instanceof Error ? e.message : e}`;
     await transitionSale(saleId, ["esperando_pago"], "pago_fallido", { payment_status: "rechazado", payment_failure_reason: reason });

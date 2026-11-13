@@ -1,3 +1,4 @@
+import { passwordError } from "@/lib/password-rules";
 import bcrypt from "bcryptjs";
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
@@ -30,8 +31,10 @@ export async function POST(req: Request) {
 
   if (!name) return NextResponse.json({ error: "Escribe el nombre" }, { status: 400 });
   if (!EMAIL_RE.test(email)) return NextResponse.json({ error: "Correo no válido" }, { status: 400 });
-  if (password.length < 8) return NextResponse.json({ error: "La contraseña debe tener al menos 8 caracteres" }, { status: 400 });
   if (!isRole(role)) return NextResponse.json({ error: "Rol no válido" }, { status: 400 });
+  // Administrador: mínimo 12 caracteres; cajero y cliente: 8
+  const pwdErr = passwordError(role, password);
+  if (pwdErr) return NextResponse.json({ error: pwdErr }, { status: 400 });
   if (seller === undefined && b?.siigo_seller_id !== undefined) {
     return NextResponse.json({ error: "El id de vendedor de Siigo debe ser un número" }, { status: 400 });
   }

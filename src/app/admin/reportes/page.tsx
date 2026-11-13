@@ -5,6 +5,9 @@ import { paymentLabel } from "@/lib/payments";
 import { isDateStr, SALE_DAY_SQL, todayBogota } from "@/lib/sales";
 import { statusInfo } from "@/components/sales/status";
 import { NOT_REVENUE_SQL } from "@/lib/sale-states";
+import type { Metadata } from "next";
+
+export const metadata: Metadata = { title: "Reportes" };
 
 // Las ventas 'anulada' no cuentan en ningún reporte. Se cuentan todas las demás (facturadas o no) y se muestra el desglose por estado.
 // Tampoco cuentan 'esperando_pago' ni 'pago_fallido' (cobros del kiosco donde no entró dinero): ver NOT_REVENUE.

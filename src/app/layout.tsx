@@ -2,8 +2,10 @@ import type { Metadata } from "next";
 import { THEME_SCRIPT } from "@/lib/client/theme";
 import "./globals.css";
 
+// Cada pantalla define solo su nombre corto ("Caja", "Ventas"…) y la plantilla agrega " · FECP POS".
+// Favicon: src/app/icon.png y src/app/apple-icon.png (convención de archivos de Next; se enlazan solos).
 export const metadata: Metadata = {
-  title: "FECP POS",
+  title: { default: "FECP POS", template: "%s · FECP POS" },
   description: "Punto de venta FECP",
 };
 

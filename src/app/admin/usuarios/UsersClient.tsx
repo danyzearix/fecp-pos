@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { minPasswordLength } from "@/lib/password-rules";
 import { ROLE_LABEL, ROLES, type Role } from "@/lib/permissions";
 
 type U = {
@@ -84,8 +85,8 @@ export default function UsersClient() {
           <input className={input} required type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="correo@ejemplo.com" />
         </label>
         <label className="col-span-2">
-          <span className={label}>Contraseña (mín. 8)</span>
-          <input className={input} required minLength={8} type="text" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Contraseña inicial" autoComplete="off" />
+          <span className={label}>Contraseña (mín. {minPasswordLength(form.role)})</span>
+          <input className={input} required minLength={minPasswordLength(form.role)} type="text" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Contraseña inicial" autoComplete="off" />
         </label>
         <label className="col-span-2">
           <span className={label}>Rol</span>
@@ -187,12 +188,12 @@ function UserRow({ u, isMe, patch }: { u: U; isMe: boolean; patch: (u: U, body: 
               <input
                 value={pwd}
                 onChange={(e) => setPwd(e.target.value)}
-                placeholder="Nueva contraseña"
+                placeholder={`Nueva contraseña (mín. ${minPasswordLength(u.role)})`}
                 autoComplete="off"
                 className="w-40 border border-field rounded-lg px-2 min-h-11 text-[14px] text-fg placeholder:text-[13px] bg-surface"
               />
               <button
-                disabled={pwd.length < 8}
+                disabled={pwd.length < minPasswordLength(u.role)}
                 onClick={async () => {
                   if (await patch(u, { password: pwd }, `Contraseña de ${u.email} restablecida`)) {
                     setPwd("");
