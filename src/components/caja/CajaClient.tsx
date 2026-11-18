@@ -277,9 +277,9 @@ export default function CajaClient({
         local_number: nextLocalNumber(config.prefix),
         created_at_device: new Date().toISOString(),
         checkout_type: r.checkoutType,
-        payment_method: r.paymentMethod,
-        payment_reference: r.paymentReference,
-        cash_received: r.cashReceived,
+        // Formato NUEVO: una línea por medio (el servidor valida que sumen el total que él calcula). Las ventas que ya estén
+        // en la cola con el formato viejo (payment_method/cash_received) siguen enviándose: el servidor acepta los dos.
+        payments: r.payments,
         customer: r.customer,
         items: cart.map((l) => ({
           product_id: l.productId,

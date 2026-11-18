@@ -44,7 +44,7 @@ Marca cada punto con `[x]` cuando pase. Haz todo con `SIIGO_TEST_MODE=true` (los
 
 ## 6. Pagos
 - [ ] Efectivo: botones $10.000/$20.000/$50.000/$100.000; el cambio sale en grande; con valor menor al total no deja confirmar.
-- [ ] Tarjeta débito, tarjeta crédito y Transferencia: exigen la **referencia** y la casilla “Verifiqué el pago…”; sin ambas no deja confirmar.
+- [ ] Tarjeta y Transferencia (cada línea del cobro): exigen la **referencia** y la casilla “Verifiqué el pago…”; sin ambas no deja confirmar.
 - [ ] La referencia sale en la tirilla, en el historial y en Reportes (detalle por medio de pago).
 - [ ] En Siigo la observación dice “PRUEBA POS - ELIMINAR | POS FECP venta {UUID} | {medio} ref {referencia}”.
 
@@ -152,6 +152,28 @@ Abre la app por **`http://127.0.0.1:3000`** (no `localhost`). Tarjeta de prueba 
 - [ ] Con `APP_PUBLIC_URL` definido y un dominio con HTTPS: el webhook confirma el pago aunque se cierre el navegador.
 
 ---
+
+## 12c. Seguridad de precios
+
+### Regresión del KIOSCO (hay que correrla siempre que se toque `src/lib/kiosk.ts` o el cobro electrónico)
+El kiosco (rol cliente) y el cobro electrónico de la caja **solo mandan `product_id` y cantidad**; el precio, el IVA y el total salen de la tabla `products`.
+```powershell
+node --env-file=.env.local db/prueba-kiosco-precio.mjs http://127.0.0.1:3000
+```
+- [ ] Manda `price=1`, `unit_price=1`, `tax_rate=0` y `total=1` y comprueba que la venta se guardó con el **precio, IVA y total REALES** (no $1). Termina con `RESULTADO: OK` y código de salida 0.
+- [ ] Cantidad 0, negativa y producto inexistente → 400.
+- [ ] El script borra la venta y el usuario temporal que crea (con `EPAYCO_TEST_MODE=true` la sesión de ePayco es de prueba: no cobra dinero).
+
+### Validación de precios en la CAJA (`/api/sales`)
+- [ ] Una venta con `unit_price=1` de un producto de $12.600 **se acepta y se guarda**, queda `pending` con "Precio por revisar" en `last_error` y **NO se factura**.
+- [ ] Aparece en **Admin → Precios por revisar** con la diferencia por línea, el cajero, la hora y cuánto lleva retenida; el menú y Reportes muestran el contador.
+- [ ] Precio igual al vigente → se factura normal. Precio vigente hace menos de `PRICE_HISTORY_HOURS` (72 h) tras un cambio → se factura. Más viejo → se retiene.
+- [ ] Diferencia solo de IVA, solo de SKU, producto inexistente o sin `product_id` → se acepta y se retiene (nunca error 4xx).
+- [ ] Pago dividido y crédito con precio alterado → se retienen igual.
+- [ ] **Reintentar** en `/ventas` no factura una retenida (409). **Aprobar y facturar** (dos clics a la vez) → una sola factura. **Anular** exige una nota (mín. 5 caracteres).
+- [ ] Una anulada con dinero cobrado sale en **Reportes → Ventas anuladas con dinero cobrado** y en el cuadre de efectivo, y no cuenta en "Total recaudado" ni "Total facturado".
+- [ ] Un cajero no ve el panel y sus endpoints responden 403.
+- [ ] A las 2 h retenida → "atrasada"; a las 4 h → rojo.
 
 ## 13. Antes de pasar a producción
 - [ ] `RESOLUCION_DIAN_*`, `NEGOCIO_*` y `POS_ADDRESS` completos.

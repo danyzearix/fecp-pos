@@ -6,8 +6,8 @@ import { useConnection } from "@/hooks/useConnection";
 import { printTicket } from "@/lib/client/print";
 import { formatCOP } from "@/lib/money";
 import type { Role } from "@/lib/permissions";
-import { paymentLabel } from "@/lib/payments";
 import type { ReceiptFilter, SaleListRow } from "@/lib/sales";
+import PaymentCell from "./PaymentCell";
 import { missingRequiredReceipt, ReceiptCell } from "./ReceiptViewer";
 import SaleActionButton from "./SaleActionButton";
 import { statusInfo } from "./status";
@@ -139,7 +139,7 @@ export default function VentasClient({
         {/* ---------- Celular y tablet vertical: una tarjeta por venta ---------- */}
         <div className="lg:hidden flex-1 overflow-y-auto space-y-2">
           {sales.map((s) => {
-            const st = statusInfo(s.status);
+            const st = s.price_review_status === "pendiente" ? { label: isAdmin ? "Precio por revisar" : "En revisión", cls: "bg-warn-soft text-warn-ink" } : statusInfo(s.status);
             return (
               <div
                 key={s.id}
@@ -160,8 +160,7 @@ export default function VentasClient({
                 </div>
                 <div className="flex items-end justify-between gap-2">
                   <div className="text-[13px] text-dim">
-                    {paymentLabel(s.payment_method)}
-                    {s.payment_reference && <div className="text-[12px]">Ref. {s.payment_reference}</div>}
+                    <PaymentCell s={s} />
                   </div>
                   <div className="text-xl font-bold text-fg">{formatCOP(s.total)}</div>
                 </div>
@@ -175,7 +174,7 @@ export default function VentasClient({
                       {open === s.id ? "Ocultar error" : "Ver error"}
                     </button>
                   )}
-                  {isAdmin && <SaleActionButton saleId={s.id} status={s.status} onDone={() => load(true)} />}
+                  {isAdmin && <SaleActionButton saleId={s.id} status={s.price_review_status === "pendiente" ? "retenida" : s.status} onDone={() => load(true)} />}
                 </div>
                 {open === s.id && s.last_error && (
                   <div className="bg-err-soft text-err-ink rounded-lg px-3 py-2 text-[13px] whitespace-pre-wrap break-words">{s.last_error}</div>
@@ -206,7 +205,7 @@ export default function VentasClient({
             </thead>
             <tbody className="divide-y divide-line text-fg">
               {sales.map((s) => {
-                const st = statusInfo(s.status);
+                const st = s.price_review_status === "pendiente" ? { label: isAdmin ? "Precio por revisar" : "En revisión", cls: "bg-warn-soft text-warn-ink" } : statusInfo(s.status);
                 const canSeeError = isAdmin && !!s.last_error;
                 return (
                   <FragmentRow key={s.id}>
@@ -220,8 +219,7 @@ export default function VentasClient({
                       </td>
                       <td className="px-3 py-2 text-right whitespace-nowrap font-semibold">{formatCOP(s.total)}</td>
                       <td className="px-3 py-2">
-                        <div className="leading-tight">{paymentLabel(s.payment_method)}</div>
-                        {s.payment_reference && <div className="text-[12px] text-dim">Ref. {s.payment_reference}</div>}
+                        <PaymentCell s={s} />
                       </td>
                       <td className="px-3 py-2">
                         <ReceiptCell s={s} isAdmin={isAdmin} onChanged={() => load(true)} />
@@ -246,7 +244,7 @@ export default function VentasClient({
                               {open === s.id ? "Ocultar error" : "Ver error"}
                             </button>
                           )}
-                          {isAdmin && <SaleActionButton saleId={s.id} status={s.status} onDone={() => load(true)} />}
+                          {isAdmin && <SaleActionButton saleId={s.id} status={s.price_review_status === "pendiente" ? "retenida" : s.status} onDone={() => load(true)} />}
                         </div>
                       </td>
                     </tr>

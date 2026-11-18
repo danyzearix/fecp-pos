@@ -76,11 +76,13 @@ export async function compressReceipt(input: Uint8Array): Promise<{ data: Buffer
 }
 
 // ------------------------------------------------------------------ permisos
-export type ReceiptSale = { id: string; local_number: string; payment_method: string; payment_reference: string | null; cashier_id: number; sale_day: string; created_day: string };
+export type ReceiptSale = { id: string; local_number: string; payment_method: string; payment_reference: string | null; methods: string[]; cashier_id: number; sale_day: string; created_day: string };
 
 export async function loadReceiptSale(id: string): Promise<ReceiptSale | null> {
   const { rows } = await query<ReceiptSale>(
-    `SELECT s.id, s.local_number, s.payment_method, s.payment_reference, s.cashier_id,
+    `SELECT s.id, s.local_number, s.payment_method, s.payment_reference,
+            COALESCE((SELECT array_agg(sp.method ORDER BY sp.ord) FROM sale_payments sp WHERE sp.sale_id = s.id), ARRAY[s.payment_method]) AS methods,
+            s.cashier_id,
             ${SALE_DAY_SQL}::text AS sale_day, (s.created_at AT TIME ZONE 'America/Bogota')::date::text AS created_day
        FROM sales s WHERE s.id = $1`,
     [id]
@@ -121,7 +123,7 @@ export async function getReceipt(saleId: string): Promise<ReceiptRow | null> {
  * Escribe primero el archivo (nombre UUID, permisos 600) y luego el registro; si el registro falla, borra el archivo.
  */
 export async function saveReceipt(p: { sale: ReceiptSale; input: Uint8Array; user: { uid: number; role: string; name: string } }) {
-  if (!receiptAllowed(p.sale.payment_method)) throw new ReceiptError(400, "Este medio de pago no lleva comprobante (solo transferencia y tarjeta).");
+  if (!receiptAllowed(p.sale.methods)) throw new ReceiptError(400, "Esta venta no lleva comprobante (solo cuando hay transferencia o tarjeta).");
   const prev = await getReceipt(p.sale.id);
   if (prev?.status === "activo" && p.user.role !== "admin") throw new ReceiptError(409, "Esta venta ya tiene comprobante. Solo un administrador puede reemplazarlo.");
   if (prev?.status === "eliminado" && p.user.role !== "admin") throw new ReceiptError(409, "El comprobante de esta venta fue eliminado por retención.");

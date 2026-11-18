@@ -1,7 +1,12 @@
 // Tipos compartidos entre navegador y servidor para ventas y tirillas.
 
-import type { PaymentMethod } from "./payments";
-export { PAYMENT_METHODS, CASHIER_PAYMENT_METHODS, paymentLabel, requiresReference, type PaymentMethod } from "./payments";
+import type { LineMethod, PaymentMethod } from "./payments";
+import type { PayLine, PayLineIn } from "./payment-lines";
+export {
+  PAYMENT_METHODS, LEGACY_PAYMENT_METHODS, CASHIER_PAYMENT_METHODS, paymentLabel, paymentShortLabel, requiresReference,
+  type LineMethod, type PaymentMethod,
+} from "./payments";
+export type { PayLine, PayLineIn } from "./payment-lines";
 
 export const CONSUMIDOR_FINAL_ID = "222222222222";
 
@@ -36,18 +41,28 @@ export type SaleItemIn = {
   prices_include_tax: boolean;
 };
 
-/** Lo que el navegador envía a POST /api/sales */
+/**
+ * Lo que el navegador envía a POST /api/sales.
+ * FORMATO NUEVO: `payments` (1 a 4 líneas, una por medio). FORMATO VIEJO (ventas que quedaron en la cola local antes de esta
+ * versión): payment_method / payment_reference / cash_received, un solo medio por el total. El servidor acepta los dos.
+ */
 export type SaleIn = {
   id: string; // UUID generado en el navegador
   local_number: string; // C01-000123
   created_at_device: string; // ISO
   checkout_type: "corto" | "completo";
-  payment_method: PaymentMethod;
-  payment_reference: string | null; // obligatoria si el medio no es efectivo
-  cash_received: number | null;
   customer: CustomerIn | null; // null = consumidor final
   items: SaleItemIn[];
+  /** formato nuevo: líneas de pago (los montos aplicados deben sumar el total que calcula el servidor) */
+  payments?: PayLineIn[];
+  /** formato viejo (solo para ventas ya encoladas): */
+  payment_method?: LineMethod;
+  payment_reference?: string | null;
+  cash_received?: number | null;
 };
+
+/** Una línea de pago tal como se muestra en la tirilla, el historial y los reportes */
+export type PaymentLineView = PayLine;
 
 /** Configuración no secreta que necesitan la caja y la tirilla */
 export type PosConfig = {
@@ -76,10 +91,15 @@ export type TicketData = {
   tax_total: number;
   total: number;
   tax_by_rate: { rate: number; base: number; tax: number }[];
+  /** columnas viejas (compatibilidad): medio de la venta ("mixto" si hay varias líneas), referencias, efectivo */
   payment_method: string;
   payment_reference: string | null;
   cash_received: number | null;
   change_given: number | null;
+  /** una entrada por línea de pago (sale_payments). Es lo que imprime la tirilla. */
+  payments: PaymentLineView[];
   invoice_name: string | null;
   cufe: string | null;
 };
+
+export type { PaymentMethod as SalePaymentMethod };

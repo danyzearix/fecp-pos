@@ -222,3 +222,92 @@ ALTER TABLE sales ADD COLUMN IF NOT EXISTS webhook_hint_ref  TEXT;
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS webhook_hint_txid TEXT;
 -- Intentos de verificación que no se pudieron resolver (a los 60 pasa a "por revisar" para que un admin lo vea)
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS verify_attempts   INTEGER NOT NULL DEFAULT 0;
+
+-- ---------------------------------------------------------------------------
+-- PAGO DIVIDIDO: sale_payments (una fila por línea de pago de una venta)
+-- ---------------------------------------------------------------------------
+-- Una venta tiene 1 a 4 líneas, una por medio. Los reportes, el cuadre y /ventas calculan desde AQUÍ.
+-- amount = monto APLICADO a la venta (en efectivo, lo cobrado de la venta, no el billete entregado).
+-- Las columnas viejas de sales (payment_method, payment_reference, cash_received, change_given) se CONSERVAN por
+-- compatibilidad: para una venta con varias líneas, sales.payment_method vale 'mixto'.
+CREATE TABLE IF NOT EXISTS sale_payments (
+  id            SERIAL PRIMARY KEY,
+  sale_id       UUID NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  method        TEXT NOT NULL,                 -- efectivo | tarjeta | transferencia | credito_fecp | epayco  (+ históricos tarjeta_debito, tarjeta_credito)
+  amount        NUMERIC(14,2) NOT NULL CHECK (amount >= 0),
+  reference     TEXT,
+  cash_received NUMERIC(14,2),                 -- solo la línea de efectivo
+  change_given  NUMERIC(14,2),                 -- solo la línea de efectivo
+  credit_days   INTEGER,                       -- solo crédito: 14 | 30 | 60 | 90
+  due_date      DATE,                          -- solo crédito: fecha de la venta + plazo
+  ord           SMALLINT NOT NULL DEFAULT 1,   -- orden de la línea en la venta
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (sale_id, ord),
+  UNIQUE (sale_id, method)                     -- una línea por medio
+);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_sale   ON sale_payments (sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_method ON sale_payments (method);
+CREATE INDEX IF NOT EXISTS idx_sale_payments_due    ON sale_payments (due_date) WHERE due_date IS NOT NULL;
+
+-- MIGRACIÓN (idempotente, no borra ni reescribe nada): cada venta que aún no tiene líneas recibe UNA con sus datos actuales.
+-- El medio se copia tal cual ("tarjeta_debito" sigue mostrándose como Tarjeta débito). Las columnas de sales no se tocan.
+INSERT INTO sale_payments (sale_id, method, amount, reference, cash_received, change_given, ord)
+SELECT s.id, s.payment_method, s.total, s.payment_reference, s.cash_received, s.change_given, 1
+  FROM sales s
+ WHERE NOT EXISTS (SELECT 1 FROM sale_payments sp WHERE sp.sale_id = s.id)
+   AND s.payment_method <> 'mixto';
+
+-- ---------------------------------------------------------------------------
+-- VALIDACIÓN DE PRECIOS EN LA CAJA
+-- ---------------------------------------------------------------------------
+-- Historial de precios: una fila por "versión" de un producto (precio, IVA y SKU) con su vigencia. valid_to NULL = vigente.
+-- Lo llena un DISPARADOR sobre products, así cualquier cambio (sincronización completa, incremental, o la de IVA con Siigo)
+-- queda registrado sin depender de cada código que escriba en products.
+-- Regla (src/lib/price-check.ts): una línea de venta de la caja es válida si coincide con el precio, IVA y SKU vigentes, o con
+-- alguno vigente en las últimas PRICE_HISTORY_HOURS horas (72 por defecto). Cualquier diferencia retiene la venta.
+CREATE TABLE IF NOT EXISTS product_price_history (
+  id                 BIGSERIAL PRIMARY KEY,
+  product_id         INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  sku                TEXT,
+  price              NUMERIC(14,2) NOT NULL,
+  tax_rate           INTEGER NOT NULL,
+  prices_include_tax BOOLEAN NOT NULL,
+  valid_from         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  valid_to           TIMESTAMPTZ          -- NULL = es la versión vigente
+);
+CREATE INDEX IF NOT EXISTS idx_pph_product ON product_price_history (product_id, valid_from);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pph_open ON product_price_history (product_id) WHERE valid_to IS NULL;
+
+-- Línea base (idempotente): los valores ACTUALES de cada producto que aún no tenga historial, vigentes "desde siempre".
+INSERT INTO product_price_history (product_id, sku, price, tax_rate, prices_include_tax, valid_from)
+SELECT p.id, p.sku, p.price, p.tax_rate, p.prices_include_tax, TIMESTAMPTZ 'epoch'
+  FROM products p
+ WHERE NOT EXISTS (SELECT 1 FROM product_price_history h WHERE h.product_id = p.id);
+
+-- Disparador: si cambia precio, IVA (tax_rate / prices_include_tax) o sku, cierra la versión vigente y abre la nueva.
+CREATE OR REPLACE FUNCTION fecp_track_price() RETURNS trigger AS $fn$
+BEGIN
+  IF TG_OP = 'INSERT'
+     OR (NEW.price, NEW.tax_rate, NEW.prices_include_tax, NEW.sku) IS DISTINCT FROM (OLD.price, OLD.tax_rate, OLD.prices_include_tax, OLD.sku) THEN
+    UPDATE product_price_history SET valid_to = now() WHERE product_id = NEW.id AND valid_to IS NULL;
+    INSERT INTO product_price_history (product_id, sku, price, tax_rate, prices_include_tax, valid_from)
+    VALUES (NEW.id, NEW.sku, NEW.price, NEW.tax_rate, NEW.prices_include_tax, now());
+  END IF;
+  RETURN NEW;
+END
+$fn$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trg_products_price_history ON products;
+CREATE TRIGGER trg_products_price_history AFTER INSERT OR UPDATE ON products FOR EACH ROW EXECUTE FUNCTION fecp_track_price();
+
+-- Revisión de precios en ventas de la caja. Una venta con diferencias se ACEPTA y se guarda (el cliente ya pagó), queda
+-- 'pending' con el motivo en last_error, y NO se factura hasta que un admin la apruebe (o la anule con una nota).
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS price_review_status     TEXT;        -- NULL | 'pendiente' | 'aprobada' | 'anulada'
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS price_review_detail     JSONB;       -- por línea: enviado, vigente y diferencia
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS price_review_at         TIMESTAMPTZ; -- desde cuándo está retenida
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS price_review_by         INTEGER REFERENCES users(id); -- admin que decidió
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS price_review_decided_at TIMESTAMPTZ;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS price_review_note       TEXT;        -- motivo (obligatorio al anular)
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS time_note               TEXT;        -- hora del equipo fuera de rango → se usó la del servidor
+ALTER TABLE sales DROP CONSTRAINT IF EXISTS sales_price_review_check;
+ALTER TABLE sales ADD CONSTRAINT sales_price_review_check CHECK (price_review_status IS NULL OR price_review_status IN ('pendiente','aprobada','anulada'));
+CREATE INDEX IF NOT EXISTS idx_sales_price_review ON sales (price_review_at) WHERE price_review_status = 'pendiente';

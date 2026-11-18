@@ -1,7 +1,8 @@
 // Construye los datos de una tirilla a partir de una venta del navegador (cola local).
 // Se usa cuando el servidor no está disponible. Es código puro (sirve en navegador y servidor).
 import { cartTotals, lineAmounts, round2, type CartLine } from "./money";
-import { CONSUMIDOR_FINAL_ID, type SaleIn, type SaleItemIn, type TicketData } from "./sale-types";
+import { bogotaDay, joinedReference, saleMethodOf, validatePaymentLines, type PayLineIn } from "./payment-lines";
+import { CONSUMIDOR_FINAL_ID, type PaymentLineView, type SaleIn, type SaleItemIn, type TicketData } from "./sale-types";
 
 export const itemToLine = (i: SaleItemIn): CartLine => ({
   productId: i.product_id,
@@ -22,11 +23,30 @@ export function customerDisplay(c: SaleIn["customer"]) {
   return { name, identification: c.identification };
 }
 
+/** Líneas de pago de una venta del navegador (formato nuevo o el viejo de la cola local), con cambio y vencimiento. */
+export function ticketPayments(sale: SaleIn, total: number): PaymentLineView[] {
+  const input: PayLineIn[] = sale.payments ?? [
+    { method: sale.payment_method ?? "efectivo", amount: total, reference: sale.payment_reference ?? null, cash_received: sale.cash_received ?? null, credit_days: null },
+  ];
+  const v = validatePaymentLines(input, total, {
+    saleDay: bogotaDay(sale.created_at_device),
+    customerIdentified: !!sale.customer && sale.customer.identification !== CONSUMIDOR_FINAL_ID,
+  });
+  if (v.ok) return v.lines;
+  // La tirilla provisional nunca se rompe: si algo no cuadra se muestran las líneas tal cual
+  return input.map((l) => ({
+    method: l.method, amount: l.amount, reference: l.reference ?? null, cash_received: l.cash_received ?? null,
+    change_given: null, credit_days: l.credit_days ?? null, due_date: null,
+  }));
+}
+
 export function buildTicketFromSale(sale: SaleIn, cashierName: string): TicketData {
   const lines = sale.items.map(itemToLine);
   const t = cartTotals(lines);
   const cust = customerDisplay(sale.customer);
   const total = t.total;
+  const payments = ticketPayments(sale, total);
+  const cashLine = payments.find((p) => p.method === "efectivo") ?? null;
   return {
     id: sale.id,
     local_number: sale.local_number,
@@ -48,10 +68,11 @@ export function buildTicketFromSale(sale: SaleIn, cashierName: string): TicketDa
     tax_by_rate: Object.entries(t.byRate)
       .map(([rate, v]) => ({ rate: Number(rate), base: round2(v.base), tax: round2(v.tax) }))
       .sort((a, b) => a.rate - b.rate),
-    payment_method: sale.payment_method,
-    payment_reference: sale.payment_reference ?? null,
-    cash_received: sale.cash_received,
-    change_given: sale.cash_received == null ? null : round2(sale.cash_received - total),
+    payment_method: saleMethodOf(payments),
+    payment_reference: joinedReference(payments),
+    cash_received: cashLine?.cash_received ?? null,
+    change_given: cashLine?.change_given ?? null,
+    payments,
     invoice_name: null,
     cufe: null,
   };

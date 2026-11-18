@@ -5,7 +5,7 @@
 import { useState } from "react";
 import ReceiptCapture from "@/components/ReceiptCapture";
 import { uploadReceipt } from "@/lib/client/receipts";
-import { paymentLabel } from "@/lib/payments";
+import { paymentLabel, paymentShortLabel } from "@/lib/payments";
 import { receiptAllowed, receiptRequired } from "@/lib/receipt-rules";
 import type { SaleListRow } from "@/lib/sales";
 
@@ -13,7 +13,9 @@ const fmtDate = (iso: string) => new Date(iso).toLocaleString("es-CO", { timeZon
 const fmtDay = (iso: string) => new Date(iso).toLocaleDateString("es-CO", { timeZone: "America/Bogota", dateStyle: "long" });
 
 /** Transferencia sin foto (pendiente o de antes de exigirla): se resalta en el historial. */
-export const missingRequiredReceipt = (s: SaleListRow) => receiptRequired(s.payment_method) && s.receipt_status !== "activo" && s.receipt_status !== "eliminado";
+// El comprobante depende de los medios de las LÍNEAS de pago: transferencia = obligatorio; tarjeta = opcional.
+const methodsOf = (s: SaleListRow) => s.payments.map((p) => p.method);
+export const missingRequiredReceipt = (s: SaleListRow) => receiptRequired(methodsOf(s)) && s.receipt_status !== "activo" && s.receipt_status !== "eliminado";
 
 const IconReceipt = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -55,7 +57,7 @@ export function ReceiptCell({ s, isAdmin, onChanged }: { s: SaleListRow; isAdmin
         >
           <IconReceipt /> {s.receipt_status === "activo" ? "Ver comprobante" : "Eliminado"}
         </button>
-      ) : receiptAllowed(s.payment_method) ? (
+      ) : receiptAllowed(methodsOf(s)) ? (
         <>
           {s.receipt_status === "pendiente" && <span className="px-2 py-0.5 rounded-full text-[12px] font-semibold bg-warn-soft text-warn-ink">Comprobante pendiente</span>}
           <button
@@ -108,7 +110,7 @@ function ReceiptViewer({ s, isAdmin, onClose, onReplace }: { s: SaleListRow; isA
 
           <dl className="text-[14px] space-y-2">
             <div><dt className="text-dim text-[12px]">Fecha de la foto</dt><dd>{s.receipt_uploaded_at ? fmtDate(s.receipt_uploaded_at) : "—"}</dd></div>
-            <div><dt className="text-dim text-[12px]">Medio de pago</dt><dd>{paymentLabel(s.payment_method)}</dd></div>
+            <div><dt className="text-dim text-[12px]">Medio de pago</dt><dd>{s.payments.length > 1 ? s.payments.map((p) => `${paymentShortLabel(p.method)} ${Math.round(p.amount).toLocaleString("es-CO")}`).join(" + ") : paymentLabel(s.payment_method)}</dd></div>
             <div><dt className="text-dim text-[12px]">Referencia</dt><dd className="break-all">{s.payment_reference ?? "—"}</dd></div>
             <div><dt className="text-dim text-[12px]">Subido por</dt><dd>{s.receipt_uploaded_by ?? "—"}</dd></div>
             <div><dt className="text-dim text-[12px]">Fecha de la venta</dt><dd>{fmtDate(s.created_at)}</dd></div>

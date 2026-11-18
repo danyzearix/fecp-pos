@@ -13,10 +13,10 @@ import {
 } from "@/config/siigo-map";
 import { query } from "../db";
 import { writeLog } from "../log";
-import { round2 } from "../money";
-import { paymentLabel, type PaymentMethod } from "../payments";
+import type { LineMethod } from "../payments";
 import { INVOICEABLE } from "../sale-states";
-import { epaycoInvoicingBlocker, siigoPaymentId } from "./payment";
+import { creditInvoicingBlocker, epaycoInvoicingBlocker } from "./payment";
+import { buildObservations, buildSiigoPayments, PaymentsMismatchError, type SalePayLine } from "./payment-body";
 import { CONSUMIDOR_FINAL_ID } from "../sale-types";
 import { siigo, SiigoHttpError, SiigoNetworkError } from "./client";
 import { ensureSiigoCustomer, type CustomerRow } from "./customers";
@@ -27,7 +27,7 @@ type SaleRow = {
   cashier_id: number;
   customer_id: number;
   total: string;
-  payment_method: PaymentMethod;
+  payment_method: string; // el medio de la única línea, o "mixto" (las líneas están en sale_payments)
   payment_reference: string | null;
   siigo_invoice_id: string | null;
   created_at: Date;
@@ -67,8 +67,10 @@ const invoiceLabel = (inv: SiigoInvoice) => (inv.prefix && inv.number != null ? 
 
 async function claim(saleId: string, from: string[]): Promise<SaleRow | null> {
   const { rows } = await query<SaleRow>(
+    // Una venta retenida por "precio por revisar" NUNCA se reclama para facturar (segunda capa: aunque alguien se saltara el
+    // chequeo de invoiceSale, este UPDATE no la toma). Solo se factura desde Admin → Precios por revisar, tras aprobarla.
     `UPDATE sales SET status = 'invoicing', invoicing_started_at = now(), last_error = NULL
-      WHERE id = $1 AND status = ANY($2::text[])
+      WHERE id = $1 AND status = ANY($2::text[]) AND price_review_status IS DISTINCT FROM 'pendiente'
       RETURNING id, local_number, cashier_id, customer_id, total, payment_method, payment_reference, siigo_invoice_id, created_at`,
     [saleId, from]
   );
@@ -146,13 +148,16 @@ async function buildInvoiceBody(sale: SaleRow) {
     return item;
   });
 
-  const paymentId = siigoPaymentId(sale.payment_method);
-  if (!paymentId) throw new Error(`No hay forma de pago de Siigo para "${sale.payment_method}" (src/config/siigo-map.ts)`);
-
-  const obs =
-    (test ? "PRUEBA POS - ELIMINAR | " : "") +
-    `POS FECP venta ${sale.id} | ${paymentLabel(sale.payment_method)}` +
-    (sale.payment_reference ? ` ref ${sale.payment_reference}` : "");
+  // ---- Pagos: UNO por cada línea de sale_payments, con el id de Siigo según el medio ----
+  const pl = await query<{ method: LineMethod; amount: string; reference: string | null; credit_days: number | null; due_date: string | null }>(
+    `SELECT method, amount, COALESCE(reference, CASE WHEN method = 'epayco' THEN $2 END) AS reference, credit_days, to_char(due_date, 'YYYY-MM-DD') AS due_date
+       FROM sale_payments WHERE sale_id = $1 ORDER BY ord`,
+    [sale.id, sale.payment_reference]
+  );
+  const lines: SalePayLine[] = pl.rows.map((r) => ({ method: r.method, amount: Number(r.amount), reference: r.reference, credit_days: r.credit_days, due_date: r.due_date }));
+  // Si la suma no coincide con el total, lanza PaymentsMismatchError ANTES de enviar nada: la venta queda en revisión con el motivo
+  const payments = buildSiigoPayments(lines, Number(sale.total));
+  const obs = buildObservations({ saleId: sale.id, lines, test });
 
   const hasEmail = !!customer.email && customer.identification !== CONSUMIDOR_FINAL_ID;
 
@@ -168,7 +173,7 @@ async function buildInvoiceBody(sale: SaleRow) {
       mail: { send: !test && hasEmail },
       observations: obs,
       items: siigoItems,
-      payments: [{ id: paymentId, value: round2(Number(sale.total)) }],
+      payments,
     },
   };
 }
@@ -228,7 +233,11 @@ async function finalize(sale: SaleRow, created: SiigoInvoice, userId: number | u
 async function fail(sale: SaleRow, e: unknown, posted: boolean, userId: number | undefined, request: unknown): Promise<InvoiceOutcome> {
   let status: "failed" | "revisar";
   let msg: string;
-  if (e instanceof SiigoNetworkError) {
+  if (e instanceof PaymentsMismatchError) {
+    // Nunca se envió nada a Siigo. Queda en "revisar" con el motivo (no se reintenta a ciegas).
+    status = "revisar";
+    msg = e.message;
+  } else if (e instanceof SiigoNetworkError) {
     status = posted ? "revisar" : "failed";
     msg = posted ? `No se sabe si Siigo creó la factura: ${e.message}` : e.message;
   } else if (e instanceof SiigoHttpError) {
@@ -277,6 +286,29 @@ export async function sweepStuckInvoicing(): Promise<number> {
 /** Factura una venta en estado 'pending', 'failed' o 'pagado'. Si otra petición ya la está facturando, no hace nada. */
 export async function invoiceSale(saleId: string, userId?: number): Promise<InvoiceOutcome> {
   await sweepStuckInvoicing().catch(() => {});
+
+  // Venta retenida por precio por revisar: no se factura ni se reintenta (ni sola ni desde el botón de /ventas).
+  // La decide un admin en Admin → Precios por revisar ("Aprobar y facturar" o "Anular").
+  const held = await query<{ held: boolean }>("SELECT price_review_status = 'pendiente' AS held FROM sales WHERE id = $1", [saleId]);
+  if (held.rows[0]?.held) {
+    await writeLog("factura", `Venta ${saleId}: NO se factura, está retenida por precio por revisar`, { level: "warn", userId, detail: { sale_id: saleId } });
+    return current(saleId);
+  }
+
+  // Crédito FECP: con SIIGO_TEST_MODE=false y sin SIIGO_PAYMENT_CREDITO_ID no se factura (el id por defecto es solo de pruebas).
+  // La venta se queda como está (no se reclama) y el motivo queda en last_error y en /admin/configuracion.
+  const hasCredit = await query<{ c: boolean; status: string }>(
+    "SELECT EXISTS (SELECT 1 FROM sale_payments WHERE sale_id = $1 AND method = 'credito_fecp') AS c, (SELECT status FROM sales WHERE id = $1) AS status",
+    [saleId]
+  );
+  if (hasCredit.rows[0]?.c && INVOICEABLE.includes(hasCredit.rows[0].status as never)) {
+    const blocker = creditInvoicingBlocker();
+    if (blocker) {
+      await query("UPDATE sales SET last_error = $2 WHERE id = $1", [saleId, blocker]);
+      await writeLog("factura", `Venta ${saleId}: NO se factura el Crédito FECP. ${blocker}`, { level: "error", userId, detail: { sale_id: saleId, blocker } });
+      return current(saleId);
+    }
+  }
 
   // Pago electrónico: no se factura si la configuración no es segura (ver src/lib/siigo/payment.ts).
   // La venta se queda como está (no se reclama) y el motivo queda en last_error y en /admin/configuracion.

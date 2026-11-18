@@ -125,7 +125,9 @@ git pull                         # o copia los archivos nuevos
 dc build && dc up -d             # recrea solo fecp-pos-app (y db si cambió); crea los volúmenes nuevos si faltan
 dc exec app node db/setup.mjs    # aplica cambios de tablas si los hay (idempotente: no borra datos)
 ```
-Si `.env.production.example` trae variables nuevas, cópialas a tu `.env.production` (y vuelve a `dc up -d`).
+Si `.env.production.example` trae variables nuevas, cópialas a tu `.env.production` (y vuelve a `dc up -d`). La última versión agrega `PRICE_HISTORY_HOURS=72` (ventana de validación de precios de la caja).
+
+> **`db:setup` es obligatorio en esta actualización:** crea `product_price_history` con la línea base de los 701 productos, el disparador sobre `products` y las columnas de revisión de `sales`. Verifica: `dc exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT (SELECT count(*) FROM products), (SELECT count(*) FROM product_price_history WHERE valid_to IS NULL)"'` (las dos cifras deben ser iguales).
 
 ### 2.4.1 Scripts de `db/` en el servidor
 La imagen incluye `db/` (`setup`, `seed`, `iva-report`, `siigo-test-docs`). Para los reportes se usa un contenedor **temporal**
@@ -345,7 +347,7 @@ Si está el `_comprobantes.tar.gz` del mismo respaldo, **reemplaza también las 
    dc exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "TRUNCATE sale_receipts, payment_refs, sale_items, sales, logs RESTART IDENTITY; ALTER SEQUENCE kiosk_sale_seq RESTART WITH 1;"'
    dc exec app sh -c 'rm -rf /app/uploads/comprobantes/*'      # y las fotos de prueba
    ```
-3. Pasa a real **solo cuando lo decidas** (README sección 13: `SIIGO_TEST_MODE=false`, `EPAYCO_TEST_MODE=false`, `EPAYCO_SIIGO_PAYMENT_ID` real). Tras editar `.env.production`: `dc up -d` recrea la app con los valores nuevos.
+3. Pasa a real **solo cuando lo decidas** (README sección 13: `SIIGO_TEST_MODE=false`, `EPAYCO_TEST_MODE=false`, `EPAYCO_SIIGO_PAYMENT_ID` real y `SIIGO_PAYMENT_CREDITO_ID` real si se vende a crédito). Tras editar `.env.production`: `dc up -d` recrea la app con los valores nuevos.
 4. **Las cajas y el kiosco deben iniciar sesión de nuevo** (la sesión es por dirección; cambian de `127.0.0.1` a `pos.fecp.me`). Actualiza sus accesos directos de Chrome (README, sección 7).
 5. Primera copia: corre `backup.sh` a mano y verifícala con `restore.sh --probar`.
 

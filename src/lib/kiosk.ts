@@ -154,6 +154,7 @@ export async function createKioskPayment(input: {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'epayco','esperando_pago',now(),$12,'esperando',$9,$10,$11,$13,now())`,
       [saleId, localNumber, input.userId, customerId, checkoutType, totals.subtotal, totals.tax, totals.total, expiresAt, payToken, notifyEmail, source, channel]
     );
+    await client.query("INSERT INTO sale_payments (sale_id, method, amount, ord) VALUES ($1,'epayco',$2,1)", [saleId, totals.total]);
     for (const l of lines) {
       await client.query(
         `INSERT INTO sale_items (sale_id, product_id, sku, name, quantity, unit_price, tax_rate, line_total, prices_include_tax)

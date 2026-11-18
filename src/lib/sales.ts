@@ -6,12 +6,13 @@ import { cartTotals, lineAmounts, round2 } from "./money";
 import { getPosConfig } from "./config";
 import { itemToLine } from "./ticket";
 import { receiptRequired, type ReceiptStatus } from "./receipt-rules";
+import { checkPrices } from "./price-check";
+import { bogotaDay, joinedReference, MAX_PAY_LINES, methodsOf, saleMethodOf, validatePaymentLines, type PayLine, type PayLineIn } from "./payment-lines";
 import {
   CONSUMIDOR_FINAL_ID,
   ID_TYPES,
-  CASHIER_PAYMENT_METHODS,
-  requiresReference,
   type CustomerIn,
+  type LineMethod,
   type SaleIn,
   type TicketData,
 } from "./sale-types";
@@ -49,8 +50,59 @@ export function parseCustomer(raw: unknown): CustomerIn | null | string {
   };
 }
 
+/** Venta ya validada por el servidor: con las líneas de pago completas (cambio, vencimiento) y su total. */
+export type ParsedSale = Omit<SaleIn, "payments" | "payment_method" | "payment_reference" | "cash_received"> & {
+  lines: PayLine[];
+  total: number;
+  /** si la hora del equipo estaba fuera de rango (hace > 7 días o > 5 min en el futuro) se usó la del servidor y queda aquí la nota */
+  time_note: string | null;
+};
+
+/** Límites de la hora que manda el equipo: no más de 7 días atrás ni más de 5 minutos en el futuro. */
+export const DEVICE_MAX_AGE_MS = 7 * 24 * 3600_000;
+export const DEVICE_MAX_AHEAD_MS = 5 * 60_000;
+
+/** Crédito FECP: cliente con cédula/NIT REAL y datos completos (igual que el checkout completo), aunque la venta sea < 5 UVT. */
+function creditCustomerError(c: CustomerIn | null): string | null {
+  if (!c || c.identification === CONSUMIDOR_FINAL_ID || !["13", "22", "31"].includes(c.id_type)) {
+    return "El Crédito FECP exige un cliente identificado con cédula o NIT real (no Consumidor final)";
+  }
+  const okName = c.id_type === "31" ? !!c.company_name : !!(c.first_name && c.last_name);
+  if (!okName || !c.email || !EMAIL_RE.test(c.email) || !c.address || !c.state_code || !c.city_code) {
+    return "El Crédito FECP exige los datos completos del cliente (nombre, correo, dirección, departamento y ciudad)";
+  }
+  if (c.id_type === "31" && !c.check_digit) return "Falta el dígito de verificación del NIT";
+  return null;
+}
+
+/** Líneas de pago que manda el navegador: formato NUEVO (payments) o VIEJO (un solo medio, de la cola local anterior). */
+function readPayLines(b: Record<string, unknown>, total: number): PayLineIn[] | string {
+  if (Array.isArray(b.payments)) {
+    const lines: PayLineIn[] = [];
+    for (const raw of b.payments) {
+      const l = (raw ?? {}) as Record<string, unknown>;
+      // En el formato NUEVO solo existen los medios actuales (Tarjeta reemplazó a débito y crédito; los históricos solo vienen en la cola vieja)
+      if (!["efectivo", "tarjeta", "transferencia", "credito_fecp", "epayco"].includes(str(l.method, 30))) return "Medio de pago inválido";
+      lines.push({
+        method: str(l.method, 30) as LineMethod,
+        amount: num(l.amount),
+        reference: str(l.reference, 60),
+        cash_received: l.cash_received == null ? null : num(l.cash_received),
+        credit_days: l.credit_days == null ? null : num(l.credit_days),
+      });
+    }
+    return lines;
+  }
+  // Formato viejo: UN medio por el total. Los históricos (tarjeta débito/crédito) siguen válidos aquí; el crédito y ePayco, no.
+  const method = ["efectivo", "tarjeta", "transferencia", "tarjeta_debito", "tarjeta_credito"].find((m) => m === b.payment_method) as LineMethod | undefined;
+  if (!method) return b.payment_method === "epayco" ? "El pago electrónico se cobra por su propio flujo (no se registra aquí)" : "Medio de pago inválido";
+  const cash = b.cash_received == null ? null : num(b.cash_received);
+  if (method === "efectivo" && (cash === null || !(cash + 0.005 >= total))) return "El valor recibido es menor al total";
+  return [{ method, amount: total, reference: str(b.payment_reference, 60), cash_received: method === "efectivo" ? cash : null, credit_days: null }];
+}
+
 /** Devuelve la venta limpia o un mensaje de error en español. */
-export function parseSale(body: unknown): SaleIn | string {
+export function parseSale(body: unknown): ParsedSale | string {
   if (!body || typeof body !== "object") return "Cuerpo inválido";
   const b = body as Record<string, unknown>;
 
@@ -60,13 +112,6 @@ export function parseSale(body: unknown): SaleIn | string {
   if (!local_number) return "Falta el número local";
   const checkout_type = b.checkout_type;
   if (checkout_type !== "corto" && checkout_type !== "completo") return "Tipo de checkout inválido";
-  const payment_method = CASHIER_PAYMENT_METHODS.find((m) => m.id === b.payment_method)?.id;
-  if (!payment_method) return "Medio de pago inválido";
-  const payment_reference = str(b.payment_reference, 60);
-  if (requiresReference(payment_method) && !payment_reference) {
-    return "Falta la referencia o los últimos dígitos del comprobante de pago";
-  }
-
   const customer = parseCustomer(b.customer);
   if (typeof customer === "string") return customer;
 
@@ -92,21 +137,38 @@ export function parseSale(body: unknown): SaleIn | string {
     });
   }
 
-  const created = new Date(str(b.created_at_device, 40));
-  const cash = b.cash_received == null ? null : num(b.cash_received);
-  if (cash !== null && !(cash >= 0)) return "Valor recibido inválido";
+  // Hora del equipo: se acepta entre "hace 7 días" y "ahora + 5 minutos". Fuera de ese rango (o ilegible) se usa la hora del
+  // servidor y se anota (no se rechaza la venta).
+  const rawCreated = str(b.created_at_device, 40);
+  const created = new Date(rawCreated);
+  const nowMs = Date.now();
+  const inRange = !isNaN(created.getTime()) && created.getTime() >= nowMs - DEVICE_MAX_AGE_MS && created.getTime() <= nowMs + DEVICE_MAX_AHEAD_MS;
+  const createdIso = inRange ? created.toISOString() : new Date(nowMs).toISOString();
+  const timeNote = inRange ? null : `Hora del equipo fuera de rango (${rawCreated || "sin hora"}): se usó la hora del servidor`;
 
-  return {
-    id,
-    local_number,
-    created_at_device: isNaN(created.getTime()) ? new Date().toISOString() : created.toISOString(),
-    checkout_type,
-    payment_method,
-    payment_reference: requiresReference(payment_method) ? payment_reference : null,
-    cash_received: payment_method === "efectivo" ? cash : null,
-    customer,
-    items,
-  };
+  // ---- Pagos: el TOTAL lo calcula el servidor desde los productos; los montos del navegador solo se comparan con él ----
+  const total = cartTotals(items.map(itemToLine)).total;
+  const linesIn = readPayLines(b, total);
+  if (typeof linesIn === "string") return linesIn;
+  if (linesIn.length > MAX_PAY_LINES) return `Máximo ${MAX_PAY_LINES} medios de pago por venta`;
+  if (linesIn.some((l) => l.method === "epayco")) {
+    return linesIn.length > 1
+      ? "El pago electrónico (ePayco) solo puede ser el único medio de la venta"
+      : "El pago electrónico se cobra por su propio flujo (no se registra aquí)";
+  }
+  const hasCredit = linesIn.some((l) => l.method === "credito_fecp");
+  if (hasCredit) {
+    if (checkout_type !== "completo") return "El Crédito FECP exige el checkout completo (datos completos del cliente)";
+    const ce = creditCustomerError(customer);
+    if (ce) return ce;
+  }
+  const v = validatePaymentLines(linesIn, total, {
+    saleDay: bogotaDay(createdIso),
+    customerIdentified: !!customer && customer.identification !== CONSUMIDOR_FINAL_ID,
+  });
+  if (!v.ok) return v.error;
+
+  return { id, local_number, created_at_device: createdIso, checkout_type, customer, items, lines: v.lines, total, time_note: timeNote };
 }
 
 /** "Maria Fernanda Lopez" → ["Maria Fernanda", "Lopez"] */
@@ -159,17 +221,24 @@ export async function upsertCashierCustomer(client: PoolClient, customer: Custom
  * Registra la venta. Idempotente: si el mismo UUID llega dos veces, la segunda vez no inserta nada
  * (INSERT ... ON CONFLICT (id) DO NOTHING) y devuelve el estado actual.
  */
-export async function createSale(sale: SaleIn, cashierId: number): Promise<CreateSaleResult> {
+export async function createSale(sale: ParsedSale, cashierId: number): Promise<CreateSaleResult> {
   const lines = sale.items.map(itemToLine);
   const totals = cartTotals(lines);
 
-  let change: number | null = null;
-  if (sale.payment_method === "efectivo") {
-    if (sale.cash_received == null || sale.cash_received + 0.005 < totals.total) {
-      return { ok: false, error: "El valor recibido es menor al total" };
-    }
-    change = round2(sale.cash_received - totals.total);
-  }
+  // Defensa en profundidad: las líneas ya se validaron en parseSale; aquí se re-comprueba contra el total recalculado
+  const recheck = validatePaymentLines(
+    sale.lines.map((l) => ({ method: l.method, amount: l.amount, reference: l.reference, cash_received: l.cash_received, credit_days: l.credit_days })),
+    totals.total,
+    { saleDay: bogotaDay(sale.created_at_device), customerIdentified: !!sale.customer && sale.customer.identification !== CONSUMIDOR_FINAL_ID }
+  );
+  if (!recheck.ok) return { ok: false, error: recheck.error };
+  const payLines = recheck.lines;
+  const cashLine = payLines.find((l) => l.method === "efectivo") ?? null;
+
+  // Precios: cada línea se compara con la base (y su historial reciente). Tolerancia cero. Si algo no coincide la venta se
+  // ACEPTA igual (el cliente ya pagó) pero queda retenida: no se factura sola hasta que un admin la decida.
+  const pc = await checkPrices(sale.items);
+  const heldReason = pc.flagged ? `Precio por revisar: ${pc.summary}. Se decide en Admin → Precios por revisar.` : null;
 
   const cfg = getPosConfig();
   if (sale.checkout_type === "corto" && totals.subtotal > 5 * cfg.uvt) {
@@ -188,20 +257,35 @@ export async function createSale(sale: SaleIn, cashierId: number): Promise<Creat
 
     const ins = await client.query(
       `INSERT INTO sales (id, local_number, cashier_id, customer_id, checkout_type, subtotal, tax_total, total,
-                          payment_method, cash_received, change_given, status, created_at_device, payment_reference)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$13)
+                          payment_method, cash_received, change_given, status, created_at_device, payment_reference,
+                          price_review_status, price_review_detail, price_review_at, last_error, time_note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$13,
+               $14, $15::jsonb, CASE WHEN $14::text IS NULL THEN NULL ELSE now() END, $16, $17)
        ON CONFLICT (id) DO NOTHING RETURNING id`,
       [
         sale.id, sale.local_number, cashierId, cust.rows[0].id, sale.checkout_type,
-        totals.subtotal, totals.tax, totals.total, sale.payment_method,
-        sale.cash_received, change, sale.created_at_device, sale.payment_reference,
+        totals.subtotal, totals.tax, totals.total,
+        // columnas viejas (compatibilidad): el medio de la única línea o "mixto"; el efectivo y sus referencias
+        saleMethodOf(payLines), cashLine?.cash_received ?? null, cashLine?.change_given ?? null, sale.created_at_device, joinedReference(payLines),
+        pc.flagged ? "pendiente" : null, pc.flagged ? JSON.stringify(pc.detail) : null, heldReason, sale.time_note,
       ]
     );
 
     const inserted = (ins.rowCount ?? 0) > 0;
-    // Transferencia: el comprobante es obligatorio. La foto se sube DESPUÉS de que la venta exista (puede venir de la cola
-    // sin conexión); mientras no llegue, la venta queda con "Comprobante pendiente".
-    if (inserted && receiptRequired(sale.payment_method)) {
+    // Líneas de pago (una por medio). Reportes, cuadre e historial calculan desde sale_payments.
+    if (inserted) {
+      for (let i = 0; i < payLines.length; i++) {
+        const l = payLines[i];
+        await client.query(
+          `INSERT INTO sale_payments (sale_id, method, amount, reference, cash_received, change_given, credit_days, due_date, ord)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [sale.id, l.method, l.amount, l.reference, l.cash_received, l.change_given, l.credit_days, l.due_date, i + 1]
+        );
+      }
+    }
+    // Si hay una línea de Transferencia, el comprobante es obligatorio. La foto se sube DESPUÉS de que la venta exista (puede
+    // venir de la cola sin conexión); mientras no llegue, la venta queda con "Comprobante pendiente".
+    if (inserted && receiptRequired(methodsOf(payLines))) {
       await client.query("INSERT INTO sale_receipts (sale_id, status) VALUES ($1, 'pendiente') ON CONFLICT (sale_id) DO NOTHING", [sale.id]);
     }
     if (inserted) {
@@ -218,10 +302,21 @@ export async function createSale(sale: SaleIn, cashierId: number): Promise<Creat
     }
     await client.query("COMMIT");
 
+    if (inserted && pc.flagged) {
+      // Sin datos personales: solo el motivo, la cantidad de líneas y la diferencia
+      await writeLog("venta", `Venta ${sale.local_number} RETENIDA por precio por revisar: ${pc.summary}`, {
+        level: "warn",
+        userId: cashierId,
+        detail: { id: sale.id, reasons: pc.detail.reasons, lines_flagged: pc.detail.lines.filter((l) => l.reasons.length).length, diff_total: pc.detail.diff_total, window_hours: pc.detail.window_hours },
+      });
+    }
+    if (inserted && sale.time_note) {
+      await writeLog("venta", `Venta ${sale.local_number}: ${sale.time_note}`, { level: "warn", userId: cashierId, detail: { id: sale.id } });
+    }
     if (inserted) {
       await writeLog("venta", `Venta ${sale.local_number} registrada por $${totals.total}`, {
         userId: cashierId,
-        detail: { id: sale.id, total: totals.total, payment: sale.payment_method, items: sale.items.length, checkout: sale.checkout_type },
+        detail: { id: sale.id, total: totals.total, payment: saleMethodOf(payLines), lines: payLines.map((l) => ({ m: l.method, a: l.amount })), items: sale.items.length, checkout: sale.checkout_type },
       });
     }
 
@@ -238,11 +333,20 @@ export async function createSale(sale: SaleIn, cashierId: number): Promise<Creat
   }
 }
 
+/** Subconsulta: las líneas de pago de la venta (alias s) como JSON, en orden. due_date como texto YYYY-MM-DD. */
+export const PAY_LINES_SQL = `(SELECT json_agg(json_build_object(
+    'method', sp.method, 'amount', sp.amount::float8,
+    'reference', COALESCE(sp.reference, CASE WHEN sp.method = 'epayco' THEN s.payment_reference END),
+    'cash_received', sp.cash_received::float8, 'change_given', sp.change_given::float8,
+    'credit_days', sp.credit_days, 'due_date', to_char(sp.due_date, 'YYYY-MM-DD')) ORDER BY sp.ord)
+  FROM sale_payments sp WHERE sp.sale_id = s.id)`;
+
 type SaleRow = {
   id: string; local_number: string; status: string; created_at: Date; created_at_device: Date | null;
   subtotal: number; tax_total: number; total: number; payment_method: string; payment_reference: string | null;
   cash_received: number | null; change_given: number | null; invoice_name: string | null; cufe: string | null;
   cashier_name: string; c_first: string | null; c_last: string | null; c_company: string | null; c_ident: string | null;
+  pay_lines: PayLine[] | null;
 };
 
 export async function getTicketData(id: string): Promise<TicketData | null> {
@@ -251,7 +355,8 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
             s.subtotal::float8 AS subtotal, s.tax_total::float8 AS tax_total, s.total::float8 AS total,
             s.payment_method, s.payment_reference, s.cash_received::float8 AS cash_received, s.change_given::float8 AS change_given,
             s.invoice_name, s.cufe, u.name AS cashier_name,
-            c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company, c.identification AS c_ident
+            c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company, c.identification AS c_ident,
+            ${PAY_LINES_SQL} AS pay_lines
        FROM sales s
        JOIN users u ON u.id = s.cashier_id
        LEFT JOIN customers c ON c.id = s.customer_id
@@ -302,6 +407,11 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
     payment_reference: s.payment_reference,
     cash_received: s.cash_received,
     change_given: s.change_given,
+    // Líneas de pago; si por algo no hubiera filas (no debería), se arma una sola con las columnas viejas
+    payments:
+      s.pay_lines && s.pay_lines.length
+        ? s.pay_lines
+        : [{ method: s.payment_method as LineMethod, amount: s.total, reference: s.payment_reference, cash_received: s.cash_received, change_given: s.change_given, credit_days: null, due_date: null }],
     invoice_name: s.invoice_name,
     cufe: s.cufe,
   };
@@ -341,6 +451,10 @@ export type SaleListRow = {
   receipt_deleted_at: string | null;
   /** fecha de la venta (Bogotá), para el nombre del archivo descargado */
   sale_day: string;
+  /** líneas de pago (una por medio). payment_method vale "mixto" si hay más de una. */
+  payments: PayLine[];
+  /** 'pendiente' = retenida por precio por revisar (no se factura hasta que un admin decida) */
+  price_review_status: "pendiente" | "aprobada" | "anulada" | null;
 };
 
 /** Filtro de comprobante en el historial */
@@ -355,15 +469,17 @@ export async function listSales(date: string, cashierId: number | null, receipt:
     receipt === "pendiente" ? "AND r.status = 'pendiente'" :
     receipt === "sin" ? "AND r.sale_id IS NULL" : "";
   const { rows } = await query<
-    Omit<SaleListRow, "receipt_uploaded_at" | "receipt_deleted_at"> & {
+    Omit<SaleListRow, "receipt_uploaded_at" | "receipt_deleted_at" | "payments" | "price_review_status"> & {
+      price_review_status: SaleListRow["price_review_status"];
       c_first: string | null; c_last: string | null; c_company: string | null; receipt_uploaded_at: Date | null; receipt_deleted_at: Date | null;
+      pay_lines: PayLine[] | null;
     }
   >(
     `SELECT s.id, s.local_number, s.invoice_name, s.total::float8 AS total, s.payment_method, s.payment_reference,
             s.status, s.last_error, COALESCE(s.created_at_device, s.created_at) AS created_at, u.name AS cashier_name,
             c.identification AS customer_identification, c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company,
             r.status AS receipt_status, r.uploaded_at AS receipt_uploaded_at, ru.name AS receipt_uploaded_by, r.deleted_at AS receipt_deleted_at,
-            ${SALE_DAY_SQL}::text AS sale_day
+            ${SALE_DAY_SQL}::text AS sale_day, ${PAY_LINES_SQL} AS pay_lines, s.price_review_status
        FROM sales s
        JOIN users u ON u.id = s.cashier_id
        LEFT JOIN customers c ON c.id = s.customer_id
@@ -384,6 +500,11 @@ export async function listSales(date: string, cashierId: number | null, receipt:
       receipt_uploaded_at: r.receipt_uploaded_at ? new Date(r.receipt_uploaded_at).toISOString() : null,
       receipt_deleted_at: r.receipt_deleted_at ? new Date(r.receipt_deleted_at).toISOString() : null,
       sale_day: r.sale_day,
+      price_review_status: r.price_review_status ?? null,
+      payments:
+        r.pay_lines && r.pay_lines.length
+          ? r.pay_lines
+          : [{ method: r.payment_method as LineMethod, amount: r.total, reference: r.payment_reference, cash_received: null, change_given: null, credit_days: null, due_date: null }],
       customer_identification: isCF ? CONSUMIDOR_FINAL_ID : r.customer_identification,
       customer_name: isCF ? "Consumidor final" : r.c_company || [r.c_first, r.c_last].filter(Boolean).join(" ") || r.customer_identification,
     };

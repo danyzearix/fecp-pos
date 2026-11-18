@@ -1,11 +1,15 @@
-import { EPAYCO_SIIGO_PAYMENT_ID_DEFAULT, SIIGO_COST_CENTER, SIIGO_EXEMPT_TAX_ID, SIIGO_PAYMENT_ID, SIIGO_TAX_ID_BY_RATE } from "@/config/siigo-map";
+import { CREDITO_SIIGO_PAYMENT_ID_DEFAULT, EPAYCO_SIIGO_PAYMENT_ID_DEFAULT, SIIGO_COST_CENTER, SIIGO_EXEMPT_TAX_ID, SIIGO_TAX_ID_BY_RATE } from "@/config/siigo-map";
 import { getEpaycoConfig } from "@/lib/epayco/config";
-import { epaycoInvoicingBlocker } from "@/lib/siigo/payment";
+import { priceHistoryHours } from "@/lib/price-check";
+import { reviewCounts } from "@/lib/price-review";
+import { heldText } from "@/lib/price-review-rules";
+import { creditInvoicingBlocker, epaycoInvoicingBlocker, explicitCreditPaymentId, siigoPaymentId } from "@/lib/siigo/payment";
 import { requirePage } from "@/lib/auth";
 import { getPosConfig } from "@/lib/config";
 import { query } from "@/lib/db";
-import { PAYMENT_METHODS } from "@/lib/payments";
+import { LEGACY_PAYMENT_METHODS, PAYMENT_METHODS } from "@/lib/payments";
 import { sweepStuckInvoicing } from "@/lib/siigo/invoice";
+import { formatCOP } from "@/lib/money";
 import ConnectionTests from "./ConnectionTests";
 import ProblemSales, { type Problem } from "./ProblemSales";
 import type { Metadata } from "next";
@@ -38,6 +42,8 @@ export default async function ConfiguracionPage() {
   const cfg = getPosConfig();
   const epayco = getEpaycoConfig();
   const invoicingBlocker = epaycoInvoicingBlocker();
+  const creditBlocker = creditInvoicingBlocker();
+  const rc = await reviewCounts();
 
   const probs = await query<Problem & { created_at: Date }>(
     `SELECT s.id, s.local_number, s.status, s.total::float8 AS total, u.name AS cashier,
@@ -109,7 +115,37 @@ export default async function ConfiguracionPage() {
         />
         <Section
           title="Mapa de medios de pago → Siigo"
-          rows={PAYMENT_METHODS.map((m) => [m.label, `id ${SIIGO_PAYMENT_ID[m.id]}`] as [string, string])}
+          rows={[
+            ...PAYMENT_METHODS.map((m) => {
+              const note =
+                m.id === "transferencia" ? " (valor de pruebas, pendiente de confirmar con FECP)"
+                : m.id === "epayco" ? (env("EPAYCO_SIIGO_PAYMENT_ID") ? " (EPAYCO_SIIGO_PAYMENT_ID)" : " (por defecto: solo pruebas)")
+                : m.id === "credito_fecp" ? (explicitCreditPaymentId() ? " (SIIGO_PAYMENT_CREDITO_ID)" : " (por defecto: solo pruebas)")
+                : "";
+              // En modo real, un valor "por defecto: solo pruebas" NO se usa: el sistema se niega a facturar ese medio
+              const missingInReal = !cfg.testMode && ((m.id === "epayco" && !env("EPAYCO_SIIGO_PAYMENT_ID")) || (m.id === "credito_fecp" && !explicitCreditPaymentId()));
+              return [m.label, missingInReal ? "✗ FALTA el id real (en modo real no se factura este medio)" : `id ${siigoPaymentId(m.id)}${note}`] as [string, string];
+            }),
+            ...LEGACY_PAYMENT_METHODS.map((m) => [`${m.label} (histórico)`, `id ${siigoPaymentId(m.id)}`] as [string, string]),
+          ]}
+        />
+        <Section
+          title="Validación de precios (caja)"
+          rows={[
+            ["PRICE_HISTORY_HOURS", `${priceHistoryHours()} horas${env("PRICE_HISTORY_HOURS") ? "" : " (por defecto)"}`],
+            ["Regla", "Una línea es válida si coincide con el precio, IVA y SKU vigentes, o con alguno vigente en esa ventana. Tolerancia cero."],
+            ["Ventas por revisar", rc.prices === 0 ? "0" : `${rc.prices} (${formatCOP(rc.pricesTotal)}) — la más antigua lleva ${heldText(rc.pricesOldestMin)}${rc.pricesLevel === "critica" ? " · ✗ MUY ATRASADA (+4 h)" : rc.pricesLevel === "atrasada" ? " · ATRASADA (+2 h)" : ""}`],
+            ["Hora del equipo", "Se acepta entre hace 7 días y ahora + 5 minutos; fuera de eso se usa la hora del servidor y se anota"],
+          ]}
+        />
+        <Section
+          title="Crédito FECP"
+          rows={[
+            ["SIIGO_PAYMENT_CREDITO_ID", env("SIIGO_PAYMENT_CREDITO_ID") || (cfg.testMode ? `(sin definir: se usa ${CREDITO_SIIGO_PAYMENT_ID_DEFAULT}, solo de pruebas)` : "✗ FALTA (en modo real no se factura el crédito)")],
+            ["¿Se pueden facturar ventas a crédito?", creditBlocker ? `✗ NO: ${creditBlocker}` : "Sí"],
+            ["Plazos", "14, 30, 60 y 90 días (el vencimiento = fecha de la venta + plazo)"],
+            ["Saldos y abonos", "El POS no los lleva: quedan en Siigo"],
+          ]}
         />
         <Section
           title="Autoservicio / ePayco"

@@ -1,6 +1,6 @@
 // Configuración de Siigo editable (ids tomados de GET /v1/taxes, /v1/payment-types?document_type=FV y
 // /v1/cost-centers el 2026-11-11). Se pueden volver a consultar en /api/admin/siigo/taxes y /api/admin/siigo/payment-types.
-import type { PaymentMethod } from "@/lib/payments";
+import type { LineMethod } from "@/lib/payments";
 
 /** Productos GRAVADOS: tarifa → id del impuesto IVA en Siigo */
 export const SIIGO_TAX_ID_BY_RATE: Record<number, number> = {
@@ -13,12 +13,20 @@ export const SIIGO_EXEMPT_TAX_ID = 26387; // IVA 0%
 
 /** Productos EXCLUIDOS: se envían SIN arreglo taxes (igual que la factura FV-2-31341). */
 
-/** Medio de pago del POS → id de forma de pago en Siigo */
-export const SIIGO_PAYMENT_ID: Record<PaymentMethod, number> = {
+/**
+ * Medio de pago de UNA LÍNEA del POS → id de forma de pago en Siigo (GET /v1/payment-types?document_type=FV).
+ * Se envía un pago por cada línea de sale_payments.
+ */
+export const SIIGO_PAYMENT_ID: Record<LineMethod, number> = {
   efectivo: 1666, // Efectivo
-  tarjeta_debito: 1669, // Tarjeta Crédito — cambiar cuando FECP cree "Tarjeta Débito" en Siigo
-  tarjeta_credito: 1669, // Tarjeta Crédito
-  transferencia: 5798, // Pago transferencia Bancol
+  tarjeta: 1669, // Tarjeta Crédito (reemplaza a Tarjeta débito y Tarjeta crédito; ambos ya iban al 1669)
+  tarjeta_debito: 1669, // histórico: ventas viejas
+  tarjeta_credito: 1669, // histórico: ventas viejas
+  transferencia: 5798, // Pago transferencia Bancol — VALOR DE PRUEBAS, pendiente de confirmar con FECP
+  // Crédito FECP: el id REAL se pone en SIIGO_PAYMENT_CREDITO_ID (.env). Este valor es solo el de PRUEBAS (SIIGO_TEST_MODE=true):
+  // 1667 "Crédito" es la forma de pago de Siigo con fecha de vencimiento (due_date=true). Con SIIGO_TEST_MODE=false y la
+  // variable vacía, el sistema se niega a facturar ventas con crédito (ver src/lib/siigo/payment.ts).
+  credito_fecp: 1667,
   // Pago electrónico (ePayco, kiosco). Valor SOLO DE PRUEBAS: en modo real se exige EPAYCO_SIIGO_PAYMENT_ID en .env.local
   // (ver src/lib/siigo/payment.ts). Aquí queda el valor por defecto para SIIGO_TEST_MODE=true.
   epayco: 5798,
@@ -27,6 +35,9 @@ export const SIIGO_PAYMENT_ID: Record<PaymentMethod, number> = {
 
 /** Valor de prueba para el pago electrónico; el definitivo se pone en EPAYCO_SIIGO_PAYMENT_ID */
 export const EPAYCO_SIIGO_PAYMENT_ID_DEFAULT = 5798;
+
+/** Valor de prueba para el Crédito FECP; el definitivo se pone en SIIGO_PAYMENT_CREDITO_ID */
+export const CREDITO_SIIGO_PAYMENT_ID_DEFAULT = SIIGO_PAYMENT_ID.credito_fecp;
 
 /** Centro de costo obligatorio en los documentos 35123 y 6503 */
 export const SIIGO_COST_CENTER = 972; // VENTAS

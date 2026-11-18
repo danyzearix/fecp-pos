@@ -3,6 +3,7 @@ import { guardApi } from "@/lib/auth";
 import { query } from "@/lib/db";
 import { writeLog } from "@/lib/log";
 import { siigo, siigoTestConnection } from "@/lib/siigo/client";
+import { explicitCreditPaymentId, siigoPaymentId } from "@/lib/siigo/payment";
 import { wooGet, wooTestConnection } from "@/lib/woo";
 
 type Check = { name: string; ok: boolean; detail: string };
@@ -44,6 +45,24 @@ export async function POST(req: Request, ctx: { params: Promise<{ service: strin
         });
       } catch (e) {
         checks.push({ name: "Comprobante de venta", ok: false, detail: msg(e) });
+      }
+      // Formas de pago: que el Crédito FECP exista, esté activo y exija fecha de vencimiento (due_date), como pide Siigo
+      try {
+        const pts = await siigo<{ id: number; name: string; active: boolean; due_date: boolean }[]>("GET", "/v1/payment-types?document_type=FV");
+        const creditId = siigoPaymentId("credito_fecp");
+        const pt = pts.find((x) => x.id === creditId);
+        checks.push({
+          name: `Forma de pago del Crédito FECP = ${creditId}${explicitCreditPaymentId() ? "" : " (por defecto de pruebas)"}`,
+          ok: !!pt && pt.active && pt.due_date,
+          detail: pt ? `${pt.name}${pt.active ? "" : " — INACTIVA"}${pt.due_date ? " · con fecha de vencimiento ✓" : " — NO maneja fecha de vencimiento (due_date): no sirve para crédito"}` : "No existe en Siigo",
+        });
+        for (const m of ["efectivo", "tarjeta", "transferencia"] as const) {
+          const id = siigoPaymentId(m);
+          const x = pts.find((y) => y.id === id);
+          checks.push({ name: `Forma de pago de ${m} = ${id}`, ok: !!x && x.active, detail: x ? `${x.name}${x.active ? "" : " — INACTIVA"}` : "No existe en Siigo" });
+        }
+      } catch (e) {
+        checks.push({ name: "Formas de pago", ok: false, detail: msg(e) });
       }
       try {
         const users = await siigo<{ results?: { id: number; first_name: string; last_name: string; active: boolean }[] } | { id: number; first_name: string; last_name: string; active: boolean }[]>("GET", "/v1/users");

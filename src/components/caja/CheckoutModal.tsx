@@ -3,27 +3,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReceiptCapture from "@/components/ReceiptCapture";
 import { receiptAllowed, receiptRequired } from "@/lib/receipt-rules";
+import { bogotaDay, validatePaymentLines, type PayLineIn } from "@/lib/payment-lines";
 import { DEPTS, citiesOf, EMAIL_RE, nitDv, splitName } from "@/lib/client/customer-form";
 import { finePointer } from "@/lib/client/pointer";
-import { formatCOP, round2 } from "@/lib/money";
-import {
-  CONSUMIDOR_FINAL_ID,
-  ID_TYPES,
-  PAYMENT_METHODS,
-  requiresReference,
-  type CustomerIn,
-  type PaymentMethod,
-  type PosConfig,
-} from "@/lib/sale-types";
+import { formatCOP } from "@/lib/money";
+import { CONSUMIDOR_FINAL_ID, ID_TYPES, paymentShortLabel, type CustomerIn, type PaymentMethod, type PosConfig } from "@/lib/sale-types";
 import type { CartCustomer } from "./CustomerPicker";
+import PaymentLines from "./PaymentLines";
+import { newLine, toPayLinesIn, type LineUi } from "./payment-ui";
 
 export type CheckoutResult = {
   checkoutType: "corto" | "completo";
   customer: CustomerIn | null;
+  /** "epayco" (flujo aparte), el medio de la única línea, o "mixto" */
   paymentMethod: PaymentMethod;
-  paymentReference: string | null;
-  cashReceived: number | null;
-  /** foto del comprobante (ya reducida). Obligatoria en transferencia, opcional en tarjeta; null si no aplica. */
+  /** líneas de pago (1 a 4, una por medio). Vacío si es pago electrónico (ePayco). */
+  payments: PayLineIn[];
+  /** foto del comprobante (ya reducida). Obligatoria con transferencia, opcional con tarjeta; null si no aplica. */
   receipt: Blob | null;
 };
 
@@ -44,17 +40,20 @@ type Form = {
   email: string; phone: string; address: string; state: string; city: string;
 };
 
-const QUICK_BILLS = [10000, 20000, 50000, 100000];
 
 const inputCls =
-  "w-full border border-field rounded-lg px-3 py-2 text-[15px] text-fg placeholder:text-[15px] placeholder:text-faint outline-none focus:border-brand bg-surface";
+  "w-full border border-field rounded-lg px-3 py-2 min-h-11 text-[15px] text-fg placeholder:text-[15px] placeholder:text-faint outline-none focus:border-brand bg-surface";
 const labelCls = "block text-[13px] font-semibold text-body";
 
 export default function CheckoutModal({ totals, customer, config, epaycoReady, busy, onClose, onConfirm }: Props) {
   const threshold = 5 * config.uvt;
   const forceFull = totals.subtotal > threshold;
   const [manualFull, setManualFull] = useState(false);
-  const type: "corto" | "completo" = forceFull || manualFull ? "completo" : "corto";
+  // Líneas de pago (cobro dividido). Empieza con una línea de efectivo que cubre el total.
+  const [lines, setLines] = useState<LineUi[]>(() => [newLine("efectivo")]);
+  const hasCredit = lines.some((l) => l.method === "credito_fecp");
+  // El Crédito FECP exige los datos completos del cliente aunque la venta esté por debajo de 5 UVT
+  const type: "corto" | "completo" = forceFull || manualFull || hasCredit ? "completo" : "corto";
 
   const prefill = customer && customer.identification !== CONSUMIDOR_FINAL_ID ? customer : null;
   const [f, setF] = useState<Form>(() => ({
@@ -74,16 +73,9 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
   const set = (k: keyof Form, v: string) => setF((p) => ({ ...p, [k]: v }));
   const [found, setFound] = useState(false);
 
-  const [method, setMethodState] = useState<PaymentMethod>("efectivo");
-  const [reference, setReference] = useState("");
-  const [verified, setVerified] = useState(false);
-  const isEpayco = method === "epayco"; // el pago lo verifica el servidor con ePayco: no hay referencia ni casilla
-  const needsRef = requiresReference(method) && !isEpayco;
-  // Al cambiar de medio hay que volver a verificar el pago
-  const setMethod = (m: PaymentMethod) => {
-    setMethodState(m);
-    setVerified(false);
-  };
+  const isEpayco = lines.length === 1 && lines[0].method === "epayco"; // el pago lo verifica el servidor con ePayco: no hay referencia ni casilla
+  const methods = lines.map((l) => l.method);
+  const saleDay = bogotaDay(new Date());
   // Comprobante (evidencia para auditoría): NO reemplaza la referencia ni la casilla
   const [receipt, setReceipt] = useState<Blob | null>(null);
   const [camOpen, setCamOpen] = useState(false);
@@ -91,8 +83,8 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
   useEffect(() => () => {
     if (receiptUrl) URL.revokeObjectURL(receiptUrl);
   }, [receiptUrl]);
-  const receiptOk = receiptAllowed(method);
-  const receiptMust = receiptRequired(method);
+  const receiptOk = receiptAllowed(methods); // transferencia (obligatorio) o tarjeta (opcional)
+  const receiptMust = receiptRequired(methods); // basta UNA línea de transferencia
   // En táctil no se enfoca solo: el teclado en pantalla taparía el modal al abrirlo
   const [autoFocusFields] = useState(() => (typeof window === "undefined" ? false : finePointer()));
   const [online, setOnline] = useState(true);
@@ -106,9 +98,6 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
       window.removeEventListener("offline", upd);
     };
   }, []);
-  const [cashStr, setCashStr] = useState("");
-  const cash = Number(cashStr.replace(/\D/g, "")) || 0;
-  const change = round2(cash - totals.total);
 
   // Al pasar a checkout completo, si no hay datos de ubicación, usar los del punto de venta
   const cities = useMemo(() => citiesOf(f.state), [f.state]);
@@ -177,10 +166,16 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
     }
     if (isEpayco && !epaycoReady) return "El pago electrónico no está disponible (revise la configuración de ePayco)";
     if (isEpayco && !online) return "Sin conexión: el pago electrónico necesita internet";
-    if (method === "efectivo" && cash + 0.005 < totals.total) return "El valor recibido es menor al total";
-    if (needsRef && !reference.trim()) return "Escribe la referencia o los últimos dígitos del comprobante";
-    if (needsRef && !verified) return "Marca la casilla: verificaste el pago en el datáfono o en la cuenta";
-    if (receiptMust && !receipt) return "Toma la foto del comprobante (obligatoria en transferencias)";
+    if (!isEpayco) {
+      // Crédito FECP: cédula o NIT REALES (no Consumidor final, ni pasaporte)
+      if (hasCredit && (!id || id === CONSUMIDOR_FINAL_ID || f.idType === "41")) return "El Crédito FECP exige un cliente identificado con cédula o NIT";
+      // La misma validación que hace el servidor (src/lib/payment-lines.ts), con el total de esta venta
+      const v = validatePaymentLines(toPayLinesIn(lines, totals.total), totals.total, { saleDay, customerIdentified: !!id && id !== CONSUMIDOR_FINAL_ID });
+      if (!v.ok) return v.error;
+      const unverified = lines.find((l) => (l.method === "tarjeta" || l.method === "transferencia") && !l.verified);
+      if (unverified) return `Marca la casilla de ${paymentShortLabel(unverified.method)}: verificaste el pago en el datáfono o en la cuenta`;
+      if (receiptMust && !receipt) return "Toma la foto del comprobante (obligatoria cuando hay transferencia)";
+    }
     return null;
   }
   const error = validate();
@@ -215,10 +210,9 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
     onConfirm({
       checkoutType: type,
       customer: buildCustomer(),
-      paymentMethod: method,
-      paymentReference: needsRef ? reference.trim() : null,
-      cashReceived: method === "efectivo" ? cash : null,
-      receipt: receiptOk ? receipt : null,
+      paymentMethod: isEpayco ? "epayco" : lines.length > 1 ? "mixto" : lines[0].method,
+      payments: isEpayco ? [] : toPayLinesIn(lines, totals.total),
+      receipt: receiptOk && !isEpayco ? receipt : null,
     });
   }
 
@@ -271,7 +265,9 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
               <div className="font-bold text-[14px]">
                 Checkout {type === "completo" ? "COMPLETO" : "CORTO"}
               </div>
-              {forceFull ? (
+              {hasCredit && !forceFull ? (
+                <div>Hay una línea de Crédito FECP: se requieren todos los datos del cliente (cédula o NIT), aunque la venta esté por debajo de 5 UVT.</div>
+              ) : forceFull ? (
                 <div>
                   La base sin IVA ({formatCOP(totals.subtotal)}) supera 5 UVT ({formatCOP(threshold)}): se requieren todos los datos del cliente.
                 </div>
@@ -280,7 +276,7 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
                   La base sin IVA ({formatCOP(totals.subtotal)}) es menor o igual a 5 UVT ({formatCOP(threshold)}): los datos del cliente son opcionales.
                 </div>
               )}
-              {!forceFull && (
+              {!forceFull && !hasCredit && (
                 <label className="mt-1.5 flex items-center gap-2 cursor-pointer font-medium">
                   <input type="checkbox" checked={manualFull} onChange={(e) => setManualFull(e.target.checked)} />
                   El cliente pide factura con todos sus datos (checkout completo)
@@ -397,122 +393,29 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
               </div>
             </div>
 
-            <div>
-              <div className={`${labelCls} mb-1.5`}>Medio de pago</div>
-              <div className="grid grid-cols-2 gap-2">
-                {PAYMENT_METHODS.map((m) => {
-                  const off = m.id === "epayco" && !epaycoReady;
-                  return (
-                    <button
-                      key={m.id}
-                      onClick={() => setMethod(m.id)}
-                      disabled={off}
-                      title={off ? "No disponible: falta configurar ePayco" : undefined}
-                      className={`min-h-12 px-2 rounded-lg border text-[14px] font-medium leading-tight disabled:opacity-50 disabled:cursor-not-allowed ${
-                        method === m.id ? "bg-brand border-brand text-white" : "bg-surface border-field text-body hover:bg-hover"
-                      } ${m.id === "epayco" ? "col-span-2" : ""}`}
-                    >
-                      {m.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            {/* Medios de pago: una línea por medio (máx. 4). El servidor valida todo otra vez. */}
+            <PaymentLines total={totals.total} lines={lines} setLines={setLines} epaycoReady={epaycoReady} saleDay={saleDay} autoFocus={autoFocusFields} />
 
-            {isEpayco && (
-              <div className="rounded-lg border border-brand-line bg-brand-soft px-3 py-3 text-[14px] text-brand-ink space-y-1">
-                <div className="font-bold">Cobro con tarjeta, PSE, Nequi, etc.</div>
-                <div>
-                  Al confirmar se abre la ventana de ePayco para que el cliente pague. La venta solo se factura cuando el
-                  servidor confirma el pago con ePayco; no hace falta digitar ninguna referencia.
+            {/* Comprobante (evidencia): obligatorio con transferencia, opcional con tarjeta. NO reemplaza referencia ni casilla. */}
+            {receiptOk && !isEpayco && (
+              <div className={`rounded-lg border px-3 py-2.5 space-y-2 ${receiptMust && !receipt ? "border-warn-line bg-warn-soft" : "border-line bg-subtle"}`}>
+                <div className="text-[13px] font-semibold text-body">
+                  Comprobante {receiptMust ? <span className="text-err-ink">(obligatorio por la transferencia)</span> : <span className="text-dim font-normal">(opcional)</span>}
                 </div>
-              </div>
-            )}
-
-            {needsRef && (
-              <div className="space-y-3">
-                <label className="block">
-                  <span className={labelCls}>Referencia o últimos dígitos del comprobante</span>
-                  <input
-                    className={inputCls}
-                    autoFocus={autoFocusFields}
-                    maxLength={60}
-                    inputMode="numeric"
-                    value={reference}
-                    onChange={(e) => setReference(e.target.value)}
-                    placeholder="Ej. 4821 o número de aprobación"
-                  />
-                </label>
-                <label
-                  className={`flex items-start gap-2.5 rounded-lg border px-3 py-2.5 cursor-pointer text-[14px] text-fg ${
-                    verified ? "bg-ok-soft border-ok-line" : "bg-surface border-warn-line"
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    className="mt-0.5 w-6 h-6 shrink-0"
-                    checked={verified}
-                    onChange={(e) => setVerified(e.target.checked)}
-                  />
-                  <span>Verifiqué el pago en el datáfono o en la cuenta de FECP</span>
-                </label>
-
-                {receiptOk && (
-                  <div className={`rounded-lg border px-3 py-2.5 space-y-2 ${receiptMust && !receipt ? "border-warn-line bg-warn-soft" : "border-line bg-subtle"}`}>
-                    <div className="text-[13px] font-semibold text-body">
-                      Comprobante {receiptMust ? <span className="text-err-ink">(obligatorio)</span> : <span className="text-dim font-normal">(opcional)</span>}
+                {receipt && receiptUrl ? (
+                  <div className="flex items-center gap-3">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={receiptUrl} alt="Comprobante" className="w-20 h-20 object-cover rounded-md border border-line bg-white" />
+                    <div className="flex flex-wrap gap-2">
+                      <button onClick={() => setCamOpen(true)} className="px-3 min-h-11 rounded-lg border border-field text-[13px] font-medium text-body bg-surface">Cambiar foto</button>
+                      <button onClick={() => setReceipt(null)} className="px-3 min-h-11 rounded-lg border border-field text-[13px] font-medium text-body bg-surface">Quitar</button>
                     </div>
-                    {receipt && receiptUrl ? (
-                      <div className="flex items-center gap-3">
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img src={receiptUrl} alt="Comprobante" className="w-20 h-20 object-cover rounded-md border border-line bg-white" />
-                        <div className="flex flex-wrap gap-2">
-                          <button onClick={() => setCamOpen(true)} className="px-3 min-h-11 rounded-lg border border-field text-[13px] font-medium text-body bg-surface">Cambiar foto</button>
-                          <button onClick={() => setReceipt(null)} className="px-3 min-h-11 rounded-lg border border-field text-[13px] font-medium text-body bg-surface">Quitar</button>
-                        </div>
-                      </div>
-                    ) : (
-                      <button onClick={() => setCamOpen(true)} className="w-full px-4 min-h-12 rounded-lg border border-brand text-brand-text bg-surface text-[15px] font-semibold hover:bg-brand-soft">
-                        Tomar foto del comprobante
-                      </button>
-                    )}
                   </div>
-                )}
-              </div>
-            )}
-
-            {method === "efectivo" && (
-              <div className="space-y-2">
-                <label className="block">
-                  <span className={labelCls}>Valor recibido</span>
-                  <input
-                    className={`${inputCls} !text-xl font-bold`}
-                    inputMode="numeric"
-                    autoFocus={autoFocusFields}
-                    value={cash ? formatCOP(cash) : ""}
-                    onChange={(e) => setCashStr(e.target.value)}
-                    placeholder="$ 0"
-                  />
-                </label>
-                <div className="grid grid-cols-3 gap-2">
-                  {QUICK_BILLS.map((b) => (
-                    <button key={b} onClick={() => setCashStr(String(b))} className="min-h-11 rounded-lg border border-field bg-surface text-[14px] font-medium text-body hover:bg-hover">
-                      {formatCOP(b)}
-                    </button>
-                  ))}
-                  <button
-                    onClick={() => setCashStr(String(Math.ceil(totals.total)))}
-                    className="min-h-11 rounded-lg border border-brand text-brand-text bg-surface text-[14px] font-semibold hover:bg-brand-soft"
-                  >
-                    Exacto
+                ) : (
+                  <button onClick={() => setCamOpen(true)} className="w-full px-4 min-h-12 rounded-lg border border-brand text-brand-text bg-surface text-[15px] font-semibold hover:bg-brand-soft">
+                    Tomar foto del comprobante
                   </button>
-                </div>
-                <div className={`rounded-xl text-center py-3 ${change >= 0 && cash > 0 ? "bg-ok-soft" : "bg-surface border border-line"}`}>
-                  <div className="text-[13px] font-semibold text-body">{change < 0 && cash > 0 ? "Faltan" : "Cambio"}</div>
-                  <div className={`text-4xl sm:text-5xl font-extrabold ${change < 0 && cash > 0 ? "text-err-ink" : "text-ok-ink"}`}>
-                    {cash > 0 ? formatCOP(Math.abs(change)) : "$ 0"}
-                  </div>
-                </div>
+                )}
               </div>
             )}
           </div>

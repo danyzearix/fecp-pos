@@ -1,5 +1,5 @@
 import { formatCOP } from "@/lib/money";
-import { paymentLabel, type PosConfig, type TicketData } from "@/lib/sale-types";
+import { paymentLabel, paymentShortLabel, type PosConfig, type TicketData } from "@/lib/sale-types";
 
 const fmtDate = new Intl.DateTimeFormat("es-CO", {
   dateStyle: "short",
@@ -17,6 +17,11 @@ function Row({ left, right, bold }: { left: React.ReactNode; right?: React.React
     </div>
   );
 }
+
+const dueDate = (iso: string) => {
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+};
 
 const Sep = () => <div style={{ borderTop: "1px dashed #000", margin: "5px 0" }} />;
 const Center = ({ children, bold }: { children: React.ReactNode; bold?: boolean }) => (
@@ -93,10 +98,19 @@ export default function TicketView({ data, config, qrDataUrl }: { data: TicketDa
       ))}
       <Row left="TOTAL" right={formatCOP(data.total)} bold />
       <Sep />
-      <div>Medio de pago: {paymentLabel(data.payment_method)}</div>
-      {data.payment_reference && <Row left="Referencia" right={data.payment_reference} />}
-      {data.cash_received != null && <Row left="Recibido" right={formatCOP(data.cash_received)} />}
-      {data.change_given != null && <Row left="Cambio" right={formatCOP(data.change_given)} />}
+      {/* Una entrada por línea de pago: monto aplicado y referencia; el cambio solo en la de efectivo; el plazo y vencimiento en el crédito */}
+      {data.payments.length > 1 && <div style={{ fontWeight: 700 }}>FORMAS DE PAGO</div>}
+      {data.payments.length === 1 && <div>Medio de pago: {paymentLabel(data.payments[0].method)}</div>}
+      {data.payments.map((p, idx) => (
+        <div key={idx} style={{ marginBottom: data.payments.length > 1 ? 2 : 0 }}>
+          {data.payments.length > 1 && <Row left={paymentShortLabel(p.method)} right={formatCOP(p.amount)} />}
+          {p.reference && <Row left={data.payments.length > 1 ? "  Ref." : "Referencia"} right={p.reference} />}
+          {p.method === "efectivo" && p.cash_received != null && <Row left={data.payments.length > 1 ? "  Recibido" : "Recibido"} right={formatCOP(p.cash_received)} />}
+          {p.method === "efectivo" && p.change_given != null && <Row left={data.payments.length > 1 ? "  Cambio" : "Cambio"} right={formatCOP(p.change_given)} />}
+          {p.credit_days != null && <Row left="  Plazo" right={`${p.credit_days} días`} />}
+          {p.due_date && <Row left="  Vence" right={dueDate(p.due_date)} />}
+        </div>
+      ))}
       <Sep />
 
       {final ? (

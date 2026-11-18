@@ -56,6 +56,7 @@ Abre `.env.local` y completa los valores. **Nunca subas este archivo a un reposi
 | `SIIGO_PARTNER_ID` | Nombre de la integración, 3–100 letras/números, sin espacios |
 | `SIIGO_DOCUMENT_ID` | Comprobante de factura electrónica de venta (FECP: `35123`) |
 | `SIIGO_TEST_DOCUMENT_ID` | Comprobante NO electrónico para pruebas (FECP: `6503`) |
+| `SIIGO_PAYMENT_CREDITO_ID` | Forma de pago de Siigo para el **Crédito FECP** (una con `due_date=true`; "Crédito" suele ser `1667`). Vacía + `SIIGO_TEST_MODE=false` = el sistema se **niega** a facturar ventas a crédito |
 | `SIIGO_SELLER_ID` | Vendedor de Siigo por defecto (se usa si el usuario no tiene `siigo_seller_id`) |
 | `SIIGO_TEST_MODE` | `true` = documentos de prueba sin DIAN · `false` = **facturas electrónicas reales** |
 | `UVT_VALUE` | Valor de la UVT del año (5 UVT define checkout corto/completo) |
@@ -294,8 +295,10 @@ Evidencia para auditoría. **No reemplaza** la referencia ni la casilla *“Veri
 | Medio | Comprobante |
 |---|---|
 | Transferencia (Nequi/Bancolombia/otra) | **Obligatorio**: no se puede confirmar la venta sin la foto |
-| Tarjeta débito / crédito (datáfono) | Opcional |
-| Efectivo, ePayco | No aplica |
+| Tarjeta (datáfono; y las históricas débito/crédito) | Opcional |
+| Efectivo, Crédito FECP, ePayco | No aplica |
+
+Con **varios medios** (cobro dividido): si hay **una línea de Transferencia**, la foto es obligatoria (una por venta); si solo hay Tarjeta, es opcional.
 
 - **Captura:** en el modal de cobro, **Tomar foto del comprobante** abre la cámara (vista previa → *Capturar* → *Repetir* / *Usar esta foto*) y muestra la miniatura. Si no hay cámara o Chrome la bloquea, ofrece **Subir imagen desde el equipo** y explica cómo permitir la cámara (candado junto a la dirección → *Cámara* → *Permitir*). La cámara exige **https** (o `127.0.0.1`).
 - **Sin conexión:** la foto se guarda con la venta en el equipo (**IndexedDB**) y se sube sola cuando vuelve la conexión, **después** de que la venta exista en el servidor. Mientras no llegue, la transferencia queda **“Comprobante pendiente”**.
@@ -303,6 +306,44 @@ Evidencia para auditoría. **No reemplaza** la referencia ni la casilla *“Veri
 - **Historial (`/ventas`):** botón **Ver comprobante** en cada venta que lo tenga → visor grande con fecha, medio, referencia, quién lo subió y **Descargar** (`comprobante-C01-000123-2026-11-12.jpg`). Filtros: *Con comprobante*, *Sin comprobante*, *Comprobante pendiente*. Las transferencias sin foto se resaltan en amarillo. Desde ahí también se puede **Adjuntar comprobante** a ventas viejas o pendientes.
 - **Permisos:** admin, todos; cajero, solo los de sus ventas de **hoy y ayer** (la misma regla de reimprimir); rol cliente, nunca. Se sirven por un endpoint autenticado (`Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`) y **cada vista o descarga queda en los logs**.
 - **Retención:** una tarea diaria dentro de la app borra los archivos con más de `RECEIPT_RETENTION_DAYS` (**180**) días desde la fecha de la venta; el registro queda como *“Eliminado por retención el <fecha>”*. Los respaldos (ver DEPLOY.md) también incluyen las fotos.
+
+## 11c. Medios de pago y cobro dividido
+
+**Medios** (ids internos en `sale_payments.method`): **Efectivo**, **Tarjeta** (reemplaza a *Tarjeta débito* y *Tarjeta crédito*), **Transferencia**, **Crédito FECP** y **Pago electrónico** (ePayco: PSE, tarjetas, QR). Las ventas históricas conservan su etiqueta original (*Tarjeta débito*, *Tarjeta crédito*): la migración no reescribe nada.
+
+**Reglas del cobro dividido** (se validan en el **servidor**, con el total que él calcula de los productos, y se repiten en la pantalla):
+1. Una venta tiene **1 a 4 líneas** de pago, **una por medio**.
+2. La suma de los montos aplicados es **exactamente** el total.
+3. **Efectivo** es el único que recibe más de lo aplicado: `cash_received` y `change_given` solo en esa línea. Los demás llevan el monto exacto y no pueden superar lo que falta por cubrir.
+4. **Tarjeta** y **Transferencia** exigen referencia por línea (y la casilla *“Verifiqué el pago…”*).
+5. **Pago electrónico** solo puede ser el **único** medio, por el total, y se cobra por su propio flujo (el kiosco no cambia).
+6. **Crédito FECP**: exige cliente identificado con **cédula o NIT real** (no Consumidor final ni pasaporte), **datos completos** (aunque la venta sea < 5 UVT) y un plazo de **14, 30, 60 o 90 días**; guarda `due_date` = fecha de la venta + plazo. **No hay cupo ni abonos:** el POS no lleva saldos, eso queda en Siigo.
+
+**En la caja:** el modal muestra siempre **“Falta por cubrir: $X”** y solo deja confirmar cuando es **0**. Empieza con una línea de efectivo que cubre el total; **“Dividir el pago”** agrega medios, y la línea automática se completa sola con lo que falta (el efectivo trae botones de billetes, *Exacto* y el cambio en grande).
+
+**Base de datos:** `sale_payments` (una fila por línea). Las columnas viejas de `sales` se conservan: `payment_method` vale el medio de la única línea o **`mixto`**; `payment_reference` junta las referencias (`4821 / NEQ-9`); `cash_received`/`change_given` son los de la línea de efectivo. **Reportes, cuadre e historial se calculan desde `sale_payments`.** `npm run db:setup` crea la tabla y **migra** cada venta existente a una línea (idempotente; no toca las columnas viejas).
+
+**Siigo:** se envía **un pago por línea** con el id de `src/config/siigo-map.ts` (Efectivo 1666 · Tarjeta 1669 · Transferencia 5798 *(valor de pruebas, por confirmar)* · Pago electrónico `EPAYCO_SIIGO_PAYMENT_ID` · Crédito `SIIGO_PAYMENT_CREDITO_ID`). La línea de crédito lleva `due_date`. **Antes de enviar** el POS verifica que la suma de los pagos sea igual al total de la factura; si no, no se envía nada y la venta queda en **revisión** con el motivo. `observations` lista cada medio: `POS FECP venta {UUID} | Tarjeta 40000 ref 4821 | Credito FECP 30400 30d | Efectivo 50000`.
+
+> Lo que Siigo **sí documenta**: `payments` es una lista de `{id, value, due_date}`; `due_date` (yyyy-MM-dd) solo es obligatorio si la forma de pago tiene `due_date=true`, y solo se admite **una** con vencimiento por factura. Lo que **no documenta** (y por eso el POS lo exige por su cuenta): si la suma de pagos debe igualar el total. Verificado en la práctica (modo prueba, comprobante 6503): Siigo acepta varios pagos en la misma factura.
+
+**Tirilla:** lista cada línea con su monto y referencia, el cambio solo en la de efectivo y, si hay crédito, el plazo y el vencimiento. **`/ventas`:** muestra *Mixto* con el detalle desplegable. **Reportes:** *Total recaudado* cuenta solo lo cobrado (efectivo, tarjeta, transferencia, electrónico); **el crédito NO es dinero recaudado** y sale aparte en *Ventas a crédito* (por cliente, plazo y vencimiento). Los totales por medio salen de `sale_payments`. El **cuadre de efectivo** suma solo el efectivo **aplicado**, no el billete entregado.
+
+**Sin conexión:** la venta dividida viaja en la cola local con el formato nuevo (`payments`); las ventas que ya estaban en la cola con el formato viejo (`payment_method`, `cash_received`) se siguen enviando sin error.
+
+**Numeración:** el número impreso sale del **prefijo y consecutivo que devuelve Siigo** (no hay ningún "FVP" ni "FE" escrito en el código); el comprobante lo define `SIIGO_DOCUMENT_ID` (FECP: `35123`). Los datos de resolución de la tirilla salen de `RESOLUCION_DIAN_*`.
+
+## 11d. Validación de precios en la caja
+
+La caja arma la venta con el catálogo guardado en el equipo (así funciona **sin conexión**) y manda precio, IVA y SKU. El servidor **ya no se fía**: al recibir cada venta de `/api/sales` (todos los medios, incluidos el pago dividido y el crédito) compara **cada línea** con la tabla `products`.
+
+- **El kiosco y el cobro electrónico no tienen este problema:** solo mandan `product_id` y cantidad; precio, IVA y total salen de `products` (regresión: `node --env-file=.env.local db/prueba-kiosco-precio.mjs`).
+- **Regla (tolerancia cero):** una línea es válida si su precio, IVA (`tax_rate` y `prices_include_tax`) y SKU coinciden con los **vigentes**, o con alguno que estuvo vigente en las últimas `PRICE_HISTORY_HOURS` horas (**72** por defecto). Así una venta hecha sin conexión con un precio que luego cambió no genera falsas alarmas. El historial (`product_price_history`) lo llena un **disparador** sobre `products`: cualquier cambio de precio, IVA o sku (sincronización completa, incremental o la de IVA con Siigo) queda registrado. `db:setup` crea la línea base con los valores actuales.
+- **Si algo no coincide la venta NO se rechaza** (el cliente ya pagó): se **acepta y se guarda**, queda `pending` con el motivo en `last_error` y **no se factura sola** (ni se reintenta, ni desde el botón *Reintentar* de `/ventas`). Lo mismo si el producto no existe ("producto desconocido"). Solo se rechazan datos estructuralmente inválidos (cantidad cero o negativa, pagos que no cuadran).
+- **Hora del equipo:** `created_at_device` se acepta entre *hace 7 días* y *ahora + 5 minutos*; fuera de eso se usa la hora del servidor y se anota (`sales.time_note` y logs).
+- **Panel `/admin/precios-por-revisar` (solo admin):** venta, cajero, hora, cuánto lleva retenida y las líneas con *enviado / vigente / diferencia*. **Aprobar y facturar** (con confirmación; para cambios legítimos como una promoción; usa el flujo de facturación con idempotencia: una sola factura aunque se pulse dos veces) o **Anular** (exige una nota; nunca se factura). No hay "corregir al precio de la base": el cliente ya pagó el monto original. Cada decisión queda atada a su admin, con fecha y nota, y en los logs.
+- **Avisos:** contador en el menú de admin y en Reportes; a las **2 h** retenida se marca *atrasada* y a las **4 h** en *rojo*. **Configuración** muestra la ventana y cuántas hay por revisar.
+- **Cuadre:** las ventas anuladas con dinero cobrado salen en **Reportes → Ventas anuladas con dinero cobrado** (monto y nota) y en el cuadre de efectivo ("Efectivo total esperado en caja"); no cuentan en *Total recaudado* ni *Total facturado*.
 
 ## 12. Comandos útiles
 
@@ -313,6 +354,7 @@ Evidencia para auditoría. **No reemplaza** la referencia ni la casilla *“Veri
 | `npm run report:iva` | Genera `docs/productos-iva-diferente.csv` (IVA distinto entre WooCommerce y Siigo) |
 | `npm run siigo:pruebas` | Lista los documentos de PRUEBA creados en Siigo para anularlos |
 | `npm run build` / `npm start` | Producción local (sin Docker) |
+| `node --env-file=.env.local db/prueba-kiosco-precio.mjs` | Regresión: el kiosco usa el precio real de la base |
 | `deploy/backup.sh` / `deploy/restore.sh` | Respaldo y restauración en el servidor (ver [DEPLOY.md](DEPLOY.md), sección 5) |
 
 **Dejar la base en cero antes del deploy** (borra **ventas, líneas de venta, referencias de pago y logs**; conserva productos, usuarios, clientes y configuración, y reinicia la numeración `K01`/`E01`):
@@ -336,6 +378,8 @@ Es irreversible. Haz una copia antes si dudas (`pg_dump`). Si quieres también b
    - `EPAYCO_SIIGO_PAYMENT_ID` = el id **real** de la forma de pago de ePayco en Siigo, escrito explícitamente en `.env.local`. El `5798` es solo de pruebas.
    - Seguridad incorporada: con `SIIGO_TEST_MODE=false` **y sin** `EPAYCO_SIIGO_PAYMENT_ID` explícito, el sistema **se niega** a facturar pagos electrónicos; y con `EPAYCO_TEST_MODE=true` junto a `SIIGO_TEST_MODE=false` tampoco factura un pago de prueba. El motivo aparece en **Configuración**.
    - Define `APP_PUBLIC_URL=https://tu-dominio` para activar el webhook y el QR de pago.
+   - **Crédito FECP:** `SIIGO_PAYMENT_CREDITO_ID` = el id **real** de una forma de pago de Siigo con fecha de vencimiento (`due_date=true`; "Crédito" suele ser `1667`). Con `SIIGO_TEST_MODE=false` y la variable vacía el sistema **se niega** a facturar ventas a crédito (se ve en **Configuración**; *Probar conexión Siigo* comprueba que exista, esté activa y maneje vencimiento).
+   - **Transferencia:** el `5798` es un valor de pruebas pendiente de confirmar: edita `src/config/siigo-map.ts` si FECP usa otra forma de pago.
 5. Antes de abrir: deja la base en cero (sección 12) y anula los documentos de prueba en Siigo (`npm run siigo:pruebas`).
 
 ## 14. Cómo se evita facturar dos veces
