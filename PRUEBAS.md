@@ -175,6 +175,23 @@ node --env-file=.env.local db/prueba-kiosco-precio.mjs http://127.0.0.1:3000
 - [ ] Un cajero no ve el panel y sus endpoints responden 403.
 - [ ] A las 2 h retenida → "atrasada"; a las 4 h → rojo.
 
+## 12d. Clientes de Siigo
+
+- [ ] **Admin → Clientes → Sincronizar clientes** (primera vez): barra de progreso hasta 100 %, ~5 minutos. Al terminar: "Clientes en el POS" ≈ los clientes activos de Siigo, fecha de última sincronización, y el historial con creados/omitidos/errores.
+- [ ] Pulsarlo otra vez enseguida: trae solo lo modificado (1–2 peticiones) y no cambia nada.
+- [ ] Con una sincronización en curso, abrir **Clientes** en otro navegador y pulsar el botón → mensaje "Ya hay una sincronización en curso".
+- [ ] Reiniciar el contenedor a mitad (`dc restart app`): después de ~3 minutos la pantalla dice *Interrumpida* y **Retomar sincronización** continúa desde la página donde iba.
+- [ ] Caja: escribir 2 letras → no busca; escribir 3 → máximo 10 resultados; un cliente **inactivo** no aparece.
+- [ ] Caja: escribir una cédula completa de un cliente creado **hoy** en Siigo (no está en el POS) → "Buscando en Siigo…" y aparece; en **Admin → Logs** (tipo sync) queda la búsqueda con el documento como `***123`.
+- [ ] Elegir un cliente sincronizado: el checkout se llena solo; con **Crédito FECP** y un cliente con cédula/NIT, correo y dirección → se factura con vencimiento.
+- [ ] Como cajero: abrir `/admin/clientes` → te devuelve a la caja. Como kiosco (rol cliente): `/api/customers?q=123456` → 403.
+- [ ] El cliente **Consumidor final** sigue igual.
+- [ ] **Regresión de privacidad del kiosco** (córrela siempre que se toque `src/app/api/customers`, `src/lib/kiosk.ts` o la tirilla del kiosco):
+  ```powershell
+  node --env-file=.env.local db/prueba-kiosco-clientes.mjs http://127.0.0.1:3000
+  ```
+  Termina con `RESULTADO: OK` y código 0. Comprueba que el rol *cliente* recibe **403** en `/api/customers` (con y sin `live=1`) y en `/api/admin/clientes/sync`, que el cobro del kiosco con la cédula de un cliente existente **no lo modifica ni devuelve sus datos**, y que la tirilla del kiosco solo muestra `***` + 3 dígitos. Borra todo lo que crea.
+
 ## 13. Antes de pasar a producción
 - [ ] `RESOLUCION_DIAN_*`, `NEGOCIO_*` y `POS_ADDRESS` completos.
 - [ ] FECP corrigió (o aceptó) los productos de `docs/productos-iva-diferente.csv`.

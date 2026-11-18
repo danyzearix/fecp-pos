@@ -345,6 +345,22 @@ La caja arma la venta con el catálogo guardado en el equipo (así funciona **si
 - **Avisos:** contador en el menú de admin y en Reportes; a las **2 h** retenida se marca *atrasada* y a las **4 h** en *rojo*. **Configuración** muestra la ventana y cuántas hay por revisar.
 - **Cuadre:** las ventas anuladas con dinero cobrado salen en **Reportes → Ventas anuladas con dinero cobrado** (monto y nota) y en el cuadre de efectivo ("Efectivo total esperado en caja"); no cuentan en *Total recaudado* ni *Total facturado*.
 
+## 11e. Clientes de Siigo en el POS
+
+Los clientes se copian **de Siigo al POS, en una sola dirección** (Siigo manda; el POS nunca crea ni modifica nada en Siigo con esta función: solo `GET /v1/customers`).
+
+- **Qué se trae:** solo los terceros de tipo **cliente** (el filtro `type=Customer` de Siigo; ya excluye las sucursales, se usa la principal). Proveedores y "otros" no. Por cliente se guarda solo lo necesario para facturar: tipo y número de documento, dígito de verificación, nombre o razón social, correo, teléfono, dirección, departamento y ciudad, y el **id de Siigo** (`customers.siigo_id`). Los inactivos se guardan marcados (`active = false`) y **no se ofrecen en la caja**.
+- **Reglas de "Siigo manda":** upsert por identificación, idempotente (una segunda corrida no toca ninguna fila). Si Siigo trae un valor, reemplaza al del POS; si Siigo **no** trae correo, teléfono, dirección o ubicación, se conserva el que el POS ya tenía. **No se toca** el *Consumidor final* `222222222222`. Si una identificación viene repetida en Siigo se conserva la primera y se cuenta en el log. Se **omiten** (y se cuentan por motivo) los terceros sin tipo de documento, sin nombre o con un número de documento que el POS no acepta.
+- **Botón:** **Admin → Clientes → Sincronizar clientes** (solo admin). La primera vez trae todo; las siguientes piden solo lo **modificado** (`updated_start`) y lo **creado** (`created_start`) desde la última corrida **con un día de traslape** (hay que pedir ambos: Siigo no pone fecha de modificación a los nuevos). *Recarga completa* vuelve a pedir todo.
+- **Cómo corre:** en segundo plano dentro de la app, por páginas de 100 (nunca todo en memoria), con barra de progreso. **Una sola a la vez**, con bloqueo en la base (si hay otra, el botón responde 409 con "ya hay una sincronización en curso"). Si el servidor se reinicia o Siigo falla a mitad, la corrida queda *interrumpida* y **se retoma** desde la última página guardada con el botón *Retomar*. Muestra el total en el POS, la fecha de la última sincronización, un historial y los errores.
+- **Historial:** cada corrida guarda sus conteos y, de los clientes que cambiaron, **qué columnas** cambiaron (por ejemplo "correo 3, dirección 1"; solo conteos, nunca los valores).
+- **Limitación conocida:** la sincronización incremental depende de la fecha de modificación (`last_updated`) que Siigo pone a cada tercero. Si Siigo no la actualiza en algún cambio, ese cambio no llega hasta la próxima **Recarga completa** (≈ 4,5 min): conviene hacerla de vez en cuando (por ejemplo, una vez por semana).
+- **Ritmo:** máximo **40 peticiones por minuto** (~17.000 clientes ≈ 170 páginas ≈ **4,5 minutos**), con espera y reintento ante 429 o errores temporales de Siigo. Comparte la ventana de peticiones del cliente de Siigo con la facturación y **cede el paso**: si ya van más de 60 en el último minuto, espera.
+- **Caja:** el buscador pide **al menos 3 caracteres** y devuelve **máximo 10** (solo admin y cajero). Si el cajero escribe una **cédula/NIT completa que no está en la copia local**, el POS la consulta en Siigo (GET por `identification`, solo lectura), la guarda y la ofrece; máximo **12 consultas por minuto por usuario**. El checkout autocompleta con los datos del cliente y el **Crédito FECP** funciona con estos clientes (exige cédula o NIT real, igual que antes: un cliente sin correo o dirección en Siigo hay que completarlo en el checkout).
+- **Kiosco:** el rol *cliente* **no puede leer, buscar ni autocompletar** nada de `customers` (`/api/customers` y `/api/admin/clientes/*` responden 403; la tirilla del kiosco solo muestra `***` + 3 últimos dígitos del documento, nunca el nombre guardado).
+- **Logs** (tipo `sync`): inicio y fin de cada corrida con conteos (creados, actualizados, sin cambios, omitidos, repetidos, errores), y cada búsqueda en vivo con el documento enmascarado (`***123`). Nunca nombres, documentos completos ni correos.
+- **Tipos de documento:** la tabla acepta cualquier código de 2 dígitos de la DIAN que traiga Siigo (cédula, NIT, tarjeta de identidad, documento extranjero…). Los formularios de la caja y del kiosco siguen ofreciendo los 4 de siempre para clientes **nuevos**.
+
 ## 12. Comandos útiles
 
 | Comando | Para qué |
@@ -355,6 +371,7 @@ La caja arma la venta con el catálogo guardado en el equipo (así funciona **si
 | `npm run siigo:pruebas` | Lista los documentos de PRUEBA creados en Siigo para anularlos |
 | `npm run build` / `npm start` | Producción local (sin Docker) |
 | `node --env-file=.env.local db/prueba-kiosco-precio.mjs` | Regresión: el kiosco usa el precio real de la base |
+| `node --env-file=.env.local db/prueba-kiosco-clientes.mjs` | Regresión: el kiosco no lee ni modifica la tabla de clientes |
 | `deploy/backup.sh` / `deploy/restore.sh` | Respaldo y restauración en el servidor (ver [DEPLOY.md](DEPLOY.md), sección 5) |
 
 **Dejar la base en cero antes del deploy** (borra **ventas, líneas de venta, referencias de pago y logs**; conserva productos, usuarios, clientes y configuración, y reinicia la numeración `K01`/`E01`):

@@ -1,9 +1,14 @@
+import Link from "next/link";
 import { requirePage } from "@/lib/auth";
+import { normalizeName } from "@/lib/customers";
 import { query } from "@/lib/db";
-import { CONSUMIDOR_FINAL_ID } from "@/lib/sale-types";
+import { CONSUMIDOR_FINAL_ID, ID_TYPE_LABELS } from "@/lib/sale-types";
+import { getSyncStatus } from "@/lib/siigo/customer-sync";
 import type { Metadata } from "next";
+import SyncPanel from "./SyncPanel";
 
 export const metadata: Metadata = { title: "Clientes" };
+export const dynamic = "force-dynamic";
 
 type Row = {
   id: number;
@@ -17,41 +22,55 @@ type Row = {
   phone: string | null;
   address: string | null;
   siigo_synced: boolean;
+  active: boolean;
   compras: number;
   ultima: Date | null;
 };
 
 const TYPE: Record<string, string> = { "13": "CC", "31": "NIT", "22": "CE", "41": "Pasaporte" };
-const LIMIT = 200;
+const PAGE_SIZE = 50;
+const likeEsc = (s: string) => s.replace(/[\\%_]/g, "\\$&");
 
 // Solo lectura. Corregir un cliente aquí NO lo corrige en Siigo (la API de Siigo reemplaza todos los campos al editar).
-export default async function ClientesPage({ searchParams }: { searchParams: Promise<{ q?: string }> }) {
+export default async function ClientesPage({ searchParams }: { searchParams: Promise<{ q?: string; page?: string }> }) {
   await requirePage("/admin");
-  const { q = "" } = await searchParams;
-  const term = q.trim().replace(/[\\%_]/g, "\\$&");
+  const { q = "", page: pageRaw } = await searchParams;
+  const term = likeEsc(q.trim());
+  const words = likeEsc(normalizeName(q));
+  const page = Math.max(1, Math.floor(Number(pageRaw)) || 1);
+  const sync = await getSyncStatus();
+
+  // Filtro con índices: identificación que empieza por… o nombre que contiene… (se cuenta aparte para paginar)
+  const where = `($1 = '' OR c.identification LIKE $1 || '%' OR c.search_name LIKE '%' || $2 || '%')`;
+  const total = (await query<{ n: number }>(`SELECT count(*)::int AS n FROM customers c WHERE ${where}`, [term, words])).rows[0].n;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const cur = Math.min(page, pages);
 
   const { rows } = await query<Row>(
     `SELECT c.id, c.id_type, c.identification, c.check_digit, c.first_name, c.last_name, c.company_name,
-            c.email, c.phone, c.address, c.siigo_synced,
+            c.email, c.phone, c.address, c.siigo_synced, c.active,
             count(s.id) FILTER (WHERE s.status <> 'anulada')::int AS compras,
             max(COALESCE(s.created_at_device, s.created_at)) FILTER (WHERE s.status <> 'anulada') AS ultima
        FROM customers c LEFT JOIN sales s ON s.customer_id = c.id
-      WHERE $1 = '' OR c.identification LIKE $1 || '%'
-         OR (coalesce(c.first_name,'') || ' ' || coalesce(c.last_name,'') || ' ' || coalesce(c.company_name,'')) ILIKE '%' || $1 || '%'
+      WHERE ${where}
       GROUP BY c.id
       ORDER BY compras DESC, c.id DESC
-      LIMIT ${LIMIT}`,
-    [term]
+      LIMIT ${PAGE_SIZE} OFFSET ${(cur - 1) * PAGE_SIZE}`,
+    [term, words]
   );
+  const href = (p: number) => `/admin/clientes?${new URLSearchParams({ ...(q ? { q } : {}), page: String(p) })}`;
 
   return (
     <div className="space-y-5 max-w-7xl min-w-0">
       <div>
         <h1 className="text-2xl font-bold text-fg">Clientes</h1>
         <p className="text-[13px] text-dim">
-          Respaldo en la base del POS. Se crean al vender con cédula o NIT. Solo lectura: cambiar un cliente aquí no lo cambia en Siigo.
+          Copia de los clientes de Siigo (Siigo manda: se actualizan al sincronizar) más los que se registran al vender. Solo lectura: cambiar un
+          cliente aquí no lo cambia en Siigo.
         </p>
       </div>
+
+      <SyncPanel initial={JSON.parse(JSON.stringify(sync))} />
 
       <form className="flex gap-2">
         <input
@@ -83,9 +102,12 @@ export default async function ClientesPage({ searchParams }: { searchParams: Pro
               const name = isCF ? "Consumidor final" : c.company_name || [c.first_name, c.last_name].filter(Boolean).join(" ") || "—";
               return (
                 <tr key={c.id}>
-                  <td className="px-4 py-2 font-medium">{name}</td>
-                  <td className="px-4 py-2 whitespace-nowrap">
-                    {TYPE[c.id_type] ?? c.id_type} {c.identification}
+                  <td className="px-4 py-2 font-medium">
+                    {name}
+                    {!c.active && <span className="ml-2 text-[12px] font-semibold px-2 py-0.5 rounded-full bg-off-soft text-off-ink">Inactivo</span>}
+                  </td>
+                  <td className="px-4 py-2 whitespace-nowrap" title={ID_TYPE_LABELS[c.id_type]}>
+                    {TYPE[c.id_type] ?? ID_TYPE_LABELS[c.id_type] ?? c.id_type} {c.identification}
                     {c.check_digit ? `-${c.check_digit}` : ""}
                   </td>
                   <td className="px-4 py-2">{c.email || "—"}</td>
@@ -111,7 +133,22 @@ export default async function ClientesPage({ searchParams }: { searchParams: Pro
           </tbody>
         </table>
       </div>
-      {rows.length === LIMIT && <p className="text-[13px] text-dim">Mostrando los primeros {LIMIT}. Usa el buscador para acotar.</p>}
+
+      <div className="flex flex-wrap items-center gap-3 text-[14px] text-body">
+        <span>
+          {total.toLocaleString("es-CO")} cliente{total === 1 ? "" : "s"} · página {cur} de {pages}
+        </span>
+        {cur > 1 && (
+          <Link href={href(cur - 1)} className="px-4 min-h-11 inline-flex items-center rounded-lg border border-field bg-surface font-medium">
+            ← Anterior
+          </Link>
+        )}
+        {cur < pages && (
+          <Link href={href(cur + 1)} className="px-4 min-h-11 inline-flex items-center rounded-lg border border-field bg-surface font-medium">
+            Siguiente →
+          </Link>
+        )}
+      </div>
     </div>
   );
 }

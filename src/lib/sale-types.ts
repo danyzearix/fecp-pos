@@ -17,6 +17,26 @@ export const ID_TYPES = [
   { id: "41", label: "Pasaporte" },
 ] as const;
 
+/**
+ * Tipos de documento que puede traer un cliente SINCRONIZADO desde Siigo (tabla de la DIAN). La caja los acepta para clientes
+ * que ya existen; los formularios (caja y kiosco) siguen ofreciendo solo los de ID_TYPES al registrar un cliente nuevo.
+ */
+export const ID_TYPE_LABELS: Record<string, string> = {
+  "11": "Registro civil",
+  "12": "Tarjeta de identidad",
+  "13": "Cédula de ciudadanía",
+  "21": "Tarjeta de extranjería",
+  "22": "Cédula de extranjería",
+  "31": "NIT",
+  "41": "Pasaporte",
+  "42": "Documento de identificación extranjero",
+  "43": "Sin identificación del exterior",
+  "47": "PEP",
+  "48": "PPT",
+  "50": "NIT de otro país",
+  "91": "NUIP",
+};
+
 export type CustomerIn = {
   id_type: string;
   identification: string;

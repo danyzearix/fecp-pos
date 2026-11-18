@@ -53,7 +53,17 @@ export default function CustomerPicker({ customer, onChange }: Props) {
         const { customers } = (await res.json()) as { customers: CartCustomer[] };
         if (mine !== seq.current) return; // llegó una respuesta vieja
         setResults(customers);
-        setMsg(customers.length ? "" : "Sin resultados. Se podrá registrar al cobrar.");
+        if (customers.length) return setMsg("");
+        // Una cédula/NIT completa que no está en la copia del POS: se consulta en Siigo (solo lectura) y se guarda
+        if (!/^\d{5,20}$/.test(term)) return setMsg("Sin resultados. Se podrá registrar al cobrar.");
+        setMsg("Buscando en Siigo…");
+        await new Promise((r) => setTimeout(r, 700)); // por si sigue escribiendo
+        if (mine !== seq.current) return;
+        const live = await fetch(`/api/customers?q=${encodeURIComponent(term)}&live=1`);
+        const j = (await live.json().catch(() => ({}))) as { customers?: CartCustomer[]; notice?: string; error?: string };
+        if (mine !== seq.current) return;
+        setResults(j.customers ?? []);
+        setMsg(j.customers?.length ? "" : (j.notice ?? j.error ?? "Sin resultados. Se podrá registrar al cobrar."));
       } catch {
         if (mine === seq.current) setMsg("Sin conexión: se ingresará al cobrar.");
       }

@@ -47,6 +47,12 @@ async function throttle() {
   }
 }
 
+/** Peticiones a Siigo hechas en el último minuto (toda la app comparte esta ventana). La sincronización de clientes la mira para ceder el paso a la facturación. */
+export function siigoRequestsLastMinute(): number {
+  const now = Date.now();
+  return st.stamps.filter((t) => now - t <= 60_000).length;
+}
+
 function readableError(body: unknown, status: number): string {
   const b = body as { Errors?: { Code?: string; Message?: string; Params?: string[] }[]; message?: string } | null;
   if (b?.Errors?.length) {

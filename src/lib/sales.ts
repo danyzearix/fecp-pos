@@ -11,6 +11,7 @@ import { bogotaDay, joinedReference, MAX_PAY_LINES, methodsOf, saleMethodOf, val
 import {
   CONSUMIDOR_FINAL_ID,
   ID_TYPES,
+  ID_TYPE_LABELS,
   type CustomerIn,
   type LineMethod,
   type SaleIn,
@@ -24,14 +25,15 @@ export const isUuid = (s: string) => UUID_RE.test(s);
 const str = (v: unknown, max = 200) => (typeof v === "string" ? v.trim().slice(0, max) : "");
 const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : NaN);
 
-export function parseCustomer(raw: unknown): CustomerIn | null | string {
+/** extended = también los tipos de documento de clientes sincronizados desde Siigo (solo la caja; el kiosco ofrece los 4 de siempre). */
+export function parseCustomer(raw: unknown, opts: { extended?: boolean } = {}): CustomerIn | null | string {
   if (raw == null) return null;
   if (typeof raw !== "object") return "Cliente inválido";
   const c = raw as Record<string, unknown>;
   const identification = str(c.identification, 20);
   if (!identification) return null;
   const id_type = str(c.id_type, 2) || "13";
-  if (!ID_TYPES.some((t) => t.id === id_type)) return "Tipo de documento inválido";
+  if (!ID_TYPES.some((t) => t.id === id_type) && !(opts.extended && id_type in ID_TYPE_LABELS)) return "Tipo de documento inválido";
   if (!/^[0-9A-Za-z-]{3,20}$/.test(identification)) return "Número de documento inválido";
   const email = str(c.email);
   if (email && !EMAIL_RE.test(email)) return "Correo inválido";
@@ -112,7 +114,7 @@ export function parseSale(body: unknown): ParsedSale | string {
   if (!local_number) return "Falta el número local";
   const checkout_type = b.checkout_type;
   if (checkout_type !== "corto" && checkout_type !== "completo") return "Tipo de checkout inválido";
-  const customer = parseCustomer(b.customer);
+  const customer = parseCustomer(b.customer, { extended: true });
   if (typeof customer === "string") return customer;
 
   if (!Array.isArray(b.items) || b.items.length === 0 || b.items.length > 500) return "La venta no tiene productos";

@@ -97,7 +97,8 @@ export async function createKioskPayment(input: {
   const checkoutType = required === "completo" ? "completo" : requested;
 
   // ---- Cliente ----
-  const parsed = parseCustomer(b.customer);
+  // La caja (cobro electrónico con QR) puede traer clientes sincronizados de Siigo con más tipos de documento; el kiosco no.
+  const parsed = parseCustomer(b.customer, { extended: source === "caja" });
   if (typeof parsed === "string") return fail(400, parsed);
   const customer: CustomerIn | null = parsed;
   if (checkoutType === "completo") {

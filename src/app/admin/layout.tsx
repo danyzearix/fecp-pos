@@ -32,7 +32,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
             <Link
               key={l.href}
               href={l.href}
-              className="whitespace-nowrap px-3 inline-flex items-center justify-center min-w-11 min-h-11 text-body hover:text-brand-text font-medium"
+              className="shrink-0 whitespace-nowrap px-3 inline-flex items-center justify-center min-w-11 min-h-11 text-body hover:text-brand-text font-medium"
             >
               {l.label}
               {"badge" in l && counts && (l.badge === "payments" ? counts.payments : counts.prices) > 0 && (

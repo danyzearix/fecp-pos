@@ -51,3 +51,12 @@ export const SIIGO_DEFAULT_TIMEOUT_MS = 30_000; // consultas
 export const SIIGO_POLL_INTERVAL_MS = 2_000; // consulta de estado DIAN
 export const SIIGO_POLL_ATTEMPTS = 5;
 export const SIIGO_MAX_REQUESTS_PER_MINUTE = 90; // límite de Siigo: 100/min por empresa (dejamos margen)
+
+/**
+ * Sincronización de clientes Siigo → POS (src/lib/siigo/customer-sync.ts). SOLO LEE (GET /v1/customers).
+ * Máximo de peticiones por minuto de la sincronización (el límite de Siigo es 100 por minuto para TODA la empresa y el cliente
+ * del POS ya limita todo a SIIGO_MAX_REQUESTS_PER_MINUTE). Con 40 por minuto, ~17.000 clientes (170 páginas de 100) tardan ~4,5 min.
+ */
+export const SIIGO_CUSTOMER_SYNC_PER_MINUTE = 40;
+/** Prioridad baja: si en el último minuto ya van más de estas peticiones (por ejemplo, por facturación), la sincronización espera. */
+export const SIIGO_CUSTOMER_SYNC_YIELD_ABOVE = 60;

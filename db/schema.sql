@@ -311,3 +311,62 @@ ALTER TABLE sales ADD COLUMN IF NOT EXISTS time_note               TEXT;        
 ALTER TABLE sales DROP CONSTRAINT IF EXISTS sales_price_review_check;
 ALTER TABLE sales ADD CONSTRAINT sales_price_review_check CHECK (price_review_status IS NULL OR price_review_status IN ('pendiente','aprobada','anulada'));
 CREATE INDEX IF NOT EXISTS idx_sales_price_review ON sales (price_review_at) WHERE price_review_status = 'pendiente';
+
+-- ============================================================================
+-- Clientes sincronizados desde Siigo (Siigo → POS, una sola dirección). Todo idempotente.
+-- ============================================================================
+-- El POS acepta cualquier tipo de documento de la DIAN (2 dígitos) que traiga Siigo (antes solo 13, 31, 22 y 41).
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'customers_id_type_check' AND pg_get_constraintdef(oid) LIKE '%{2}%') THEN
+    ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_id_type_check;
+    ALTER TABLE customers ADD CONSTRAINT customers_id_type_check CHECK (id_type ~ '^[0-9]{2}$');
+  END IF;
+END $$;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS siigo_id TEXT;                          -- id (UUID) del tercero en Siigo
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS active   BOOLEAN NOT NULL DEFAULT TRUE;  -- FALSE = inactivo en Siigo: no se ofrece en la caja
+-- Texto de búsqueda por nombre: minúsculas y sin tildes (translate es inmutable, por eso puede ser columna generada)
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS search_name TEXT
+  GENERATED ALWAYS AS (translate(lower(coalesce(first_name,'') || ' ' || coalesce(last_name,'') || ' ' || coalesce(company_name,'')), 'áéíóúüñ', 'aeiouun')) STORED;
+CREATE INDEX IF NOT EXISTS idx_customers_siigo_id ON customers (siigo_id);
+-- Búsqueda por identificación (prefijo: LIKE '123%' solo usa índice con text_pattern_ops)
+CREATE INDEX IF NOT EXISTS idx_customers_ident_prefix ON customers (identification text_pattern_ops);
+-- Búsqueda por nombre (contiene): índice trigram. pg_trgm viene con Postgres; si no se pudiera crear, la búsqueda funciona igual (más lenta).
+DO $$ BEGIN
+  CREATE EXTENSION IF NOT EXISTS pg_trgm;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'pg_trgm no disponible: la búsqueda por nombre de clientes no usará índice';
+END $$;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm') THEN
+    CREATE INDEX IF NOT EXISTS idx_customers_search_name ON customers USING gin (search_name gin_trgm_ops);
+  END IF;
+END $$;
+
+-- Corridas de la sincronización. El índice único parcial es el BLOQUEO: solo puede haber UNA corrida 'running' a la vez
+-- (aunque haya varios procesos). Si el proceso muere, la fila queda 'running' con el latido viejo: se puede retomar.
+CREATE TABLE IF NOT EXISTS customer_sync_runs (
+  id            SERIAL PRIMARY KEY,
+  mode          TEXT NOT NULL,                          -- 'full' | 'incremental'
+  status        TEXT NOT NULL DEFAULT 'running',        -- running | done | interrupted | cancelled
+  phase         TEXT NOT NULL DEFAULT 'main',           -- full: main · incremental: updated y luego created
+  next_page     INTEGER NOT NULL DEFAULT 1,             -- próxima página por procesar (para retomar)
+  total_pages   INTEGER,
+  total_results INTEGER,                                -- total que reporta Siigo en la fase actual
+  since         DATE,                                   -- incremental: fecha desde la que se pide (con un día de traslape)
+  started_by    INTEGER REFERENCES users(id),
+  owner         TEXT,                                   -- quién tiene el bloqueo ahora (token del proceso)
+  started_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  heartbeat_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at   TIMESTAMPTZ,
+  requests      INTEGER NOT NULL DEFAULT 0,
+  created       INTEGER NOT NULL DEFAULT 0,
+  updated       INTEGER NOT NULL DEFAULT 0,
+  unchanged     INTEGER NOT NULL DEFAULT 0,
+  skipped       INTEGER NOT NULL DEFAULT 0,
+  duplicates    INTEGER NOT NULL DEFAULT 0,
+  errors        INTEGER NOT NULL DEFAULT 0,
+  skip_reasons  JSONB NOT NULL DEFAULT '{}'::jsonb,     -- solo conteos por motivo, nunca datos personales
+  error_message TEXT
+);
+ALTER TABLE customer_sync_runs ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL DEFAULT '{}'::jsonb; -- qué columnas cambiaron en los actualizados (solo conteos: {"email": 3, "address": 1})
+CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_sync_running ON customer_sync_runs ((TRUE)) WHERE status = 'running';

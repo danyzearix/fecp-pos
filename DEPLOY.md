@@ -129,6 +129,8 @@ Si `.env.production.example` trae variables nuevas, cópialas a tu `.env.product
 
 > **`db:setup` es obligatorio en esta actualización:** crea `product_price_history` con la línea base de los 701 productos, el disparador sobre `products` y las columnas de revisión de `sales`. Verifica: `dc exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc "SELECT (SELECT count(*) FROM products), (SELECT count(*) FROM product_price_history WHERE valid_to IS NULL)"'` (las dos cifras deben ser iguales).
 
+> **Clientes de Siigo (última versión):** `db:setup` es **obligatorio**: agrega a `customers` las columnas `siigo_id`, `active` y `search_name`, amplía el tipo de documento a cualquier código de la DIAN, crea los índices de búsqueda (`pg_trgm`, que viene con Postgres) y la tabla `customer_sync_runs`. No hay variables nuevas en `.env.production`. Después de actualizar: entra como admin a **Admin → Clientes** y pulsa **Sincronizar clientes** (la primera vez trae todo, ~5 minutos; sigue funcionando la caja mientras tanto). No hace falta cron: cuando quieras refrescar, pulsa el botón (trae solo lo nuevo).
+
 ### 2.4.1 Scripts de `db/` en el servidor
 La imagen incluye `db/` (`setup`, `seed`, `iva-report`, `siigo-test-docs`). Para los reportes se usa un contenedor **temporal**
 (`run --rm`), con `--no-deps` (no toca la base ni la app en marcha) y **`-l traefik.enable=false`** (si no, Traefik le mandaría

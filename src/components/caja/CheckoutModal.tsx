@@ -7,7 +7,7 @@ import { bogotaDay, validatePaymentLines, type PayLineIn } from "@/lib/payment-l
 import { DEPTS, citiesOf, EMAIL_RE, nitDv, splitName } from "@/lib/client/customer-form";
 import { finePointer } from "@/lib/client/pointer";
 import { formatCOP } from "@/lib/money";
-import { CONSUMIDOR_FINAL_ID, ID_TYPES, paymentShortLabel, type CustomerIn, type PaymentMethod, type PosConfig } from "@/lib/sale-types";
+import { CONSUMIDOR_FINAL_ID, ID_TYPES, ID_TYPE_LABELS, paymentShortLabel, type CustomerIn, type PaymentMethod, type PosConfig } from "@/lib/sale-types";
 import type { CartCustomer } from "./CustomerPicker";
 import PaymentLines from "./PaymentLines";
 import { newLine, toPayLinesIn, type LineUi } from "./payment-ui";
@@ -119,7 +119,14 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
         const res = await fetch(`/api/customers?q=${encodeURIComponent(id)}`);
         if (!res.ok || mine !== seq.current) return;
         const { customers } = (await res.json()) as { customers: CartCustomer[] };
-        const c = customers.find((x) => x.identification === id);
+        let c = customers.find((x) => x.identification === id);
+        if (!c && mine === seq.current && /^\d{5,20}$/.test(id)) {
+          // No está en la copia del POS: consulta en vivo a Siigo (solo lectura; el servidor la guarda y limita las consultas por minuto)
+          await new Promise((r) => setTimeout(r, 700));
+          if (mine !== seq.current) return;
+          const live = await fetch(`/api/customers?q=${encodeURIComponent(id)}&live=1`);
+          if (live.ok) c = ((await live.json()) as { customers: CartCustomer[] }).customers.find((x) => x.identification === id);
+        }
         if (!c || mine !== seq.current) return;
         setFound(true);
         setF((p) => ({
@@ -312,6 +319,8 @@ export default function CheckoutModal({ totals, customer, config, epaycoReady, b
                     {ID_TYPES.map((t) => (
                       <option key={t.id} value={t.id}>{t.label}</option>
                     ))}
+                    {/* cliente sincronizado de Siigo con otro tipo de documento (p. ej. tarjeta de identidad) */}
+                    {!ID_TYPES.some((t) => t.id === f.idType) && <option value={f.idType}>{ID_TYPE_LABELS[f.idType] ?? f.idType}</option>}
                   </select>
                 </label>
                 <label className={isNit ? "col-span-1 sm:col-span-2" : "col-span-2 sm:col-span-3"}>
