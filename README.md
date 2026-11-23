@@ -59,8 +59,9 @@ Abre `.env.local` y completa los valores. **Nunca subas este archivo a un reposi
 | `SIIGO_PAYMENT_CREDITO_ID` | Forma de pago de Siigo para el **Crédito FECP** (una con `due_date=true`; "Crédito" suele ser `1667`). Vacía + `SIIGO_TEST_MODE=false` = el sistema se **niega** a facturar ventas a crédito |
 | `SIIGO_SELLER_ID` | Vendedor de Siigo por defecto (se usa si el usuario no tiene `siigo_seller_id`) |
 | `SIIGO_TEST_MODE` | `true` = documentos de prueba sin DIAN · `false` = **facturas electrónicas reales** |
-| `UVT_VALUE` | Valor de la UVT del año (5 UVT define checkout corto/completo) |
-| `POS_ADDRESS`, `POS_STATE_CODE`, `POS_CITY_CODE` | Dirección y códigos DANE del punto de venta (clientes del checkout corto) |
+| `UVT_VALUE` | Valor de la UVT del año (se usa para el tope de 5 UVT solo cuando `CONSUMIDOR_FINAL_SIN_TOPE=false`) |
+| `CONSUMIDOR_FINAL_SIN_TOPE` | `true` (por defecto) = se puede facturar a Consumidor final sin importar el monto (Res. DIAN 165/2023, art. 11, num. 3.3). `false` = tope de 5 UVT: por encima hay que identificar al cliente. Ver §11f |
+| `POS_ADDRESS`, `POS_STATE_CODE`, `POS_CITY_CODE` | Dirección y códigos DANE del punto de venta (dirección por defecto cuando un cliente no tiene) |
 | `NEXT_PUBLIC_CAJA_PREFIX` | Prefijo del número de venta de esta caja (`C01` → `C01-000123`) |
 | `NEGOCIO_*` | Nombre, NIT, dirección y teléfono que salen en la tirilla |
 | `RESOLUCION_DIAN_*` | Número, fecha, rango y vigencia de la resolución de facturación (salen en la tirilla; Siigo no los entrega por API) |
@@ -81,7 +82,7 @@ Abre `.env.local` y completa los valores. **Nunca subas este archivo a un reposi
 ## 5. Preparar la base de datos
 
 ```powershell
-npm run db:setup     # crea/actualiza las tablas (se puede repetir sin perder datos)
+npm run db:setup     # crea/actualiza las tablas (se puede repetir sin perder datos). Tras una actualización también crea las columnas e índices de clientes (§11e)
 npm run db:seed      # crea el administrador (pide correo y contraseña, mín. 12 caracteres) y el cliente Consumidor final
 ```
 
@@ -200,7 +201,7 @@ Hay dos puertas de entrada y **el mismo camino de verificación**:
 |---|---|---|
 | Dónde | Modal de cobro → botón **Pago electrónico (ePayco)** | `/kiosco` |
 | Número de venta | `E01-000001`… | `K01-000001`… |
-| Datos del cliente | Los completa el cajero; si la cédula ya existe, se actualizan como en una venta normal | Sin autocompletar; si la cédula ya existe **no se modifica** |
+| Datos del cliente | Los completa el cajero (se **autocompletan** si el cliente está en la copia de Siigo, §11e); si la cédula ya existe, se actualizan como en una venta normal | Sin autocompletar ni lectura de clientes (403); si la cédula ya existe **no se modifica** y la tirilla no muestra su nombre |
 | Al aprobarse | Se factura y se abre la impresión de la tirilla | Pantalla final con el número de factura (o tirilla si `KIOSCO_IMPRESORA=true`) |
 
 Flujo (siempre igual):
@@ -275,7 +276,7 @@ Con `EPAYCO_TEST_MODE=true` los pagos no cobran dinero real. Visa aprobada: **`4
 
 ## 11. Autoservicio (kiosco)
 
-Pantalla táctil para el rol **Cliente**: búsqueda por nombre/SKU, lector de código de barras, carrito propio, checkout corto o completo (misma regla de 5 UVT que la caja) y **solo pago electrónico**.
+Pantalla táctil para el rol **Cliente**: búsqueda por nombre/SKU, lector de código de barras, carrito propio, **consulta del cliente por su cédula con datos enmascarados** (§11f) y **solo pago electrónico**.
 
 - **Bloqueo:** sin barra lateral ni enlaces, atajos de teclado y menú contextual bloqueados, botón “atrás” inactivo. El rol `cliente` solo puede abrir `/kiosco` (y los endpoints del kiosco).
 - **Reinicio automático:** al terminar una venta y tras 3 minutos sin actividad vacía el carrito y vuelve al inicio.
@@ -356,10 +357,33 @@ Los clientes se copian **de Siigo al POS, en una sola dirección** (Siigo manda;
 - **Historial:** cada corrida guarda sus conteos y, de los clientes que cambiaron, **qué columnas** cambiaron (por ejemplo "correo 3, dirección 1"; solo conteos, nunca los valores).
 - **Limitación conocida:** la sincronización incremental depende de la fecha de modificación (`last_updated`) que Siigo pone a cada tercero. Si Siigo no la actualiza en algún cambio, ese cambio no llega hasta la próxima **Recarga completa** (≈ 4,5 min): conviene hacerla de vez en cuando (por ejemplo, una vez por semana).
 - **Ritmo:** máximo **40 peticiones por minuto** (~17.000 clientes ≈ 170 páginas ≈ **4,5 minutos**), con espera y reintento ante 429 o errores temporales de Siigo. Comparte la ventana de peticiones del cliente de Siigo con la facturación y **cede el paso**: si ya van más de 60 en el último minuto, espera.
-- **Caja:** el buscador pide **al menos 3 caracteres** y devuelve **máximo 10** (solo admin y cajero). Si el cajero escribe una **cédula/NIT completa que no está en la copia local**, el POS la consulta en Siigo (GET por `identification`, solo lectura), la guarda y la ofrece; máximo **12 consultas por minuto por usuario**. El checkout autocompleta con los datos del cliente y el **Crédito FECP** funciona con estos clientes (exige cédula o NIT real, igual que antes: un cliente sin correo o dirección en Siigo hay que completarlo en el checkout).
-- **Kiosco:** el rol *cliente* **no puede leer, buscar ni autocompletar** nada de `customers` (`/api/customers` y `/api/admin/clientes/*` responden 403; la tirilla del kiosco solo muestra `***` + 3 últimos dígitos del documento, nunca el nombre guardado).
+- **Caja:** el cliente se busca por su **número de documento completo** en el primer paso del cobro (§11f). Se consulta primero esta tabla y, si no está, se hace UN intento en vivo a Siigo (GET por `identification`, 4 s, solo lectura; si falla se trata como "no encontrado"). El Crédito FECP funciona con estos clientes (exige cédula o NIT real, igual que antes).
+- **Kiosco:** el rol *cliente* **no puede leer ni buscar** nada de `customers` (`/api/customers` y `/api/admin/clientes/*` responden 403). Solo tiene su propia consulta por cédula, que devuelve **datos ya enmascarados** (`POST /api/kiosco/cliente`, §11f). La tirilla del kiosco solo muestra `***` + 3 últimos dígitos del documento, nunca el nombre guardado.
 - **Logs** (tipo `sync`): inicio y fin de cada corrida con conteos (creados, actualizados, sin cambios, omitidos, repetidos, errores), y cada búsqueda en vivo con el documento enmascarado (`***123`). Nunca nombres, documentos completos ni correos.
 - **Tipos de documento:** la tabla acepta cualquier código de 2 dígitos de la DIAN que traiga Siigo (cédula, NIT, tarjeta de identidad, documento extranjero…). Los formularios de la caja y del kiosco siguen ofreciendo los 4 de siempre para clientes **nuevos**.
+
+## 11f. Checkout: la cédula va PRIMERO
+
+El monto **ya no decide** el tipo de checkout. Siempre se identifica al cliente primero (o se elige Consumidor final). Según el art. 11, num. 3.3 de la Res. DIAN 165/2023 se puede facturar a Consumidor final (`222222222222`) sin importar el monto si el cliente no da sus datos; como el contador aún debe confirmar el efecto de la Res. 227/2025, hay una bandera:
+
+- **`CONSUMIDOR_FINAL_SIN_TOPE`** (`.env.local` / `.env.production`): `true` (por defecto si falta) = Consumidor final sin tope. `false` = se conserva el comportamiento anterior: con la base sin IVA por encima de **5 UVT** hay que identificar al cliente (la caja deshabilita "Consumidor final" con una explicación; el kiosco no lo ofrece y el servidor del kiosco lo rechaza). En la caja el servidor no rechaza una venta ya cobrada (puede venir de la cola sin conexión): solo deja una advertencia en los logs. **Admin → Configuración** muestra el valor activo. Cambiarlo no requiere tocar el código: edita el archivo y reinicia.
+
+**Caja (cajero y administrador)** — *Cobrar* abre el cobro en **dos pasos**:
+1. **Cliente.** Tipo de documento (Cédula de ciudadanía por defecto, NIT y los demás del sistema) y número; **Enter = Buscar**. Debajo, **Consumidor final** (salta la búsqueda) y **Factura a nombre del cliente (F9)** (abre directo el formulario, sin buscar). El servidor busca en `customers` y, si no está, hace un intento en vivo a Siigo.
+   - **Existe:** se ve el nombre completo, el tipo y número de documento; el **correo y el teléfono van ofuscados** (`d***@gmail.com`, `300***1234`: el navegador nunca recibe los reales). **Facturar a este cliente** pasa al pago. Si le faltan datos obligatorios (nombres/razón social, DV, correo, dirección, departamento, ciudad) **se piden solo los que faltan**; los demás no se tocan.
+   - **No existe:** dos botones grandes, **Consumidor final** y **Factura electrónica a nombre del cliente** (formulario completo en blanco; el cliente se crea en Siigo al facturar).
+2. **Pago.** Igual que antes (pago dividido, referencias, foto del comprobante, ePayco). **Crédito FECP** exige un cliente identificado con cédula o NIT y datos completos: si el cliente actual es Consumidor final, el cobro vuelve al paso 1 con un mensaje.
+- **Sin conexión:** la búsqueda necesita el servidor, así que se deshabilita con un aviso; siguen disponibles Consumidor final y el formulario manual, y la venta se encola como siempre. No hay copia local de clientes en el navegador.
+- **Nunca se sobrescribe un cliente guardado:** el navegador solo manda el tipo y el número de un cliente que ya existe (más los datos que le faltaban); el **servidor** completa únicamente esos campos vacíos y lo guardado no cambia. Tampoco se modifica nada en Siigo. La búsqueda parcial por prefijo o nombre ya no existe en la caja (se identifica por documento completo, y así el correo y el teléfono no se exponen).
+- **Tirilla/factura:** el tipo de documento sale en su propia línea, antes del número ("Cédula de ciudadanía" y debajo el número).
+- **Logs:** cada venta registra la rama usada (`consumidor_final`, `cliente_existente` o `cliente_nuevo`), sin datos personales.
+
+**Kiosco (rol cliente)** — nuevo paso **"Ingrese su número de cédula"** (teclado numérico grande), antes de los datos de contacto:
+- Hay que escribir el **número completo** y tocar **Consultar**: no hay búsqueda parcial ni autocompletado mientras escribe.
+- `POST /api/kiosco/cliente` (solo rol cliente) responde **solo datos enmascarados**: nombre con 3 letras + 4 asteriscos por palabra (`DAN**** MUN**** ROD****`, siempre del mismo largo: no revela el largo real) y cédula con 4 dígitos + 4 asteriscos (`1018****`). Nunca correo ni teléfono. Todo lo demás (no existe, inactivo, formato inválido, Siigo no responde) responde exactamente `{"found":false}` y tarda lo mismo (mínimo 1,2 s). **Límite: 10 consultas cada 10 minutos por IP y por sesión** (429); se cambia en las constantes `KIOSK_LOOKUP_MAX` y `KIOSK_LOOKUP_WINDOW_MS` de `src/app/api/kiosco/cliente/route.ts`. En los logs solo se guardan los últimos 3 dígitos.
+- **Existe:** "¿Es usted?" con la máscara, aviso de protección de datos (Ley 1581 de 2012) y **Sí, soy yo / No, corregir**. Al confirmar, el navegador manda **solo el número**; el servidor vuelve a buscar al cliente (nunca recibe nombre ni id de Siigo, y lo que mande se ignora). El correo y el teléfono del paso de contacto **no se prellenan**.
+- **No existe:** **Consumidor final** o **Factura electrónica a mi nombre** (formulario en blanco, sin autocompletar). También hay un enlace "No quiero dar mi cédula (Consumidor final)" en el primer paso.
+- Todo el estado de la consulta vive en la pantalla: al volver atrás, al terminar la compra o por inactividad (3 minutos) se borra.
 
 ## 12. Comandos útiles
 
@@ -381,7 +405,7 @@ Los clientes se copian **de Siigo al POS, en una sola dirección** (Siigo manda;
 Remove-Item -Recurse -Force .\uploads\comprobantes\* -ErrorAction SilentlyContinue   # fotos de comprobantes de prueba
 ```
 
-Es irreversible. Haz una copia antes si dudas (`pg_dump`). Si quieres también borrar los clientes de prueba, agrega `customers` al `TRUNCATE` (cuidado: Consumidor final lo recrea `npm run db:seed`).
+Es irreversible. Haz una copia antes si dudas (`pg_dump`). Si quieres también borrar los clientes de prueba, agrega `customers` al `TRUNCATE` (cuidado: Consumidor final lo recrea `npm run db:seed`). **No lo hagas después de sincronizar los clientes de Siigo**, o tendrás que volver a sincronizar (~5 min).
 
 ## 13. Pasar a facturación y cobros reales
 
@@ -422,5 +446,6 @@ src/app/            páginas y API
 src/components/     caja (CheckoutModal, EpaycoCharge), kiosco, ventas, tirilla y componentes compartidos
 src/config/         tax-map.ts (Woo), siigo-map.ts (ids de Siigo), dane.json
 src/lib/            permissions.ts, auth.ts, woo.ts, sales.ts, kiosk.ts, sale-states.ts, pay-link.ts,
-                    epayco/* (adapter, process, verify, session, config), siigo/*, client/* (navegador)
+                    customers.ts (búsqueda de clientes), epayco/* (adapter, process, verify, session, config),
+                    siigo/* (incluye customer-sync.ts: sincronización de clientes), client/* (navegador)
 ```

@@ -8,15 +8,16 @@ import TicketView, { dianQrUrl } from "@/components/ticket/TicketView";
 import { useBarcodeScanner } from "@/hooks/useBarcodeScanner";
 import { useFullscreen } from "@/hooks/useFullscreen";
 import { buildIndex, normalize, searchItems, type IndexedProduct, type Product } from "@/lib/client/catalog";
-import { buildCustomerFromForm, emptyCustomerForm, validateCustomerForm } from "@/lib/client/customer-form";
+import { buildCustomerFromForm, EMAIL_RE, emptyCustomerForm, validateCustomerForm } from "@/lib/client/customer-form";
 import { beepError, beepOk } from "@/lib/client/sound";
 import { cartTotals, formatCOP, type CartLine } from "@/lib/money";
 import type { PosConfig, TicketData } from "@/lib/sale-types";
+import CedulaStep, { type CedulaChoice } from "./CedulaStep";
 import CustomerStep from "./CustomerStep";
 import { findRef, openOnpageCheckout, shapeOf } from "./epayco-client";
 import ExitDialog from "./ExitDialog";
 
-type Screen = "tienda" | "datos" | "confirmar_total" | "pagando" | "procesando" | "resultado";
+type Screen = "tienda" | "cedula" | "datos" | "confirmar_total" | "pagando" | "procesando" | "resultado";
 type Outcome = { tone: "ok" | "warn" | "error"; title: string; message: string; localNumber?: string; invoice?: string | null; retry: boolean };
 // Canal de pago (uno a la vez; lo hace cumplir el servidor): en el kiosco el predeterminado es "pantalla" (checkout de
 // ePayco aquí mismo) y "qr" (pagar en el celular) es la opción secundaria, solo si hay dominio público.
@@ -47,11 +48,14 @@ const saveSale = (s: Sale | null) => {
 
 export default function KioscoClient({
   uvt,
+  sinTope,
   printer,
   defaultState,
   defaultCity,
 }: {
   uvt: number;
+  /** CONSUMIDOR_FINAL_SIN_TOPE: true = Consumidor final sin tope de monto */
+  sinTope: boolean;
   printer: boolean;
   defaultState: string;
   defaultCity: string;
@@ -63,7 +67,8 @@ export default function KioscoClient({
   const [cart, setCart] = useState<CartLine[]>([]);
   const [screen, setScreen] = useState<Screen>("tienda");
   const [form, setForm] = useState(() => emptyCustomerForm({ state: defaultState, city: defaultCity }));
-  const [manualFull, setManualFull] = useState(false);
+  // Cliente de la compra: cf = Consumidor final · existing = "Sí, soy yo" (solo el número; el servidor lo vuelve a buscar) · new = formulario en blanco
+  const [custMode, setCustMode] = useState<"cf" | "existing" | "new">("cf");
   const [formError, setFormError] = useState("");
   const [busy, setBusy] = useState(false);
   const [sale, setSale] = useState<Sale | null>(null);
@@ -98,8 +103,8 @@ export default function KioscoClient({
   const categories = useMemo(() => [...new Set(products.map((p) => p.category).filter((c): c is string => !!c))].sort((a, b) => a.localeCompare(b, "es")), [products]);
   const filtered = useMemo(() => searchItems(index.items, deferredQuery, category), [index, deferredQuery, category]);
   const totals = useMemo(() => cartTotals(cart), [cart]);
-  const forceFull = totals.subtotal > 5 * uvt;
-  const type: "corto" | "completo" = forceFull || manualFull ? "completo" : "corto";
+  // Con CONSUMIDOR_FINAL_SIN_TOPE=false se conserva el tope anterior: por encima de 5 UVT (base sin IVA) no se ofrece Consumidor final
+  const cfAllowed = sinTope || totals.subtotal <= 5 * uvt;
   const qtyIn = useMemo(() => new Map(cart.map((l) => [l.productId, l.qty])), [cart]);
 
   const showToast = useCallback((text: string, kind: "ok" | "err") => {
@@ -130,7 +135,7 @@ export default function KioscoClient({
     setQuery("");
     setCategory(null);
     setForm(emptyCustomerForm({ state: defaultState, city: defaultCity }));
-    setManualFull(false);
+    setCustMode("cf");
     setFormError("");
     setBusy(false);
     setSale(null);
@@ -287,7 +292,7 @@ export default function KioscoClient({
     const evs = ["pointerdown", "touchstart", "keydown", "wheel"] as const;
     evs.forEach((e) => window.addEventListener(e, touch, { passive: true }));
     const iv = setInterval(() => {
-      if (exitOpen || !["tienda", "datos", "confirmar_total"].includes(screen)) return; // durante el pago no se reinicia
+      if (exitOpen || !["tienda", "cedula", "datos", "confirmar_total"].includes(screen)) return; // durante el pago no se reinicia
       const idle = Date.now() - lastActivity.current;
       if (idle >= IDLE_RESET_MS) reset();
       else setIdleWarn(idle >= IDLE_WARN_MS);
@@ -481,8 +486,10 @@ export default function KioscoClient({
         body: JSON.stringify({
           // El navegador SOLO manda productos y cantidades: el servidor calcula precios, IVA y total desde su base de datos
           items: cart.map((l) => ({ product_id: l.productId, quantity: l.qty })),
-          checkout_type: type,
-          customer: buildCustomerFromForm(form, type),
+          // Solo tipo y número de un cliente que ya existe: el servidor lo vuelve a buscar (nunca se manda nombre ni id de Siigo)
+          checkout_type: custMode === "cf" ? "corto" : "completo",
+          customer:
+            custMode === "cf" ? null : custMode === "existing" ? { id_type: "13", identification: form.identification } : buildCustomerFromForm(form, "completo"),
           notify_email: form.email.trim() || undefined,
           channel: "pantalla", // en el kiosco se paga aquí mismo; el QR es la opción secundaria
         }),
@@ -512,7 +519,7 @@ export default function KioscoClient({
     }
   }
   function submitCustomer() {
-    const err = validateCustomerForm(form, type);
+    const err = custMode === "new" ? validateCustomerForm(form, "completo") : form.email.trim() && !EMAIL_RE.test(form.email.trim()) ? "El correo no es válido" : null;
     if (err) return setFormError(err);
     setFormError("");
     void createPayment();
@@ -676,7 +683,7 @@ export default function KioscoClient({
                   <div className="flex justify-between text-3xl font-bold text-brand-text pb-2"><span>Total</span><span>{formatCOP(totals.total)}</span></div>
                   <div className="flex gap-3">
                     <button onClick={() => setCart([])} disabled={cart.length === 0} className="px-6 rounded-xl border border-field text-lg font-medium text-body disabled:opacity-40">Vaciar</button>
-                    <button onClick={() => { setFormError(""); setScreen("datos"); }} disabled={cart.length === 0} className="flex-1 py-5 rounded-xl bg-go active:bg-go-hover text-white text-2xl font-bold disabled:opacity-50">
+                    <button onClick={() => { setFormError(""); setScreen("cedula"); }} disabled={cart.length === 0} className="flex-1 py-5 rounded-xl bg-go active:bg-go-hover text-white text-2xl font-bold disabled:opacity-50">
                       Pagar {formatCOP(totals.total)}
                     </button>
                   </div>
@@ -685,20 +692,34 @@ export default function KioscoClient({
             </div>
           )}
 
+          {screen === "cedula" && (
+            <CedulaStep
+              total={totals.total}
+              cfAllowed={cfAllowed}
+              onBack={() => setScreen("tienda")}
+              onChoose={(c: CedulaChoice) => {
+                // Nada de la consulta se conserva: solo el modo y (si hace falta) el número que la persona escribió
+                setCustMode(c.mode);
+                setForm({ ...emptyCustomerForm({ state: defaultState, city: defaultCity }), identification: c.mode === "cf" ? "" : c.identification });
+                setFormError("");
+                setScreen("datos");
+              }}
+            />
+          )}
+
           {screen === "datos" && (
             <CustomerStep
+              mode={custMode}
               form={form}
               setForm={setForm}
-              type={type}
-              forceFull={forceFull}
-              threshold={5 * uvt}
-              base={totals.subtotal}
               total={totals.total}
-              manualFull={manualFull}
-              setManualFull={setManualFull}
               error={formError}
               busy={busy}
-              onBack={() => setScreen("tienda")}
+              onBack={() => {
+                setForm(emptyCustomerForm({ state: defaultState, city: defaultCity }));
+                setCustMode("cf");
+                setScreen("cedula");
+              }}
               onNext={submitCustomer}
             />
           )}

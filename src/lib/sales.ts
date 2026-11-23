@@ -5,6 +5,7 @@ import { writeLog } from "./log";
 import { cartTotals, lineAmounts, round2 } from "./money";
 import { getPosConfig } from "./config";
 import { itemToLine } from "./ticket";
+import { resolveSaleCustomer } from "./customer-resolve";
 import { receiptRequired, type ReceiptStatus } from "./receipt-rules";
 import { checkPrices } from "./price-check";
 import { bogotaDay, joinedReference, MAX_PAY_LINES, methodsOf, saleMethodOf, validatePaymentLines, type PayLine, type PayLineIn } from "./payment-lines";
@@ -69,11 +70,8 @@ function creditCustomerError(c: CustomerIn | null): string | null {
   if (!c || c.identification === CONSUMIDOR_FINAL_ID || !["13", "22", "31"].includes(c.id_type)) {
     return "El Crédito FECP exige un cliente identificado con cédula o NIT real (no Consumidor final)";
   }
-  const okName = c.id_type === "31" ? !!c.company_name : !!(c.first_name && c.last_name);
-  if (!okName || !c.email || !EMAIL_RE.test(c.email) || !c.address || !c.state_code || !c.city_code) {
-    return "El Crédito FECP exige los datos completos del cliente (nombre, correo, dirección, departamento y ciudad)";
-  }
-  if (c.id_type === "31" && !c.check_digit) return "Falta el dígito de verificación del NIT";
+  // Que sus datos estén completos se valida en createSale, con el cliente ya resuelto desde la base (el navegador puede mandar solo
+  // el tipo y el número de documento de un cliente que ya existe).
   return null;
 }
 
@@ -160,9 +158,9 @@ export function parseSale(body: unknown): ParsedSale | string {
   }
   const hasCredit = linesIn.some((l) => l.method === "credito_fecp");
   if (hasCredit) {
-    if (checkout_type !== "completo") return "El Crédito FECP exige el checkout completo (datos completos del cliente)";
     const ce = creditCustomerError(customer);
     if (ce) return ce;
+    if (checkout_type !== "completo") return "El Crédito FECP exige el checkout completo (datos completos del cliente)";
   }
   const v = validatePaymentLines(linesIn, total, {
     saleDay: bogotaDay(createdIso),
@@ -186,8 +184,8 @@ export type CreateSaleResult =
   | { ok: false; error: string };
 
 /**
- * Cliente de una venta hecha por un EMPLEADO (caja): sin cédula = consumidor final; los datos nuevos completan o
- * actualizan al cliente existente. La dirección/ciudad faltantes se completan con las del punto de venta.
+ * Cliente de una venta hecha por un EMPLEADO (caja): sin cédula = consumidor final. Un cliente que ya existe NUNCA se sobrescribe:
+ * los datos que llegan solo llenan campos que estaban VACÍOS. La dirección/ciudad faltantes se completan con las del punto de venta.
  * (El kiosco NO usa esto: allí un cliente existente nunca se modifica.)
  */
 export async function upsertCashierCustomer(client: PoolClient, customer: CustomerIn | null): Promise<number> {
@@ -200,16 +198,16 @@ export async function upsertCashierCustomer(client: PoolClient, customer: Custom
     `INSERT INTO customers (id_type, identification, check_digit, first_name, last_name, company_name, email, phone, address, state_code, city_code)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      ON CONFLICT (identification) DO UPDATE SET
-       id_type      = CASE WHEN customers.identification = $12 THEN customers.id_type ELSE EXCLUDED.id_type END,
-       check_digit  = COALESCE(NULLIF(EXCLUDED.check_digit,''),  customers.check_digit),
-       first_name   = CASE WHEN customers.identification = $12 THEN customers.first_name ELSE COALESCE(NULLIF(EXCLUDED.first_name,''), customers.first_name) END,
-       last_name    = CASE WHEN customers.identification = $12 THEN customers.last_name  ELSE COALESCE(NULLIF(EXCLUDED.last_name,''),  customers.last_name)  END,
-       company_name = COALESCE(NULLIF(EXCLUDED.company_name,''), customers.company_name),
-       email        = COALESCE(NULLIF(EXCLUDED.email,''),        customers.email),
-       phone        = COALESCE(NULLIF(EXCLUDED.phone,''),        customers.phone),
-       address      = COALESCE(NULLIF(EXCLUDED.address,''),      customers.address),
-       state_code   = COALESCE(NULLIF(EXCLUDED.state_code,''),   customers.state_code),
-       city_code    = COALESCE(NULLIF(EXCLUDED.city_code,''),    customers.city_code)
+       id_type      = customers.id_type,
+       check_digit  = COALESCE(NULLIF(customers.check_digit,''),  NULLIF(EXCLUDED.check_digit,''),  customers.check_digit),
+       first_name   = CASE WHEN customers.identification = $12 THEN customers.first_name ELSE COALESCE(NULLIF(customers.first_name,''), NULLIF(EXCLUDED.first_name,''), customers.first_name) END,
+       last_name    = CASE WHEN customers.identification = $12 THEN customers.last_name  ELSE COALESCE(NULLIF(customers.last_name,''),  NULLIF(EXCLUDED.last_name,''),  customers.last_name)  END,
+       company_name = COALESCE(NULLIF(customers.company_name,''), NULLIF(EXCLUDED.company_name,''), customers.company_name),
+       email        = COALESCE(NULLIF(customers.email,''),        NULLIF(EXCLUDED.email,''),        customers.email),
+       phone        = COALESCE(NULLIF(customers.phone,''),        NULLIF(EXCLUDED.phone,''),        customers.phone),
+       address      = COALESCE(NULLIF(customers.address,''),      NULLIF(EXCLUDED.address,''),      customers.address),
+       state_code   = COALESCE(NULLIF(customers.state_code,''),   NULLIF(EXCLUDED.state_code,''),   customers.state_code),
+       city_code    = COALESCE(NULLIF(customers.city_code,''),    NULLIF(EXCLUDED.city_code,''),    customers.city_code)
      RETURNING id`,
     [
       c.id_type, c.identification, c.check_digit ?? "", c.first_name ?? "", c.last_name ?? "", c.company_name ?? "",
@@ -243,8 +241,16 @@ export async function createSale(sale: ParsedSale, cashierId: number): Promise<C
   const heldReason = pc.flagged ? `Precio por revisar: ${pc.summary}. Se decide en Admin → Precios por revisar.` : null;
 
   const cfg = getPosConfig();
-  if (sale.checkout_type === "corto" && totals.subtotal > 5 * cfg.uvt) {
-    await writeLog("venta", `Venta ${sale.local_number} con checkout corto pero base > 5 UVT`, {
+
+  // Cliente: lo resuelve el SERVIDOR desde la base. Con un cliente identificado (checkout completo) o con Crédito FECP deben estar
+  // todos sus datos (los que ya tiene guardados + los que mandó el navegador para completar lo que faltaba).
+  const hasCredit = payLines.some((l) => l.method === "credito_fecp");
+  const rc = await resolveSaleCustomer(sale.customer, { source: "caja", require: hasCredit || sale.checkout_type === "completo" ? "always" : "never", credit: hasCredit });
+  if (!rc.ok) return { ok: false, error: rc.error };
+
+  // Con CONSUMIDOR_FINAL_SIN_TOPE=false se conserva el tope anterior (la pantalla ya obliga a identificar al cliente); aquí solo se deja constancia
+  if (rc.branch === "consumidor_final" && !cfg.consumidorFinalSinTope && totals.subtotal > 5 * cfg.uvt) {
+    await writeLog("venta", `Venta ${sale.local_number} a Consumidor final con base > 5 UVT (CONSUMIDOR_FINAL_SIN_TOPE=false)`, {
       level: "warn",
       userId: cashierId,
       detail: { id: sale.id, base: totals.subtotal, limite: 5 * cfg.uvt },
@@ -255,7 +261,7 @@ export async function createSale(sale: ParsedSale, cashierId: number): Promise<C
   try {
     await client.query("BEGIN");
 
-    const cust = { rows: [{ id: await upsertCashierCustomer(client, sale.customer) }] };
+    const cust = { rows: [{ id: await upsertCashierCustomer(client, rc.toStore) }] };
 
     const ins = await client.query(
       `INSERT INTO sales (id, local_number, cashier_id, customer_id, checkout_type, subtotal, tax_total, total,
@@ -316,9 +322,9 @@ export async function createSale(sale: ParsedSale, cashierId: number): Promise<C
       await writeLog("venta", `Venta ${sale.local_number}: ${sale.time_note}`, { level: "warn", userId: cashierId, detail: { id: sale.id } });
     }
     if (inserted) {
-      await writeLog("venta", `Venta ${sale.local_number} registrada por $${totals.total}`, {
+      await writeLog("venta", `Venta ${sale.local_number} registrada por $${totals.total} · cliente: ${rc.branch}`, {
         userId: cashierId,
-        detail: { id: sale.id, total: totals.total, payment: saleMethodOf(payLines), lines: payLines.map((l) => ({ m: l.method, a: l.amount })), items: sale.items.length, checkout: sale.checkout_type },
+        detail: { id: sale.id, customer_branch: rc.branch, total: totals.total, payment: saleMethodOf(payLines), lines: payLines.map((l) => ({ m: l.method, a: l.amount })), items: sale.items.length, checkout: sale.checkout_type },
       });
     }
 
@@ -347,7 +353,7 @@ type SaleRow = {
   id: string; local_number: string; status: string; created_at: Date; created_at_device: Date | null;
   subtotal: number; tax_total: number; total: number; payment_method: string; payment_reference: string | null;
   cash_received: number | null; change_given: number | null; invoice_name: string | null; cufe: string | null;
-  cashier_name: string; c_first: string | null; c_last: string | null; c_company: string | null; c_ident: string | null;
+  cashier_name: string; c_first: string | null; c_last: string | null; c_company: string | null; c_ident: string | null; c_id_type: string | null;
   pay_lines: PayLine[] | null;
 };
 
@@ -357,7 +363,7 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
             s.subtotal::float8 AS subtotal, s.tax_total::float8 AS tax_total, s.total::float8 AS total,
             s.payment_method, s.payment_reference, s.cash_received::float8 AS cash_received, s.change_given::float8 AS change_given,
             s.invoice_name, s.cufe, u.name AS cashier_name,
-            c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company, c.identification AS c_ident,
+            c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company, c.identification AS c_ident, c.id_type AS c_id_type,
             ${PAY_LINES_SQL} AS pay_lines
        FROM sales s
        JOIN users u ON u.id = s.cashier_id
@@ -397,6 +403,7 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
     created_at: (s.created_at_device ?? s.created_at).toISOString(),
     cashier_name: s.cashier_name,
     customer_name: isCF ? "Consumidor final" : s.c_company || [s.c_first, s.c_last].filter(Boolean).join(" ") || s.c_ident!,
+    customer_id_type: ID_TYPE_LABELS[isCF ? "13" : (s.c_id_type ?? "13")] ?? s.c_id_type ?? "",
     customer_identification: isCF ? CONSUMIDOR_FINAL_ID : s.c_ident!,
     items: items.rows.map((i) => ({
       name: i.name, quantity: i.quantity, unit_price: i.unit_price, line_total: i.line_total, tax_rate: i.tax_rate,

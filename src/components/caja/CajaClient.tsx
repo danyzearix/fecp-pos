@@ -39,7 +39,6 @@ import { POSCONFIG_KEY } from "@/components/ticket/TicketPage";
 import CartPanel from "./CartPanel";
 import CheckoutModal, { type CheckoutResult } from "./CheckoutModal";
 import EpaycoCharge, { loadStoredSale, type EpaycoStart } from "./EpaycoCharge";
-import { CONSUMIDOR_FINAL, type CartCustomer } from "./CustomerPicker";
 import { IconSearch } from "./Icons";
 import Sidebar from "./Sidebar";
 
@@ -63,7 +62,6 @@ export default function CajaClient({
   const [category, setCategory] = useState<string | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [cartLoaded, setCartLoaded] = useState(false);
-  const [customer, setCustomer] = useState<CartCustomer | null>(CONSUMIDOR_FINAL);
   const [toast, setToast] = useState<Toast>(null);
   const [online, setOnline] = useState(true);
   const [pending, setPending] = useState(0);
@@ -247,7 +245,6 @@ export default function CajaClient({
   const removeLine = (productId: number) => setCart((prev) => prev.filter((l) => l.productId !== productId));
   const clearCart = () => {
     setCart([]);
-    setCustomer(CONSUMIDOR_FINAL);
   };
 
   const totals = useMemo(() => cartTotals(cart), [cart]);
@@ -304,7 +301,6 @@ export default function CajaClient({
       // La venta queda guardada en este equipo ANTES de enviarla
       enqueue({ sale, cashierName: user.name, queuedAt: Date.now(), state: "pendiente" });
       setCart([]);
-      setCustomer(CONSUMIDOR_FINAL);
       setShowCheckout(false);
       setCartOpen(false);
       setPending(pendingCount());
@@ -529,8 +525,6 @@ export default function CajaClient({
         sellerName={user.name}
         lines={cart}
         totals={totals}
-        customer={customer}
-        onCustomer={setCustomer}
         onQty={changeQty}
         onRemove={removeLine}
         onClear={clearCart}
@@ -554,7 +548,6 @@ export default function CajaClient({
       {showCheckout && (
         <CheckoutModal
           totals={totals}
-          customer={customer}
           config={config}
           epaycoReady={epaycoReady}
           busy={saving}

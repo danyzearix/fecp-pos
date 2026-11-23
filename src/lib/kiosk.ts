@@ -6,6 +6,7 @@ import { writeLog } from "./log";
 import { cartTotals, lineAmounts, type CartLine } from "./money";
 import { CONSUMIDOR_FINAL_ID, type CustomerIn } from "./sale-types";
 import { parseCustomer, upsertCashierCustomer } from "./sales";
+import { resolveSaleCustomer } from "./customer-resolve";
 import { transitionSale } from "./sale-states";
 import { EpaycoError } from "./epayco/adapter";
 import { createSaleSession } from "./epayco/session";
@@ -90,29 +91,21 @@ export async function createKioskPayment(input: {
   const totals = cartTotals(lines);
   if (!(totals.total > 0)) return fail(400, "El total debe ser mayor a cero");
 
-  // ---- Regla fiscal: 5 UVT ----
-  const required: "corto" | "completo" = totals.subtotal > 5 * pos.uvt ? "completo" : "corto";
-  const requested = b.checkout_type === "completo" ? "completo" : "corto";
-  if (required === "completo" && requested === "corto") return fail(400, "Esta compra requiere datos completos del cliente");
-  const checkoutType = required === "completo" ? "completo" : requested;
-
   // ---- Cliente ----
   // La caja (cobro electrónico con QR) puede traer clientes sincronizados de Siigo con más tipos de documento; el kiosco no.
   const parsed = parseCustomer(b.customer, { extended: source === "caja" });
   if (typeof parsed === "string") return fail(400, parsed);
-  const customer: CustomerIn | null = parsed;
-  if (checkoutType === "completo") {
-    const c = customer;
-    const okName = c && (c.id_type === "31" ? !!c.company_name : !!(c.first_name && c.last_name));
-    if (!c || c.identification === CONSUMIDOR_FINAL_ID || !okName || !c.email || !c.address || !c.state_code || !c.city_code) {
-      return fail(400, "Faltan datos del cliente para la factura");
-    }
-    if (c.id_type === "31" && !c.check_digit) return fail(400, "Falta el dígito de verificación del NIT");
-  } else if (customer && customer.id_type !== "31" && !(customer.first_name && customer.last_name)) {
-    return fail(400, "Escriba nombre y apellido del cliente");
-  }
-  // Correo para enviar ESTA factura: va en la venta, NO se guarda en el cliente
-  const notifyRaw = typeof b.notify_email === "string" ? b.notify_email.trim().slice(0, 150) : customer?.email ?? "";
+  const customer: CustomerIn | null = parsed && parsed.identification !== CONSUMIDOR_FINAL_ID ? parsed : null;
+  // El monto ya no decide el tipo de checkout: sin cédula = Consumidor final (aunque pase de 5 UVT) mientras CONSUMIDOR_FINAL_SIN_TOPE
+  // sea true. Con false se conserva el tope anterior: por encima de 5 UVT hay que identificar al cliente.
+  if (!customer && !pos.consumidorFinalSinTope && totals.subtotal > 5 * pos.uvt) return fail(400, "Esta compra requiere datos completos del cliente");
+  const checkoutType: "corto" | "completo" = customer ? "completo" : "corto";
+  // El SERVIDOR resuelve al cliente desde la base. Caja: completa solo campos vacíos y exige datos completos. Kiosco: un cliente que ya
+  // existe se usa TAL COMO ESTÁ (lo que mande el navegador se ignora); uno nuevo debe traer todos sus datos.
+  const rc = await resolveSaleCustomer(customer, { source, require: source === "caja" ? "always" : "new_only" });
+  if (!rc.ok) return fail(400, rc.error);
+  // Correo para enviar ESTA factura: va en la venta, NO se guarda en el cliente. (En la caja, si no lo escribieron, el del cliente ya guardado.)
+  const notifyRaw = typeof b.notify_email === "string" ? b.notify_email.trim().slice(0, 150) : (source === "caja" ? rc.merged?.email : customer?.email) ?? "";
   if (notifyRaw && !EMAIL_RE.test(notifyRaw)) return fail(400, "El correo no es válido");
   const notifyEmail = notifyRaw || null;
 
@@ -132,7 +125,7 @@ export async function createKioskPayment(input: {
     let customerId: number;
     if (source === "caja") {
       // Lo atiende un empleado: igual que una venta normal de caja (completa o actualiza los datos del cliente)
-      customerId = await upsertCashierCustomer(client, customer);
+      customerId = await upsertCashierCustomer(client, rc.toStore);
     } else {
       // Privacidad: si el cliente YA existe NO se modifica (nadie puede cambiar los datos de otra persona desde el kiosco)
       await client.query(
@@ -175,7 +168,7 @@ export async function createKioskPayment(input: {
   if (channel === "qr") {
     await writeLog("pago", `Cobro creado${source === "caja" ? " en caja" : ""}: ${localNumber} por $${totals.total} (canal: QR en el celular)`, {
       userId: input.userId,
-      detail: { sale_id: saleId, source, local_number: localNumber, total: totals.total, channel, test: cfg.testMode, items: lines.length },
+      detail: { sale_id: saleId, source, customer_branch: rc.branch, local_number: localNumber, total: totals.total, channel, test: cfg.testMode, items: lines.length },
     });
     return {
       ok: true, saleId, localNumber, sessionId: null, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode,
@@ -194,7 +187,7 @@ export async function createKioskPayment(input: {
     await query("UPDATE sales SET epayco_session_id = $2 WHERE id = $1", [saleId, sessionId]);
     await writeLog("pago", `Cobro creado${source === "caja" ? " en caja" : ""}: ${localNumber} por $${totals.total}`, {
       userId: input.userId,
-      detail: { sale_id: saleId, source, local_number: localNumber, total: totals.total, session_id: sessionId, channel, test: cfg.testMode, items: lines.length, response_url: responseUrl },
+      detail: { sale_id: saleId, source, customer_branch: rc.branch, local_number: localNumber, total: totals.total, session_id: sessionId, channel, test: cfg.testMode, items: lines.length, response_url: responseUrl },
     });
     // En pantalla el enlace del celular está CERRADO: no se entrega (se abre solo si se cambia a QR)
     return { ok: true, saleId, localNumber, sessionId, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode, payToken, payUrl: null, channel, qrAvailable: qrAvailable() };

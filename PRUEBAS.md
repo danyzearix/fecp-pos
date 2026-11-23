@@ -24,23 +24,29 @@ Marca cada punto con `[x]` cuando pase. Haz todo con `SIIGO_TEST_MODE=true` (los
 - [ ] Con el modal de cobro abierto, la pistola NO agrega productos al carrito.
 - [ ] F2 enfoca el buscador.
 
-## 3. Venta corta con Consumidor final
-- [ ] Agregar productos (base ≤ 5 UVT). Cobrar → el modal dice “Checkout CORTO”.
-- [ ] Sin cédula, pagar en efectivo con “Exacto” → confirmar (F9).
+## 3. Consumidor final (sin cédula)
+- [ ] Agregar productos. Cobrar → el modal dice **paso 1 de 2: cliente** (tipo de documento CC por defecto y campo "Número de documento").
+- [ ] Pulsar **Consumidor final** → pasa al pago (paso 2). Pagar en efectivo con “Exacto” → confirmar (F9).
 - [ ] La tirilla sale a 80 mm: negocio, “PRUEBA – SIN VALIDEZ FISCAL” arriba y abajo, número de factura de prueba, IVA por tarifa.
 - [ ] La venta aparece en `/ventas` como **Facturada** con su número `FV-1-…`.
 
-## 4. Venta corta con cédula
-- [ ] Escribir una cédula nueva con nombre y apellido → factura a ese cliente.
-- [ ] Repetir con la misma cédula → autocompleta los datos (“Cliente encontrado”).
+## 4. Cliente con cédula (existente y nuevo)
+- [ ] Escribir la cédula de un cliente que **existe** (Enter) → muestra nombre completo, tipo y número, y correo/teléfono con asteriscos (`d***@gmail.com`, `300***1234`). **Facturar a este cliente** → pago → factura a ese cliente, sin crear nada en Siigo.
+- [ ] Un cliente al que le **falta** el correo o la ciudad: pide **solo eso**; el resto no cambia en **Admin → Clientes**.
+- [ ] Una cédula que **no existe** → botones **Consumidor final** y **Factura electrónica a nombre del cliente** (formulario en blanco).
+- [ ] **F9** en el paso 1 abre directo el formulario "a nombre del cliente".
+- [ ] Repetir con la misma cédula (cliente nuevo ya creado) → "✓ Cliente encontrado".
 - [ ] El cliente aparece en **Admin → Clientes** con 1 o más compras.
 - [ ] ⚠ La primera vez con una cédula nueva se crea el cliente en el Siigo real.
 
-## 5. Venta mayor a 5 UVT (checkout completo)
-- [ ] Con base sin IVA > 5 UVT el modal dice “Checkout COMPLETO” y no deja volver a corto.
-- [ ] No permite confirmar sin documento, nombres/razón social, correo, dirección, departamento y ciudad.
+## 5. Venta mayor a 5 UVT
+- [ ] Con `CONSUMIDOR_FINAL_SIN_TOPE=true` (por defecto): base sin IVA > 5 UVT → **Consumidor final se puede usar** igual.
+- [ ] Con `CONSUMIDOR_FINAL_SIN_TOPE=false` (y reiniciar): > 5 UVT → el botón **Consumidor final** queda deshabilitado con la explicación; hay que identificar al cliente. **Admin → Configuración** muestra el valor activo.
+- [ ] El formulario "a nombre del cliente" no deja continuar sin documento, nombres/razón social, correo, dirección, departamento y ciudad.
 - [ ] Con NIT, calcula el dígito de verificación.
-- [ ] Una venta pequeña permite pasar a completo con la casilla “El cliente pide factura con todos sus datos”.
+- [ ] **Crédito FECP** con Consumidor final → vuelve al paso 1 con el mensaje "El Crédito FECP exige un cliente identificado…".
+- [ ] **Sin internet** (apagar el wifi del equipo): "Buscar cliente" se deshabilita con un aviso; Consumidor final y el formulario manual siguen funcionando y la venta se encola.
+- [ ] La tirilla muestra el tipo de documento en su propia línea ("Cédula de ciudadanía") y debajo el número.
 
 ## 6. Pagos
 - [ ] Efectivo: botones $10.000/$20.000/$50.000/$100.000; el cambio sale en grande; con valor menor al total no deja confirmar.
@@ -126,7 +132,11 @@ Abre la app por **`http://127.0.0.1:3000`** (no `localhost`). Tarjeta de prueba 
 - [ ] Si el total cambió (precios actualizados) antes de cobrar, avisa y pide confirmar el nuevo total.
 
 ### En el autoservicio
-- [ ] Compra con checkout corto y con checkout completo (base > 5 UVT exige todos los datos). Sin autocompletar.
+- [ ] **Paso "Ingrese su número de cédula"** (teclado grande): escribe 5 o más dígitos → mientras escribe no consulta nada; **Consultar** → "¿Es usted?" con nombre y cédula enmascarados (`DAN**** MUN**** ROD****`, `1018****`), aviso de la Ley 1581 y **Sí, soy yo / No, corregir**.
+- [ ] **Sí, soy yo** → paso de contacto con correo y teléfono **vacíos** (no se prellenan). **No, corregir** → vuelve a escribir.
+- [ ] Una cédula que no existe → **Consumidor final** y **Factura electrónica a mi nombre** (formulario en blanco).
+- [ ] Más de 10 consultas en 10 minutos → mensaje de demasiadas consultas.
+- [ ] Dejar la pantalla de "¿Es usted?" sin tocar 3 minutos → vuelve al inicio y la consulta desaparece.
 - [ ] Pago aprobado → pantalla “¡Gracias por su compra!” con el número de factura; con `KIOSCO_IMPRESORA=true` imprime la tirilla.
 - [ ] Sin conexión (apagar el wifi) → “Autoservicio no disponible, acérquese a la caja”.
 - [ ] `Ctrl+Alt+Shift+K` abre el diálogo de salida; con credenciales de administrador cierra sesión; con 5 intentos fallidos se bloquea (revisa los logs).
@@ -181,16 +191,16 @@ node --env-file=.env.local db/prueba-kiosco-precio.mjs http://127.0.0.1:3000
 - [ ] Pulsarlo otra vez enseguida: trae solo lo modificado (1–2 peticiones) y no cambia nada.
 - [ ] Con una sincronización en curso, abrir **Clientes** en otro navegador y pulsar el botón → mensaje "Ya hay una sincronización en curso".
 - [ ] Reiniciar el contenedor a mitad (`dc restart app`): después de ~3 minutos la pantalla dice *Interrumpida* y **Retomar sincronización** continúa desde la página donde iba.
-- [ ] Caja: escribir 2 letras → no busca; escribir 3 → máximo 10 resultados; un cliente **inactivo** no aparece.
-- [ ] Caja: escribir una cédula completa de un cliente creado **hoy** en Siigo (no está en el POS) → "Buscando en Siigo…" y aparece; en **Admin → Logs** (tipo sync) queda la búsqueda con el documento como `***123`.
-- [ ] Elegir un cliente sincronizado: el checkout se llena solo; con **Crédito FECP** y un cliente con cédula/NIT, correo y dirección → se factura con vencimiento.
-- [ ] Como cajero: abrir `/admin/clientes` → te devuelve a la caja. Como kiosco (rol cliente): `/api/customers?q=123456` → 403.
+- [ ] Caja: un cliente **inactivo** en Siigo no se ofrece (se trata como no encontrado).
+- [ ] Caja: escribir la cédula completa de un cliente creado **hoy** en Siigo (no está en el POS) → aparece (consulta en vivo de un intento, 4 s); en **Admin → Logs** (tipo sync) queda la búsqueda con el documento como `***123`.
+- [ ] Elegir un cliente sincronizado: se factura sin pedir datos (si le faltan, solo esos); con **Crédito FECP** y un cliente con cédula/NIT, correo y dirección → se factura con vencimiento.
+- [ ] Como cajero: abrir `/admin/clientes` → te devuelve a la caja. Como kiosco (rol cliente): `/api/customers?identification=123456` → 403.
 - [ ] El cliente **Consumidor final** sigue igual.
 - [ ] **Regresión de privacidad del kiosco** (córrela siempre que se toque `src/app/api/customers`, `src/lib/kiosk.ts` o la tirilla del kiosco):
   ```powershell
   node --env-file=.env.local db/prueba-kiosco-clientes.mjs http://127.0.0.1:3000
   ```
-  Termina con `RESULTADO: OK` y código 0. Comprueba que el rol *cliente* recibe **403** en `/api/customers` (con y sin `live=1`) y en `/api/admin/clientes/sync`, que el cobro del kiosco con la cédula de un cliente existente **no lo modifica ni devuelve sus datos**, y que la tirilla del kiosco solo muestra `***` + 3 dígitos. Borra todo lo que crea.
+  Termina con `RESULTADO: OK` y código 0. Comprueba que el rol *cliente* recibe **403** en `/api/customers` y en `/api/admin/clientes/sync`; que `POST /api/kiosco/cliente` devuelve **solo datos enmascarados** (y `{"found":false}` idéntico para todo lo demás); que el cobro del kiosco con la cédula de un cliente existente **no lo modifica** aunque el navegador mande otro nombre, id de Siigo o customer_id, ni devuelve sus datos; y que la tirilla del kiosco solo muestra `***` + 3 dígitos. Borra todo lo que crea.
 
 ## 13. Antes de pasar a producción
 - [ ] `RESOLUCION_DIAN_*`, `NEGOCIO_*` y `POS_ADDRESS` completos.

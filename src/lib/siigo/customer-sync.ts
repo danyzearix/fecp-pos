@@ -9,7 +9,7 @@
 //  - La primera vez trae todo; las siguientes piden solo lo modificado/creado desde la última corrida con 1 día de traslape.
 //  - Los logs llevan SOLO conteos: nunca nombres, documentos ni correos.
 import crypto from "node:crypto";
-import { SIIGO_CUSTOMER_SYNC_PER_MINUTE, SIIGO_CUSTOMER_SYNC_YIELD_ABOVE } from "@/config/siigo-map";
+import { SIIGO_CUSTOMER_SYNC_PER_MINUTE, SIIGO_CUSTOMER_SYNC_YIELD_ABOVE, SIIGO_LIVE_LOOKUP_MAX_PER_MINUTE } from "@/config/siigo-map";
 import { PICKER_COLUMNS, type PickerRow } from "../customers";
 import { pool, query } from "../db";
 import { writeLog } from "../log";
@@ -521,14 +521,29 @@ const mask = (id: string) => `***${id.slice(-3)}`;
 
 export type LiveResult =
   | { found: PickerRow; reason?: undefined }
-  | { found: null; reason: "no_existe" | "inactivo" | "no_valido" | "siigo_error" };
+  | { found: null; reason: "no_existe" | "inactivo" | "no_valido" | "siigo_error" | "limite" };
 
-export async function liveLookupCustomer(identification: string, user: { uid: number; name: string }): Promise<LiveResult> {
+/** Espera máxima de la consulta en vivo: si Siigo no responde a tiempo, se trata como "no encontrado". */
+export const LIVE_LOOKUP_TIMEOUT_MS = 4_000;
+
+export async function liveLookupCustomer(identification: string, user: { uid: number; name: string }, opts: { timeoutMs?: number } = {}): Promise<LiveResult> {
   const id = identification.trim();
+  const timeoutMs = opts.timeoutMs ?? LIVE_LOOKUP_TIMEOUT_MS;
   const log = (msg: string, level: "info" | "warn" = "info") => writeLog("sync", `Búsqueda en vivo en Siigo (${mask(id)}): ${msg}`, { level, userId: user.uid });
   if (!ID_RE.test(id) || id === CONSUMIDOR_FINAL_ID) return { found: null, reason: "no_valido" };
+  // Para no pasar de ~100 peticiones por minuto (comparte la ventana con la facturación): si ya van muchas, NO se consulta ni se espera
+  if (siigoRequestsLastMinute() >= SIIGO_LIVE_LOOKUP_MAX_PER_MINUTE) {
+    await log("omitida: demasiadas peticiones a Siigo en el último minuto", "warn");
+    return { found: null, reason: "limite" };
+  }
   try {
-    const data = await siigo<SiigoPage>("GET", `/v1/customers?identification=${encodeURIComponent(id)}&type=Customer`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const data = await Promise.race([
+      siigo<SiigoPage>("GET", `/v1/customers?identification=${encodeURIComponent(id)}&type=Customer`, { timeoutMs }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Siigo no respondió a tiempo")), timeoutMs);
+      }),
+    ]).finally(() => clearTimeout(timer));
     const list = (Array.isArray(data.results) ? data.results : []) as { branch_office?: number }[];
     // Con varias sucursales se usa la principal (branch_office 0), igual que la sincronización
     const pick = list.find((x) => (x.branch_office ?? 0) === 0) ?? list[0];

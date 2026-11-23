@@ -60,3 +60,5 @@ export const SIIGO_MAX_REQUESTS_PER_MINUTE = 90; // límite de Siigo: 100/min po
 export const SIIGO_CUSTOMER_SYNC_PER_MINUTE = 40;
 /** Prioridad baja: si en el último minuto ya van más de estas peticiones (por ejemplo, por facturación), la sincronización espera. */
 export const SIIGO_CUSTOMER_SYNC_YIELD_ABOVE = 60;
+/** Consulta de cliente en vivo (caja y kiosco): si ya van estas peticiones en el último minuto, no se consulta (límite de Siigo: 100/min). */
+export const SIIGO_LIVE_LOOKUP_MAX_PER_MINUTE = 80;

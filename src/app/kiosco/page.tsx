@@ -12,6 +12,7 @@ export default async function KioscoPage() {
   return (
     <KioscoClient
       uvt={pos.uvt}
+      sinTope={pos.consumidorFinalSinTope}
       printer={process.env.KIOSCO_IMPRESORA === "true"}
       defaultState={pos.defaultStateCode}
       defaultCity={pos.defaultCityCode}

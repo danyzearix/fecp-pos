@@ -6,6 +6,9 @@ export function getPosConfig(): PosConfig {
   return {
     prefix: e.NEXT_PUBLIC_CAJA_PREFIX || "C01",
     uvt: Number(e.UVT_VALUE) || 52374,
+    // Res. DIAN 165/2023 art. 11 num. 3.3: se puede facturar a Consumidor final sin importar el monto. false = tope de 5 UVT
+    // (por encima hay que identificar al cliente). Sin la variable se asume true (lo acordado con el cliente).
+    consumidorFinalSinTope: (e.CONSUMIDOR_FINAL_SIN_TOPE ?? "true").trim().toLowerCase() !== "false",
     testMode: e.SIIGO_TEST_MODE === "true",
     defaultStateCode: e.POS_STATE_CODE || "11",
     defaultCityCode: e.POS_CITY_CODE || "11001",

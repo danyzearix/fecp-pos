@@ -38,6 +38,8 @@ export const ID_TYPE_LABELS: Record<string, string> = {
 };
 
 export type CustomerIn = {
+  /** solo del navegador (tirilla provisional sin conexión): el servidor lo ignora */
+  display_name?: string;
   id_type: string;
   identification: string;
   check_digit?: string | null;
@@ -88,6 +90,8 @@ export type PaymentLineView = PayLine;
 export type PosConfig = {
   prefix: string;
   uvt: number;
+  /** true = Consumidor final sin tope de monto (Res. DIAN 165/2023 art. 11 num. 3.3); false = tope de 5 UVT */
+  consumidorFinalSinTope: boolean;
   testMode: boolean;
   defaultStateCode: string;
   defaultCityCode: string;
@@ -105,6 +109,8 @@ export type TicketData = {
   created_at: string; // ISO
   cashier_name: string;
   customer_name: string;
+  /** nombre del tipo de documento ("Cédula de ciudadanía", "NIT"…): va en su propia línea de la tirilla, antes del número */
+  customer_id_type: string;
   customer_identification: string;
   items: { name: string; quantity: number; unit_price: number; line_total: number; tax_rate: number }[];
   subtotal: number;

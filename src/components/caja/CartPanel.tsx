@@ -1,15 +1,12 @@
 "use client";
 
 import { formatCOP, lineAmounts, type CartLine } from "@/lib/money";
-import CustomerPicker, { type CartCustomer } from "./CustomerPicker";
 import { IconTrash } from "./Icons";
 
 type Props = {
   sellerName: string;
   lines: CartLine[];
   totals: { subtotal: number; tax: number; total: number };
-  customer: CartCustomer | null;
-  onCustomer: (c: CartCustomer | null) => void;
   onQty: (productId: number, delta: number) => void;
   onRemove: (productId: number) => void;
   onClear: () => void;
@@ -45,10 +42,6 @@ export default function CartPanel(p: Props) {
         <div>
           <div className={LABEL}>Vendedor</div>
           <div className={VALUE_BOX}>{p.sellerName}</div>
-        </div>
-        <div>
-          <div className={LABEL}>Cliente</div>
-          <CustomerPicker customer={p.customer} onChange={p.onCustomer} />
         </div>
       </div>
 

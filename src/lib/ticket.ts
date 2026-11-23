@@ -2,7 +2,7 @@
 // Se usa cuando el servidor no está disponible. Es código puro (sirve en navegador y servidor).
 import { cartTotals, lineAmounts, round2, type CartLine } from "./money";
 import { bogotaDay, joinedReference, saleMethodOf, validatePaymentLines, type PayLineIn } from "./payment-lines";
-import { CONSUMIDOR_FINAL_ID, type PaymentLineView, type SaleIn, type SaleItemIn, type TicketData } from "./sale-types";
+import { CONSUMIDOR_FINAL_ID, ID_TYPE_LABELS, type PaymentLineView, type SaleIn, type SaleItemIn, type TicketData } from "./sale-types";
 
 export const itemToLine = (i: SaleItemIn): CartLine => ({
   productId: i.product_id,
@@ -17,10 +17,11 @@ export const itemToLine = (i: SaleItemIn): CartLine => ({
 
 export function customerDisplay(c: SaleIn["customer"]) {
   if (!c || c.identification === CONSUMIDOR_FINAL_ID) {
-    return { name: "Consumidor final", identification: CONSUMIDOR_FINAL_ID };
+    return { name: "Consumidor final", idType: ID_TYPE_LABELS["13"], identification: CONSUMIDOR_FINAL_ID };
   }
-  const name = c.company_name || [c.first_name, c.last_name].filter(Boolean).join(" ") || c.identification;
-  return { name, identification: c.identification };
+  // display_name: el nombre completo que mostró la búsqueda (la venta solo manda tipo y número de un cliente que ya existe)
+  const name = c.display_name || c.company_name || [c.first_name, c.last_name].filter(Boolean).join(" ") || c.identification;
+  return { name, idType: ID_TYPE_LABELS[c.id_type] ?? c.id_type, identification: c.identification };
 }
 
 /** Líneas de pago de una venta del navegador (formato nuevo o el viejo de la cola local), con cambio y vencimiento. */
@@ -54,6 +55,7 @@ export function buildTicketFromSale(sale: SaleIn, cashierName: string): TicketDa
     created_at: sale.created_at_device,
     cashier_name: cashierName,
     customer_name: cust.name,
+    customer_id_type: cust.idType,
     customer_identification: cust.identification,
     items: lines.map((l) => ({
       name: l.name,

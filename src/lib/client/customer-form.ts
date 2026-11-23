@@ -1,5 +1,6 @@
 // Reglas del formulario de cliente compartidas por la caja (CheckoutModal) y el kiosco.
-// Mismas reglas fiscales: checkout CORTO (datos opcionales) hasta 5 UVT de base sin IVA; COMPLETO por encima.
+// El kiosco usa el formulario COMPLETO para registrar a un cliente NUEVO (campos en blanco). Ya no se decide "corto/completo" por el monto:
+// sin cédula = Consumidor final; con cédula = cliente identificado (ver README §11f). La rama "corto" queda por compatibilidad.
 import dane from "@/config/dane.json";
 import { CONSUMIDOR_FINAL_ID, type CustomerIn } from "../sale-types";
 

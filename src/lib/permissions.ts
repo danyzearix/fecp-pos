@@ -76,6 +76,7 @@ export const API_BY_ROLE: Record<Role, ApiRule[]> = {
   cliente: [
     ["GET", /^\/api\/kiosco\/catalogo$/],
     ["GET", /^\/api\/kiosco\/ping$/],
+    ["POST", /^\/api\/kiosco\/cliente$/], // consulta del cliente por su cédula: el servidor responde SOLO con datos enmascarados
     ["POST", /^\/api\/kiosco\/salir$/],
     ["GET", new RegExp(`^/api/kiosco/pagos/${UUID}/ticket$`)],
     ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/hooks$`)],

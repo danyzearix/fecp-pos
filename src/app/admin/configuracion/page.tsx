@@ -166,7 +166,11 @@ export default async function ConfiguracionPage() {
           rows={[
             ["Prefijo de caja", cfg.prefix],
             ["UVT_VALUE", String(cfg.uvt)],
-            ["Límite checkout corto (5 UVT)", String(5 * cfg.uvt)],
+            ["5 UVT (base sin IVA)", String(5 * cfg.uvt)],
+            [
+              "CONSUMIDOR_FINAL_SIN_TOPE",
+              cfg.consumidorFinalSinTope ? "true — Consumidor final sin tope de monto" : "false — por encima de 5 UVT se debe identificar al cliente",
+            ],
             ["POS_ADDRESS", env("POS_ADDRESS") || "✗ FALTA"],
             ["POS_STATE_CODE / POS_CITY_CODE", `${cfg.defaultStateCode} / ${cfg.defaultCityCode}`],
             ["COOKIE_SECURE", env("COOKIE_SECURE") || "false"],

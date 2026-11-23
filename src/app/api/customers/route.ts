@@ -1,56 +1,38 @@
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
-import { isInactiveCustomer, MAX_SEARCH_RESULTS, MIN_SEARCH_CHARS, searchCustomers } from "@/lib/customers";
+import { cajaCustomerView, ID_FORMAT, lookupCustomerByIdentification } from "@/lib/customer-lookup";
 import { rateLimited } from "@/lib/rate-limit";
-import { liveLookupCustomer } from "@/lib/siigo/customer-sync";
 
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "Cache-Control": "no-store" };
-/** Consultas en vivo a Siigo por usuario y por minuto (comparten el límite de Siigo con la facturación) */
-const LIVE_MAX_PER_MINUTE = 12;
+/** Consultas por usuario y por minuto (las que no están en la copia local gastan una petición a Siigo) */
+const LOOKUPS_PER_MINUTE = 20;
 
 /**
- * GET /api/customers?q=…  → busca clientes ACTIVOS por identificación (empieza por…) o por nombre. Mínimo 3 caracteres, máximo 10 resultados.
- * SOLO admin y cajero (tabla de permisos + comprobación aquí). El rol cliente (kiosco) NUNCA puede leer, buscar ni autocompletar clientes.
- *
- * GET /api/customers?q=<cédula exacta>&live=1  → si esa identificación NO está en la copia local, la consulta en Siigo (solo lectura),
- * la guarda y la devuelve. Límite por usuario: 12 por minuto.
+ * GET /api/customers?identification=<número de documento>  → CAJA (admin y cajero). Búsqueda por documento COMPLETO (sin parciales).
+ * Primero en la tabla local (sincronizada con Siigo); si no está, un solo intento en vivo a Siigo (4 s; si falla = "no encontrado").
+ * Responde nombre completo, tipo y número de documento; el correo y el teléfono van SIEMPRE ofuscados (d***@gmail.com, 300***1234)
+ * y se indica qué datos obligatorios le faltan. El rol cliente (kiosco) NO usa esta ruta (403): tiene la suya, con máscara total.
  */
 export async function GET(req: Request) {
   const g = await guardApi(req);
   if (!g.ok) return g.res;
   if (g.user.role !== "admin" && g.user.role !== "cajero") return NextResponse.json({ error: "Sin permiso" }, { status: 403 });
 
-  const url = new URL(req.url);
-  const q = (url.searchParams.get("q") ?? "").trim();
-  if (q.length < MIN_SEARCH_CHARS) {
-    return NextResponse.json({ error: `Escribe al menos ${MIN_SEARCH_CHARS} caracteres para buscar`, customers: [] }, { status: 400, headers: NO_STORE });
+  const id = (new URL(req.url).searchParams.get("identification") ?? "").trim();
+  if (!ID_FORMAT.test(id)) return NextResponse.json({ error: "Escribe el número de documento completo", found: false }, { status: 400, headers: NO_STORE });
+  if (rateLimited(`cust-lookup:${g.user.uid}`, LOOKUPS_PER_MINUTE, 60_000)) {
+    return NextResponse.json({ error: "Demasiadas consultas seguidas. Espera un momento.", found: false }, { status: 429, headers: NO_STORE });
   }
 
-  const customers = (await searchCustomers(q)).slice(0, MAX_SEARCH_RESULTS);
-  const live = url.searchParams.get("live") === "1";
-  const exactLocal = customers.some((c) => c.identification === q);
-  if (!live || exactLocal) return NextResponse.json({ customers }, { headers: NO_STORE });
-
-  // ---- Búsqueda en vivo en Siigo: solo para una identificación exacta que no está en la copia local ----
-  if (!/^[0-9A-Za-z-]{5,20}$/.test(q)) return NextResponse.json({ customers }, { headers: NO_STORE });
-  if (await isInactiveCustomer(q)) {
-    return NextResponse.json({ customers, notice: "Este cliente está inactivo en Siigo." }, { headers: NO_STORE });
-  }
-  if (rateLimited(`cust-live:${g.user.uid}`, LIVE_MAX_PER_MINUTE, 60_000)) {
-    return NextResponse.json(
-      { customers, error: "Demasiadas consultas a Siigo seguidas. Espera un momento o registra al cliente al cobrar." },
-      { status: 429, headers: NO_STORE }
-    );
-  }
-  const r = await liveLookupCustomer(q, { uid: g.user.uid, name: g.user.name });
-  if (r.found) return NextResponse.json({ customers: [r.found, ...customers], live: true }, { headers: NO_STORE });
+  const r = await lookupCustomerByIdentification(id, { uid: g.user.uid, name: g.user.name });
+  if (r.found) return NextResponse.json({ found: true, customer: cajaCustomerView(r.row, r.source) }, { headers: NO_STORE });
   const notice =
     r.reason === "inactivo"
       ? "Este cliente está inactivo en Siigo."
-      : r.reason === "siigo_error"
-        ? "No se pudo consultar a Siigo. Se podrá registrar al cobrar."
-        : "No está en Siigo. Se podrá registrar al cobrar.";
-  return NextResponse.json({ customers, notice, live: true }, { headers: NO_STORE });
+      : r.reason === "siigo_error" || r.reason === "limite"
+        ? "No se pudo consultar a Siigo; se trata como no encontrado."
+        : "";
+  return NextResponse.json({ found: false, reason: r.reason, notice }, { headers: NO_STORE });
 }
