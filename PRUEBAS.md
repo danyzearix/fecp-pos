@@ -163,6 +163,71 @@ Abre la app por **`http://127.0.0.1:3000`** (no `localhost`). Tarjeta de prueba 
 
 ---
 
+### Pantalla de elección, intentos y estados (kiosco y caja) — con `EPAYCO_TEST_MODE=true`
+- [ ] Kiosco: tras los datos del cliente aparece **«¿Cómo desea pagar?»** con dos botones **del mismo tamaño**, la advertencia **«Escanee con la cámara del celular, NO desde la app de su banco»** bajo el del QR y *Volver* / *Cancelar compra*. **Todavía no** hay venta ni ventana de ePayco (en *Admin → Ventas* no aparece nada hasta elegir).
+- [ ] **Cerrar la ventana de ePayco** sin pagar: pasa a «Verificando su pago con ePayco…» (sin «Abrir el pago de nuevo» ni QR, *Cancelar compra* deshabilitado) y en ≤ 15 s a **«Pago cancelado»** («Usted canceló el pago. No se hizo ningún cobro.»). **Intentar de nuevo** vuelve a la elección («Intento 2»); en los logs el nuevo intento sale con referencia `K01-…-2`.
+- [ ] **Cancelar** dentro del checkout de ePayco (botón de ePayco): igual que arriba, nunca dice «rechazado».
+- [ ] Tarjeta de prueba **rechazada** (ver arriba): «El pago fue rechazado» con *Intentar de nuevo* / *Cancelar*.
+- [ ] **PSE pendiente** (elige PSE de prueba y no completes el pago en el banco): «Su pago está en proceso — No lo repita…», solo *Seguir esperando* y *Cancelar compra*. Al pulsar *Cancelar compra* avisa «Si ya realizó el pago, no se perderá…»; la venta queda en **Pagos por revisar**. Si en cambio completas el pago en el banco, la pantalla pasa sola a «¡Gracias por su compra!» y se factura una sola vez.
+- [ ] **Webhook retrasado:** paga con tarjeta aprobada y cierra la pestaña antes de que vuelva; en ≤ ~30 s la venta aparece **Facturada** en *Ventas* sin intervención (consulta activa). Si no, revisa *Admin → Logs* (tipo pago, «consulta activa») y `EPAYCO_POLL_SECONDS`.
+- [ ] **QR:** *Pagar con mi celular* muestra el QR y la advertencia; escanea con la **cámara** (no con la app del banco), paga: el kiosco avanza solo. Si el celular recibe un rechazo, el enlace dice «puede intentarlo» y el intento nuevo lleva referencia nueva; con un pago pendiente el enlace dice «en proceso, no lo repita».
+- [ ] Caja: **Pago electrónico → Cobrar con ePayco** muestra «¿Cómo se va a cobrar?» (*Mostrar QR al cliente* / *Cobrar en esta pantalla*) con los mismos estados.
+- [ ] Inactividad en la pantalla «Pago cancelado» o en la elección tras un reintento (3 min): el kiosco vuelve al inicio y la venta queda cancelada.
+- [ ] Cerrar la ventana de ePayco **sin ninguna señal** (ni pago ni cancelación): tras 15 s → «No recibimos confirmación de su pago. ¿Completó el pago?» con **dos botones del mismo tamaño** («Sí, ya pagué (esperar)» / «No, intentar de nuevo») y *Cancelar compra*. «No, intentar de nuevo» abre un intento nuevo; «Sí, ya pagué» pasa a «Su pago está en proceso».
+- [ ] QR: mientras el celular **no** haya abierto el enlace se puede «Cambiar forma de pago»; cuando el celular abre `/pagar/<código>` la pantalla dice «Este pago se abrió en un celular. Termine el pago allí o cancele la compra.» y ya no ofrece cambiar.
+- [ ] Inactividad (3 min) en «en proceso» o «¿Completó el pago?»: el kiosco vuelve al inicio y la venta aparece en **Pagos por revisar** (no cancelada).
+- [ ] **Reportes:** una venta electrónica en espera o rechazada no suma en *Total recaudado*, *Total facturado* ni en el cuadre de efectivo.
+- [ ] Controles ≥ 44 px, sin scroll horizontal y buen contraste en modo oscuro (360, 768, 1024 y 1366 px).
+
+## 12b-real. Prueba real de ePayco (producción)
+
+> Hazla **tú**, con dinero real de **bajo valor** (el producto más barato), con `EPAYCO_TEST_MODE=false` y las llaves de producción. Nada de esto se pudo verificar contra ePayco real durante el desarrollo: estos pasos confirman los supuestos que quedaron abiertos. Anota el número de compra (`K01-000123`) de cada paso. En el servidor las consultas SQL se corren así (cambia la consulta entre las comillas):
+> ```bash
+> dc exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT ..."'
+> ```
+> (En tu PC: `& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -d fecp_pos -c "SELECT ..."`.)
+
+**Consultas que se repiten en cada paso** (reemplaza `K01-000123`):
+```sql
+-- Estado de la venta
+SELECT local_number, status, payment_status, payment_failure_reason, invoice_name, payment_expires_at
+  FROM sales WHERE local_number = 'K01-000123';
+
+-- Intentos de pago (referencia enviada a ePayco, estado, evidencia, QR abierto)
+SELECT attempt_no, invoice, channel, status, ref_payco, webhook_at, qr_opened_at, checks, created_at, closed_at
+  FROM payment_attempts WHERE sale_id = (SELECT id FROM sales WHERE local_number = 'K01-000123') ORDER BY attempt_no;
+
+-- Referencias de ePayco procesadas y su resultado
+SELECT ref_payco, outcome, reason, source, started_at, finished_at
+  FROM payment_refs WHERE sale_id = (SELECT id FROM sales WHERE local_number = 'K01-000123') ORDER BY started_at;
+
+-- Línea de tiempo (para medir cuánto tardó la factura): hooks, verificaciones, webhook, pago y factura
+SELECT created_at, type, message FROM logs WHERE message LIKE '%K01-000123%' OR detail::text LIKE '%K01-000123%' ORDER BY id;
+```
+
+**a) Cerrar la ventana sin pagar → «¿Completó el pago?»**
+1. En el kiosco arma una compra, elige **Pagar en esta pantalla** y cierra la ventana de ePayco sin pagar ni cancelar.
+2. Esperado: «Verificando su pago con ePayco…» y, a los ~15 s, **«No recibimos confirmación de su pago. ¿Completó el pago?»** (si en cambio sale «Pago cancelado», ePayco informó la cancelación: también es correcto; anótalo).
+3. SQL: el intento 1 debe estar `abierto`, con **`ref_payco` vacío** (sin evidencia). Pulsa **No, intentar de nuevo** → intento 2 `abierto` y el 1 `reemplazado`.
+
+**b) Cancelar dentro de ePayco → «Intentar de nuevo» con referencia `-2`**
+1. Pagar en pantalla; dentro del checkout de ePayco pulsa **Cancelar**.
+2. Esperado: «Pago cancelado» («Usted canceló el pago. No se hizo ningún cobro.»). Pulsa **Intentar de nuevo** → elige **Pagar en esta pantalla**.
+3. **Lo importante:** ePayco debe abrir el checkout sin error. SQL: el intento 2 con `invoice = 'K01-000123-2'`. Si ePayco rechaza el sufijo («invoice no válido», error al crear la sesión), anótalo: hay que cambiar el formato de la referencia. Completa el pago con tarjeta y confirma que la factura sale una sola vez y el intento 2 queda `aprobado`; en `payment_refs` la referencia aprobada debe corresponder al invoice `K01-000123-2` (columna `detail` → `invoice`).
+
+**c) PSE: cerrar la ventana antes de volver al comercio**
+1. Pagar en pantalla con **PSE**; en el banco aprueba el pago y **cierra la ventana de ePayco antes** de que regrese al kiosco.
+2. SQL **mientras esperas**: ¿el intento tiene `ref_payco`? Anota **sí/no** — es la prueba clave: si es **sí**, el servidor puede consultar a ePayco por su cuenta; si es **no**, solo el webhook salvará el caso.
+3. Mide con la línea de tiempo (consulta 4) el tiempo entre el cierre de la ventana y el log «Pago de K01-000123: PAGADO», y hasta la factura. Esperado: pantalla «Su pago está en proceso» (con evidencia) o «¿Completó el pago?» (sin ella); si eliges «Sí, ya pagué», debe facturar sola en `EPAYCO_POLL_SECONDS` (20 s) tras llegar el pago, sin repetir el cobro.
+4. Anota también: ¿llegó el webhook? (`webhook_at` del intento) y ¿cuántas consultas activas hubo? (`checks`).
+
+**d) QR con la cámara del celular**
+1. Elige **Pagar con mi celular (QR)**; escanea con la **cámara** (no desde la app del banco) y paga con tarjeta.
+2. Esperado: al abrir el enlace, el kiosco dice «Este pago se abrió en un celular…» y ya no deja cambiar de forma de pago; al aprobarse, el kiosco **avanza solo** a «¡Gracias por su compra!».
+3. SQL: `qr_opened_at` con fecha en el intento QR, `status = 'aprobado'`; la venta `invoiced`.
+
+Al terminar, borra o anula en Siigo las facturas de prueba y **reembolsa en el panel de ePayco** los cobros de estos pasos si no fueron ventas reales.
+
 ## 12c. Seguridad de precios
 
 ### Regresión del KIOSCO (hay que correrla siempre que se toque `src/lib/kiosk.ts` o el cobro electrónico)

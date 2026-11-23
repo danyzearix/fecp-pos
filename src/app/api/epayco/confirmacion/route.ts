@@ -1,5 +1,6 @@
 import { after, NextResponse } from "next/server";
 import { query } from "@/lib/db";
+import { markWebhook } from "@/lib/epayco/attempts";
 import { expectedSignature, EpaycoError, isShortRef, signatureMatches } from "@/lib/epayco/adapter";
 import { publicModeEnabled } from "@/lib/epayco/config";
 import { PaymentInputError, processPayment, recordWebhookHint } from "@/lib/epayco/process";
@@ -78,12 +79,19 @@ async function handle(req: Request) {
     return new NextResponse("Firma inválida", { status: 400 });
   }
 
-  const sale = await query<{ id: string }>("SELECT id FROM sales WHERE local_number = $1 AND source IN ('kiosco','caja') AND payment_method = 'epayco'", [invoice]);
+  const sale = await query<{ id: string }>(
+    `SELECT s.id FROM sales s
+      WHERE s.source IN ('kiosco','caja') AND s.payment_method = 'epayco'
+        AND (s.local_number = $1 OR EXISTS (SELECT 1 FROM payment_attempts a WHERE a.sale_id = s.id AND a.invoice = $1))
+      LIMIT 1`,
+    [invoice]
+  );
   if (!sale.rows[0]) {
     await writeLog("pago", `Webhook ePayco para un invoice desconocido (${invoice})`, { level: "warn", detail: seen });
     return new NextResponse("OK", { status: 200 }); // 200 para que no reintente eternamente
   }
   const saleId = sale.rows[0].id;
+  await markWebhook(invoice).catch(() => {}); // evidencia de pago para ese intento (aunque luego no se pueda consultar)
   await writeLog("pago", `Webhook ePayco recibido para ${invoice}`, { detail: { sale_id: saleId, ...seen } });
 
   // Sin referencia larga no se puede consultar a ePayco: solo se deja constancia del aviso firmado (no se decide nada)

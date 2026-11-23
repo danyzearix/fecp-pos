@@ -370,3 +370,37 @@ CREATE TABLE IF NOT EXISTS customer_sync_runs (
 );
 ALTER TABLE customer_sync_runs ADD COLUMN IF NOT EXISTS changes JSONB NOT NULL DEFAULT '{}'::jsonb; -- qué columnas cambiaron en los actualizados (solo conteos: {"email": 3, "address": 1})
 CREATE UNIQUE INDEX IF NOT EXISTS uq_customer_sync_running ON customer_sync_runs ((TRUE)) WHERE status = 'running';
+
+-- ============================================================================
+-- Pago electrónico por INTENTOS. Cada vez que el cliente elige cómo pagar (QR o en pantalla) se abre un intento con su propia
+-- referencia hacia ePayco (la 1.ª es el número de compra; las siguientes llevan sufijo: K01-000123-2). Todos son de la misma venta.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS payment_attempts (
+  id            SERIAL PRIMARY KEY,
+  sale_id       UUID NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  attempt_no    INTEGER NOT NULL,
+  invoice       TEXT NOT NULL,                  -- referencia (x_id_invoice) que se manda a ePayco en este intento
+  channel       TEXT NOT NULL,                  -- 'pantalla' | 'qr'
+  session_id    TEXT,
+  -- abierto | pendiente | aprobado | rechazado | cancelado | vencido | reemplazado | por_revisar
+  status        TEXT NOT NULL DEFAULT 'abierto',
+  ref_payco     TEXT,                           -- referencia LARGA conocida (la trae el navegador o el webhook): permite la consulta activa
+  reason        TEXT,                           -- motivo legible (sin datos de tarjeta)
+  checks        INTEGER NOT NULL DEFAULT 0,     -- cuántas consultas activas a ePayco se hicieron
+  last_check_at TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at     TIMESTAMPTZ,
+  UNIQUE (sale_id, attempt_no),
+  UNIQUE (invoice)
+);
+CREATE INDEX IF NOT EXISTS idx_payment_attempts_open ON payment_attempts (status) WHERE status IN ('abierto','pendiente');
+-- payment_refs: un pago cancelado por el cliente se anota aparte del rechazado por el banco
+ALTER TABLE payment_refs DROP CONSTRAINT IF EXISTS payment_refs_outcome_check;
+ALTER TABLE payment_refs ADD CONSTRAINT payment_refs_outcome_check CHECK (outcome IN ('procesando','aprobado','rechazado','cancelado','por_revisar','tardio','duplicado'));
+
+-- Evidencia de pago en curso y QR abierto en un celular (ver src/lib/epayco/attempts.ts).
+--   webhook_at:   llegó (y estaba firmado) cualquier aviso de ePayco con la referencia de este intento
+--   qr_opened_at: se abrió la página /pagar/<código> en un celular para este intento
+-- "Evidencia" = ref_payco conocido, estado pendiente en ePayco o aviso del webhook. Con evidencia el servidor NO deja abrir otro intento.
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS webhook_at   TIMESTAMPTZ;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS qr_opened_at TIMESTAMPTZ;

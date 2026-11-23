@@ -72,6 +72,7 @@ Abre `.env.local` y completa los valores. **Nunca subas este archivo a un reposi
 | `EPAYCO_SIIGO_PAYMENT_ID` | Id de la forma de pago “ePayco” en Siigo. `5798` solo sirve para pruebas (ver sección 11) |
 | `APP_PUBLIC_URL` | Dominio público con HTTPS (solo en el deploy). Vacío = modo local: sin webhook y sin QR de pago |
 | `EPAYCO_CONFIRMATION_URL`, `EPAYCO_RESPONSE_URL` | Opcionales. Por defecto salen de `APP_PUBLIC_URL` / de la propia pantalla |
+| `EPAYCO_POLL_SECONDS` | Cada cuántos segundos el servidor consulta a ePayco por su cuenta los cobros que siguen esperando (**20** por defecto; mínimo 5; `0` = apagada). Ver §10b |
 | `KIOSCO_IMPRESORA` | `true` = el kiosco imprime la tirilla al terminar · `false` = solo muestra el número de factura |
 
 > ⚠️ **`SIIGO_TEST_MODE=true` sigue creando documentos en la contabilidad real de Siigo** (no electrónicos, “PRUEBA POS - ELIMINAR”).
@@ -206,7 +207,7 @@ Hay dos puertas de entrada y **el mismo camino de verificación**:
 
 Flujo (siempre igual):
 
-1. El navegador **solo manda productos y cantidades**. El servidor calcula precios, IVA y total desde la base de datos, guarda la venta en **`esperando_pago`** y crea la sesión de cobro en ePayco. El cobro vence a los **10 minutos**.
+1. Primero la persona **elige cómo pagar** (§10b). El navegador **solo manda productos y cantidades**. El servidor calcula precios, IVA y total desde la base de datos, guarda la venta en **`esperando_pago`**, abre el **intento 1** y, si eligió pagar en pantalla, crea la sesión de cobro en ePayco (con QR, la crea el celular). El cobro vence a los **10 minutos**.
 2. El cliente paga por **un solo canal a la vez** (ver *Canales de pago* abajo): con el **QR** en su celular (`/pagar/<código>`) o **en esta pantalla** (checkout *onpage* de ePayco). Al terminar, ePayco devuelve al navegador con `?ref_payco=…`.
 3. Ese `ref_payco` es **solo una pista**: el **servidor** consulta a ePayco por su cuenta y exige: `x_cod_response = 1` (aprobada), `x_id_invoice` igual a nuestra venta, `x_amount` igual al total de la base de datos, moneda COP, `x_test_request` coherente con `EPAYCO_TEST_MODE` y firma válida (`P_CUST_ID_CLIENTE` + `P_KEY`).
 4. Solo entonces la venta pasa a **`pagado`** y se factura en Siigo con el mismo flujo de siempre (sección 14). **Nunca** se marca pagada porque el navegador volvió a una página de “éxito”.
@@ -218,24 +219,66 @@ Estados de una venta electrónica:
 |---|---|---|
 | `esperando_pago` | Cobro creado, sin pago confirmado | No |
 | `pagado` | Pago verificado por el servidor | Sí, enseguida |
-| `pago_fallido` | Rechazado, vencido o no se pudo crear el cobro | No |
+| `pago_fallido` | Venció el tiempo, el cliente canceló la compra o no se pudo crear el cobro (un rechazo o una cancelación de UN intento **no** la cierra: la venta sigue esperando y se puede reintentar) | No |
 | `pago_por_revisar` | La verificación falló o algo no coincide (monto, factura, firma, formato inesperado…) | **No** — decide un admin |
 | `pago_tardio` | Se aprobó **después** de vencer el cobro | **No** — decide un admin |
 
-Pendiente ≠ fallido: si ePayco dice “pendiente”, el cobro sigue esperando. “Rechazada” es definitiva: “intentar de nuevo” crea una venta nueva.
+Pendiente ≠ fallido: si ePayco dice “pendiente”, el cobro sigue esperando y **no se puede abrir otro intento**. “Rechazada” o “Cancelada” cierran solo ese **intento**; “Intentar de nuevo” abre otro intento de la **misma venta** (§10b).
 
 ### Canales de pago (uno a la vez)
 
 | | Caja | Kiosco |
 |---|---|---|
-| Predeterminado | **Pagar con el celular (QR)** | **Pagar en esta pantalla** |
-| Secundario | Botón **Pagar en esta pantalla** | Botón **Pagar con el celular (QR)** (cuando la ventana de ePayco está cerrada) |
+| Cómo se elige | **Siempre** en la pantalla *¿Cómo se va a cobrar?* (*Mostrar QR al cliente* / *Cobrar en esta pantalla*) | **Siempre** en la pantalla *¿Cómo desea pagar?* (los dos botones, del mismo tamaño) |
+| Cambiar después | Desde el QR: *Cambiar forma de pago* (reemplaza el intento abierto) | Igual |
 
 - Sin `APP_PUBLIC_URL` solo existe **en pantalla** (un celular no puede abrir `127.0.0.1`).
 - El canal vive en la base de datos (`sales.pay_channel`) y lo hacen cumplir los endpoints: con QR **no** se abre el checkout en la pantalla; con "en pantalla" el enlace `/pagar/<código>` **deja de servir** y muestra *“Este cobro fue cambiado, pide uno nuevo en caja”*. Cada cambio queda en los logs (tipo `pago`).
 - **Doble pago:** si aun así llegan dos pagos aprobados para la misma venta (p. ej. alguien ya estaba pagando por el canal anterior), el primero se procesa normal y el segundo **no se factura**: queda con el motivo *“Pago duplicado de la venta X, reembolsar”* en **Pagos por revisar → Pagos duplicados**.
 
 Los reportes **no cuentan** `esperando_pago`, `pago_fallido`, `pago_por_revisar` ni `pago_tardio` en “recaudado” ni “facturado”; los pagos por revisar salen en una línea aparte con un enlace al panel.
+
+### 10b. Pantalla de elección, intentos y consulta activa
+
+**Pantalla de elección (kiosco y caja, el MISMO componente).** Antes de abrir nada se pregunta **«¿Cómo desea pagar?»** con dos botones grandes, táctiles y de **exactamente el mismo tamaño** (no se prioriza ninguno):
+- **Pagar con mi celular (QR)** — «Escanee el código con la CÁMARA de su celular», con un recuadro de advertencia con icono: **«Escanee con la cámara del celular, NO desde la app de su banco»** (la misma advertencia se muestra junto al QR). Genera el QR de `/pagar/<código>`. Si no hay dominio público (`APP_PUBLIC_URL`), el botón queda deshabilitado.
+- **Pagar en esta pantalla (tarjeta o PSE)** — «Se abrirá la ventana segura de ePayco».
+- En la caja los textos son *Mostrar QR al cliente* / *Cobrar en esta pantalla*. *Volver* regresa sin perder el carrito; *Cancelar compra* siempre está a la mano.
+**No se crea la venta ni la sesión de ePayco ni se abre ninguna ventana hasta que se elige un botón.**
+
+**Intentos.** Cada vez que se elige se abre un **intento** de pago de la misma venta (tabla `payment_attempts`: número, referencia, canal, estado, fechas; nunca datos de tarjeta). Cada intento tiene su **propia referencia hacia ePayco** (`x_id_invoice`): el intento 1 usa el número de compra (`K01-000123`, como siempre) y los siguientes llevan sufijo (`K01-000123-2`, `-3`…) para no reutilizar una transacción cancelada o rechazada. El webhook y la verificación aceptan la referencia de cualquier intento y los asocian a la misma venta. Estados de un intento: `abierto`, `pendiente`, `aprobado`, `rechazado`, `cancelado`, `vencido`, `reemplazado`, `por_revisar`. Reglas que hace cumplir el **servidor** (no solo la pantalla):
+- una venta **pagada, vencida o cancelada** no abre otro intento (409);
+- con un intento **pendiente** (p. ej. PSE) o **aprobado** no se puede abrir otro (409), ni por cambio de canal ni con `replace`;
+- con un intento **abierto** sin resultado solo se abre otro si se pide reemplazarlo (cambiar de QR a pantalla, o la ventana de ePayco nunca se abrió); el anterior queda `reemplazado`.
+El historial de intentos se ve por venta (base de datos y *Admin → Pagos por revisar*).
+
+**Evidencia de pago** (lo decide el servidor, no solo la pantalla). Un intento tiene evidencia si (a) ya se conoce su **`ref_payco`** (la mandó el navegador desde los hooks o la URL de regreso, o llegó en el webhook), (b) ePayco reportó estado **pendiente**, o (c) llegó **cualquier webhook firmado** con su referencia (`payment_attempts.webhook_at`). Reglas:
+- **Con evidencia**, el servidor responde **409** (`evidencia`) a cualquier intento nuevo o cambio de canal, aunque se pida `replace`: el pago puede estar en camino.
+- **Sin evidencia**, un intento abierto sí se puede reemplazar (`No, intentar de nuevo`), **salvo** que su QR ya se haya abierto en un celular.
+- **QR abierto en un celular:** al abrirse `/pagar/<código>` (o crearse su sesión) se guarda `payment_attempts.qr_opened_at`. Desde entonces el servidor responde **409** (`qr_abierto`) a reemplazar ese intento: «Este pago se abrió en un celular. Termine el pago allí o cancele la compra.» (si un navegador de vista previa de enlaces abre el enlace, también cuenta: es la opción segura).
+- **Inactividad del kiosco (3 min)** en «en proceso» o «¿Completó el pago?»: la venta queda en **`pago_por_revisar`** (no `pago_fallido`) y el intento **se conserva**; la consulta activa lo sigue verificando hasta que venza el cobro. Si el pago se aprueba, queda por revisar (decide un admin); si ePayco confirma que fue rechazado o cancelado y no hay otro intento vivo, la venta pasa a `pago_fallido`. En la elección o tras un rechazo/cancelación, la inactividad **cancela** la venta.
+- **Nada queda abierto indefinidamente:** la tarea de fondo (cada `EPAYCO_POLL_SECONDS`) **vence** los cobros que pasaron de 10 minutos aunque nadie los consulte y **cancela** (`pago_fallido`, «cancelada») las ventas cuyo último intento fue rechazado o cancelado y nadie volvió a elegir en **5 minutos**. En la caja, al cerrar el modal con un cobro rechazado/cancelado también se cancela al instante. Con `EPAYCO_POLL_SECONDS=0` esa tarea queda apagada (los cobros solo vencen al consultarlos).
+- Las ventas en `esperando_pago` (incluidas las que tuvieron un rechazo) **no** cuentan en *Total recaudado*, *Total facturado* ni en el cuadre de efectivo; `pago_por_revisar` y `pago_tardio` salen en *Admin → Pagos por revisar* y en el contador del menú.
+
+**Pantallas tras elegir** (todas con un camino de *Cancelar compra*):
+| Situación | Pantalla |
+|---|---|
+| La persona cierra la ventana de ePayco **sin resultado** | **«Verificando su pago con ePayco…»** con indicador de carga y *Cancelar compra* deshabilitado. **No** ofrece «Abrir el pago de nuevo» ni QR. Consulta al servidor cada 2,5 s durante máximo **15 s** |
+| ePayco informa **Cancelada / Abandonada** (la persona canceló) | **«Pago cancelado»** — «Usted canceló el pago. No se hizo ningún cobro.» · *Intentar de nuevo* (vuelve a la elección, intento nuevo) · *Cancelar compra* |
+| **Rechazada** por el banco / fallida | **«El pago fue rechazado»** — «Puede intentarlo de nuevo con otro medio de pago.» · *Intentar de nuevo* · *Cancelar* |
+| **Con evidencia de pago en curso** tras los 15 s (típico de **PSE**) | **«Su pago está en proceso»** — «No lo repita. Estamos esperando la confirmación de su banco.» Sigue consultando mientras viva el cobro (10 min). Botones **solo** *Seguir esperando* y *Cancelar compra*; este último avisa «Si ya realizó el pago, no se perderá: quedará registrado para revisión» y deja la venta en `pago_por_revisar` (si el pago luego se aprueba **no** se marca como duplicado ni se factura sola: decide un admin con *Facturar*). No hay «Abrir el pago de nuevo» |
+| **Sin ninguna evidencia** tras los 15 s | **«No recibimos confirmación de su pago. ¿Completó el pago?»** con dos botones del mismo tamaño: **«Sí, ya pagué (esperar)»** (pasa a «en proceso» y sigue consultando) y **«No, intentar de nuevo»** (vuelve a la elección y abre un intento nuevo); *Cancelar compra* sigue disponible |
+| El celular **ya abrió** el QR de este intento | **«Este pago se abrió en un celular. Termine el pago allí o cancele la compra.»** — sin «Cambiar forma de pago» |
+| Aprobado | Como siempre: factura, tirilla y reinicio del kiosco |
+Si el pago llega después de que la persona salió, sigue el manejo de siempre (`pago_tardio` / `pago_por_revisar`). El **reinicio por inactividad del kiosco (3 minutos)** actúa en la elección y en los resultados negativos: cancela la venta abierta en el servidor y borra todo el estado de pago local; durante un pago en marcha (QR, ventana, verificando, en proceso) no reinicia.
+
+**Cómo se sabe que la ventana se cerró.** Según la documentación de ePayco (docs.davipay.com), el hook `onClosed` del checkout *onpage* se dispara cuando el usuario **cierra o cancela** el checkout (también tras completar el pago) y `onResponse` cuando hay un resultado; la documentación **no** lista los campos que reciben (por eso se busca el `ref_payco` en cualquier parte del objeto). Como el SDK a veces no dispara los hooks, también se escuchan los mensajes (`postMessage`) de los dominios de ePayco y se detecta la **desaparición del iframe** del checkout.
+
+**Consulta activa del servidor** (no depender solo del webhook). La documentación oficial **solo** publica la consulta por la **referencia larga** (`ref_payco`): `GET secure.epayco.co/validation/v1/reference/{ref_payco}`; **no** documenta consulta por `invoice` ni por `sessionId`. Por eso el servidor guarda en el intento la referencia larga apenas la conoce (la manda el navegador desde los hooks o la URL de regreso, o llega en el webhook) y desde entonces puede preguntar por su cuenta:
+- `POST /api/kiosco/pagos/<id>/verificar` (la pantalla, cada 2,5–3 s): devuelve el estado y el último intento, y hace la consulta si ya hay referencia (máx. una cada 2 s por intento).
+- **Consulta periódica en segundo plano:** cada `EPAYCO_POLL_SECONDS` (**20 s** por defecto; `0` la apaga) el servidor consulta los intentos de las ventas `esperando_pago` con cobro vigente (incluye la ruta del QR). Así un webhook retrasado no deja la venta sin facturar.
+- Todo pasa por el **mismo** `processPayment` (monto, firma, invoice, modo de prueba, reclamo atómico del `ref_payco`): varias vías a la vez (webhook + pantalla + consulta activa) producen **una sola factura**.
+- **Límite:** si el servidor nunca conoce la referencia larga (la ventana se cerró sin payload y el webhook no llega o solo trae la corta), no hay con qué preguntar: la pantalla pasa a «en proceso», el webhook sigue siendo la vía y, si el cobro vence y luego se aprueba, queda como `pago_tardio` para decidir. No se pudo verificar contra ePayco real que PSE entregue la referencia larga en `onResponse`; el registro `hook de ePayco` en *Admin → Logs* muestra qué manda en realidad.
 
 ### Pagos por revisar (`/admin/pagos-por-revisar`, solo admin)
 

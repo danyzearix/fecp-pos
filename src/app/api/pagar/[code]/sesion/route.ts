@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { query } from "@/lib/db";
 import { EpaycoError } from "@/lib/epayco/adapter";
 import { epaycoMissingEnv, getEpaycoConfig } from "@/lib/epayco/config";
+import { markQrOpened, phoneAttempt } from "@/lib/epayco/attempts";
 import { createSaleSession } from "@/lib/epayco/session";
 import { writeLog } from "@/lib/log";
 import { browserOrigin } from "@/lib/origin";
@@ -31,11 +32,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ code: string }
 
   const cfg = getEpaycoConfig();
   const base = cfg.publicBaseUrl || browserOrigin(req);
+  // Cada vez que el celular abre el pago hay un intento QR: recargar la página reutiliza el abierto; tras un rechazo o cancelación
+  // se abre uno nuevo (con su propia referencia); con un pago pendiente o aprobado, el servidor no deja abrir otro.
+  const att = await phoneAttempt(s.id);
+  if (!att.ok) return NextResponse.json({ error: att.error }, { status: att.status });
+  await markQrOpened(s.id).catch(() => {});
   try {
     const { sessionId, responseUrl } = await createSaleSession({
-      saleId: s.id, localNumber: s.local_number, total: s.total, wantedUrl: `${base}/pagar/${code}/respuesta`, where: "la página de pago",
+      saleId: s.id, localNumber: s.local_number, invoice: att.invoice, total: s.total, wantedUrl: `${base}/pagar/${code}/respuesta`, where: "la página de pago",
     });
     await query("UPDATE sales SET epayco_session_id = $2 WHERE id = $1 AND status = 'esperando_pago'", [s.id, sessionId]);
+    await query("UPDATE payment_attempts SET session_id = $2 WHERE sale_id = $1 AND attempt_no = $3", [s.id, sessionId, att.attemptNo]);
     await writeLog("pago", `Sesión de pago por enlace creada para ${s.local_number}`, { detail: { sale_id: s.id, session_id: sessionId, response_url: responseUrl, test: cfg.testMode } });
     return NextResponse.json({ session_id: sessionId, test: cfg.testMode });
   } catch (e) {

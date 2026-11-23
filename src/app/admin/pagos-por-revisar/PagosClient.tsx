@@ -22,6 +22,8 @@ export type PagoRow = {
   cashier: string;
   refund_by: string | null;
   refs: { ref: string; outcome: string; reason: string | null }[];
+  /** historial de intentos de pago de la venta (referencia, canal, estado, fecha; sin datos de tarjeta) */
+  attempts: { no: number; invoice: string; channel: string; status: string; at: string }[];
   /** llegó un aviso FIRMADO del webhook, pero sin la referencia larga (no se pudo consultar a ePayco) */
   webhook_hint_at: string | null;
   webhook_hint_ref: string | null;
@@ -69,9 +71,19 @@ function WebhookHint({ r }: { r: PagoRow }) {
 
 function Refs({ r }: { r: PagoRow }) {
   const shown = r.refs.length ? r.refs : r.epayco_ref ? [{ ref: r.epayco_ref, outcome: "", reason: null }] : [];
-  if (!shown.length) return <span className="text-dim">—</span>;
+  if (!shown.length && !r.attempts?.length) return <span className="text-dim">—</span>;
   return (
     <div className="space-y-1">
+      {r.attempts?.length > 0 && (
+        <div className="text-[12px] space-y-0.5 pb-1 border-b border-line">
+          <div className="font-semibold text-body">Intentos de pago</div>
+          {r.attempts.map((a) => (
+            <div key={a.no}>
+              <span className="font-mono">{a.invoice}</span> · {a.channel === "qr" ? "QR" : "pantalla"} · <b>{a.status}</b> · <span className="text-dim">{when(a.at)}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {shown.map((x) => (
         <div key={x.ref} className="text-[12px]">
           <span className="font-mono break-all">{x.ref}</span>

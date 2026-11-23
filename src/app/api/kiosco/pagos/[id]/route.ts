@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
 import { query } from "@/lib/db";
+import { latestAttemptView } from "@/lib/epayco/attempts";
 import { expireWaitingPayments } from "@/lib/epayco/process";
 import { sourceForRole } from "@/lib/kiosk";
 import { isUuid } from "@/lib/sales";
@@ -45,6 +46,7 @@ export async function GET(req: Request, ctx: { params: Promise<{ id: string }> }
       total: s.total,
       invoice_name: s.invoice_name,
       expires_at: s.payment_expires_at?.toISOString() ?? null,
+      attempt: await latestAttemptView(id),
       message: MESSAGE[s.status] ?? "Procesando…",
     },
     { headers: { "Cache-Control": "no-store" } }

@@ -18,6 +18,7 @@ import { transitionAllowed, transitionSale, type SaleStatus } from "../sale-stat
 import { EpaycoError, fetchTransaction, isShortRef, isUnresolvedError, type EpaycoDiag, type NormalizedTx } from "./adapter";
 import { getEpaycoConfig } from "./config";
 import { judgeTransaction } from "./verify";
+import { acceptedInvoices, attachRef, markAttempt } from "./attempts";
 
 export class PaymentInputError extends Error {
   constructor(public status: number, message: string) {
@@ -26,7 +27,7 @@ export class PaymentInputError extends Error {
 }
 
 export type PaymentOutcome =
-  | "pagado" | "pendiente" | "rechazado" | "por_revisar" | "tardio" | "duplicado" | "en_proceso" | "ya_procesado"
+  | "pagado" | "pendiente" | "rechazado" | "cancelado" | "por_revisar" | "tardio" | "duplicado" | "en_proceso" | "ya_procesado"
   /** la consulta a ePayco no se pudo resolver: la venta sigue esperando y se puede reintentar */
   | "no_verificado";
 export type PaymentResult = {
@@ -60,6 +61,8 @@ const customerMessage = (o: PaymentOutcome, local: string): string => {
       return "Su pago está pendiente de confirmación. Espere un momento.";
     case "rechazado":
       return "El pago fue rechazado. Puede intentarlo de nuevo.";
+    case "cancelado":
+      return "Usted canceló el pago. No se hizo ningún cobro.";
     case "por_revisar":
     case "tardio":
     case "duplicado":
@@ -97,6 +100,7 @@ export const duplicateReason = (local: string, txRef?: string | null) =>
 const FROM_REF: Record<string, PaymentOutcome> = {
   aprobado: "pagado",
   rechazado: "rechazado",
+  cancelado: "cancelado",
   por_revisar: "por_revisar",
   tardio: "tardio",
   duplicado: "duplicado",
@@ -111,6 +115,8 @@ async function settle(p: {
   localNumber: string;
   ref: string;
   kind: "approved" | "rejected" | "review";
+  /** (solo rejected) el cliente canceló o abandonó: no fue el banco */
+  cancelled?: boolean;
   reason: string;
   tx?: NormalizedTx;
   amount?: number;
@@ -137,6 +143,7 @@ async function settle(p: {
           },
           exec
         );
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.ref });
         outcome = "pagado"; refOutcome = "aprobado";
       } else if (cur === "pago_fallido") {
         await transitionSale(
@@ -147,6 +154,7 @@ async function settle(p: {
           },
           exec
         );
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.ref });
         outcome = "tardio"; refOutcome = "tardio";
       } else {
         // La venta ya está pagada/facturada/en revisión/anulada. ¿Es el MISMO pago visto con otra referencia (la corta y la
@@ -161,7 +169,16 @@ async function settle(p: {
               )
             ).rows[0]?.same
           : false;
-        if (same && (cur === "pago_por_revisar" || cur === "pago_tardio")) {
+        // ¿Es el pago de un intento que quedó PENDIENTE y luego el cliente canceló la compra (la venta pasó a revisión)? Entonces no es
+        // un duplicado: es ese mismo pago que por fin se aprobó. No se factura solo: un administrador decide.
+        const pend = p.tx
+          ? (await c.query<{ n: number }>("SELECT count(*)::int AS n FROM payment_attempts WHERE sale_id = $1 AND invoice = $2 AND status IN ('pendiente','abierto')", [p.saleId, p.tx.invoice])).rows[0]?.n ?? 0
+          : 0;
+        if (pend > 0 && cur === "pago_por_revisar" && !same) {
+          await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.ref });
+          outcome = "por_revisar"; refOutcome = "por_revisar";
+          refReason = `Pago APROBADO (ref. ${p.tx?.refPayco}) de un intento que estaba pendiente cuando se canceló la compra. Un administrador decide (Facturar si el dinero entró).`;
+        } else if (same && (cur === "pago_por_revisar" || cur === "pago_tardio")) {
           // Ese pago YA dejó la venta en revisión (p. ej. la primera verificación falló). Sigue sin facturarse sola: decide un admin.
           outcome = "por_revisar"; refOutcome = "por_revisar";
           refReason = `Pago verificado, pero es el MISMO pago (ref. ${p.tx?.refPayco}) que ya dejó esta venta en revisión. Un administrador decide (Facturar si el dinero entró).`;
@@ -174,12 +191,29 @@ async function settle(p: {
       }
     } else if (p.kind === "rejected") {
       if (cur === "esperando_pago") {
-        await transitionSale(p.saleId, ["esperando_pago"], "pago_fallido", { payment_status: "rechazado", payment_failure_reason: p.reason }, exec);
+        // El intento termina mal, pero la VENTA sigue esperando mientras no venza: el cliente puede abrir otro intento (con otra
+        // referencia). Si ya venció, pasa a pago_fallido como siempre.
+        const expired = (await c.query<{ exp: boolean }>("SELECT (payment_expires_at IS NOT NULL AND payment_expires_at < now()) AS exp FROM sales WHERE id = $1", [p.saleId])).rows[0]?.exp;
+        const status = p.cancelled ? "cancelado" : "rechazado";
+        if (expired) {
+          await transitionSale(p.saleId, ["esperando_pago"], "pago_fallido", { payment_status: status, payment_failure_reason: p.reason }, exec);
+        } else {
+          await c.query("UPDATE sales SET payment_status = $2, payment_failure_reason = $3 WHERE id = $1 AND status = 'esperando_pago'", [p.saleId, status, p.reason]);
+        }
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, status, { ref: p.ref, reason: p.reason });
+      } else if (cur === "pago_por_revisar") {
+        // La venta quedó "por revisar" porque el kiosco se reinició o se canceló con el pago en curso. Si ePayco confirma que NO hubo pago
+        // (rechazado/cancelado) y no hay otro intento aprobado o por revisar, ya no hay nada que revisar: se cierra.
+        const status = p.cancelled ? "cancelado" : "rechazado";
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, status, { ref: p.ref, reason: p.reason });
+        const other = (await c.query<{ n: number }>("SELECT count(*)::int AS n FROM payment_attempts WHERE sale_id = $1 AND status IN ('abierto','pendiente','aprobado','por_revisar')", [p.saleId])).rows[0]?.n ?? 0;
+        if (!other) await transitionSale(p.saleId, ["pago_por_revisar"], "pago_fallido", { payment_status: status, payment_failure_reason: p.reason }, exec);
       }
-      outcome = "rechazado"; refOutcome = "rechazado";
+      outcome = p.cancelled ? "cancelado" : "rechazado"; refOutcome = p.cancelled ? "cancelado" : "rechazado";
     } else {
       if (cur === "esperando_pago") {
         await transitionSale(p.saleId, ["esperando_pago"], "pago_por_revisar", { payment_status: "por_revisar", payment_failure_reason: p.reason, epayco_ref: p.ref }, exec);
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "por_revisar", { ref: p.ref, reason: p.reason });
       }
       outcome = "por_revisar"; refOutcome = "por_revisar";
     }
@@ -199,7 +233,7 @@ async function settle(p: {
 }
 
 /** Quién pide verificar: la pantalla de caja/kiosco, el webhook de ePayco, la página pública /pagar o un admin con la referencia a mano. */
-export type PaymentCheckSource = "kiosco" | "webhook" | "publica" | "admin";
+export type PaymentCheckSource = "kiosco" | "webhook" | "publica" | "admin" | "poller";
 
 const g = globalThis as unknown as { __shortRefLogged?: Set<string> };
 
@@ -257,6 +291,8 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
   }
 
   await writeLog("pago", `Verificando pago de ${sale.local_number} (origen: ${source})`, { detail: { sale_id: saleId, ref_payco: ref, source } });
+  // La referencia larga queda guardada en el intento: así el servidor puede seguir consultando a ePayco por su cuenta (poller)
+  await attachRef(saleId, ref).catch(() => {});
 
   // ---- Consultar a ePayco (adaptador) y juzgar ----
   let tx: NormalizedTx | null = null;
@@ -265,7 +301,7 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
   let unresolved = false;
   try {
     tx = await fetchTransaction(ref);
-    verdict = judgeTransaction(tx, { local_number: sale.local_number, total: sale.total }, { saleId, testMode: getEpaycoConfig().testMode });
+    verdict = judgeTransaction(tx, { local_number: sale.local_number, total: sale.total, invoices: await acceptedInvoices(saleId, sale.local_number) }, { saleId, testMode: getEpaycoConfig().testMode });
   } catch (e) {
     if (e instanceof EpaycoError) diag = { ...e.diag, error_kind: e.kind, ref_kind: "larga", ref_len: ref.length };
     const reason = e instanceof EpaycoError ? `No se pudo verificar con ePayco (${e.kind}): ${e.message}` : `Error inesperado verificando el pago: ${e instanceof Error ? e.message : e}`;
@@ -298,17 +334,18 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
     // No es definitivo: se libera el ref para poder consultarlo de nuevo; la venta sigue esperando
     await query("DELETE FROM payment_refs WHERE ref_payco = $1 AND outcome = 'procesando'", [ref]);
     await query("UPDATE sales SET payment_status = 'pendiente', epayco_ref = $2 WHERE id = $1 AND status = 'esperando_pago'", [saleId, ref]);
+    await markAttempt((t, v) => query(t, v), saleId, tx?.invoice ?? null, "pendiente", { ref });
     await writeLog("pago", `Pago de ${sale.local_number} PENDIENTE en ePayco`, { detail: { sale_id: saleId, ref_payco: ref, tx: tx ? detailOf(tx) : null } });
     return result(saleId, "pendiente", sale.local_number);
   }
 
   const kind = verdict.kind === "approved" ? "approved" : verdict.kind === "rejected" ? "rejected" : "review";
   let reason = verdict.kind === "approved" ? "Pago aprobado y verificado" : verdict.reason;
-  const outcome = await settle({ saleId, localNumber: sale.local_number, ref, kind, reason, tx: tx ?? undefined, diag });
+  const outcome = await settle({ saleId, localNumber: sale.local_number, ref, kind, reason, tx: tx ?? undefined, diag, cancelled: verdict.kind === "rejected" && verdict.cancelled });
   if (outcome === "duplicado") reason = duplicateReason(sale.local_number, tx?.refPayco ?? null);
 
   await writeLog("pago", `Pago de ${sale.local_number}: ${outcome.toUpperCase()}${outcome === "pagado" ? "" : ` — ${reason}`}`, {
-    level: outcome === "pagado" || outcome === "rechazado" ? "info" : "error",
+    level: outcome === "pagado" || outcome === "rechazado" || outcome === "cancelado" ? "info" : "error",
     detail: { sale_id: saleId, ref_payco: ref, outcome, reason, source, tx: tx ? detailOf(tx) : null, diag: tx ? undefined : diag },
   });
   return result(saleId, outcome, sale.local_number, outcome === "pagado");
@@ -341,6 +378,9 @@ export async function expireWaitingPayments(saleId?: string): Promise<number> {
       RETURNING id, local_number`,
     [saleId ?? null]
   );
+  if (rows.length) {
+    await query("UPDATE payment_attempts SET status = 'vencido', closed_at = now() WHERE sale_id = ANY($1::uuid[]) AND status = 'abierto'", [rows.map((r) => r.id)]);
+  }
   for (const r of rows) await writeLog("pago", `Cobro ${r.local_number} VENCIDO (tiempo agotado)`, { level: "warn", detail: { sale_id: r.id } });
   return rows.length;
 }

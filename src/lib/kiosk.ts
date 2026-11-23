@@ -9,7 +9,7 @@ import { parseCustomer, upsertCashierCustomer } from "./sales";
 import { resolveSaleCustomer } from "./customer-resolve";
 import { transitionSale } from "./sale-states";
 import { EpaycoError } from "./epayco/adapter";
-import { createSaleSession } from "./epayco/session";
+import { openAttempt } from "./epayco/attempts";
 import { epaycoMissingEnv, getEpaycoConfig } from "./epayco/config";
 import { getPosConfig } from "./config";
 import { epaycoInvoicingBlocker } from "./siigo/payment";
@@ -164,33 +164,23 @@ export async function createKioskPayment(input: {
     client.release();
   }
 
-  // ---- Canal QR: NO se abre el checkout en el equipo; la sesión la crea el celular al abrir /pagar/<código> ----
-  if (channel === "qr") {
-    await writeLog("pago", `Cobro creado${source === "caja" ? " en caja" : ""}: ${localNumber} por $${totals.total} (canal: QR en el celular)`, {
-      userId: input.userId,
-      detail: { sale_id: saleId, source, customer_branch: rc.branch, local_number: localNumber, total: totals.total, channel, test: cfg.testMode, items: lines.length },
-    });
-    return {
-      ok: true, saleId, localNumber, sessionId: null, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode,
-      payToken, payUrl: payUrlFor(payToken), channel, qrAvailable: true,
-    };
-  }
-
-  // ---- Canal en pantalla: crear la sesión en ePayco ----
+  // ---- Primer INTENTO de pago con el canal que eligió la persona (el servidor crea la sesión de ePayco AHORA, no antes) ----
+  // QR: sin sesión (la crea el celular al abrir /pagar/<código>). Pantalla: sesión de ePayco con la referencia del intento.
+  await writeLog("pago", `Cobro creado${source === "caja" ? " en caja" : ""}: ${localNumber} por $${totals.total} (canal: ${channel === "qr" ? "QR en el celular" : "en pantalla"})`, {
+    userId: input.userId,
+    detail: { sale_id: saleId, source, customer_branch: rc.branch, local_number: localNumber, total: totals.total, channel, test: cfg.testMode, items: lines.length },
+  });
   try {
     // El kiosco usa EPAYCO_RESPONSE_URL si existe (o su propia pantalla /kiosco); la caja siempre vuelve a /caja.
     // El kiosco se usa en http://127.0.0.1:3000 (la pantalla /kiosco redirige sola desde localhost).
     const wantedUrl = source === "caja" ? `${input.origin}/caja` : cfg.responseUrl || `${input.origin}/kiosco`;
-    const { sessionId, responseUrl } = await createSaleSession({
-      saleId, localNumber, total: totals.total, wantedUrl, userId: input.userId, where: source === "caja" ? "la caja" : "el kiosco",
-    });
-    await query("UPDATE sales SET epayco_session_id = $2 WHERE id = $1", [saleId, sessionId]);
-    await writeLog("pago", `Cobro creado${source === "caja" ? " en caja" : ""}: ${localNumber} por $${totals.total}`, {
-      userId: input.userId,
-      detail: { sale_id: saleId, source, customer_branch: rc.branch, local_number: localNumber, total: totals.total, session_id: sessionId, channel, test: cfg.testMode, items: lines.length, response_url: responseUrl },
-    });
-    // En pantalla el enlace del celular está CERRADO: no se entrega (se abre solo si se cambia a QR)
-    return { ok: true, saleId, localNumber, sessionId, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode, payToken, payUrl: null, channel, qrAvailable: qrAvailable() };
+    const r = await openAttempt({ saleId, channel, userId: input.userId, responseUrl: wantedUrl, where: source === "caja" ? "la caja" : "el kiosco" });
+    if (!r.ok) throw new Error(r.error);
+    // En pantalla el enlace del celular está CERRADO: no se entrega (se abre solo si se elige QR)
+    return {
+      ok: true, saleId, localNumber, sessionId: r.sessionId, total: totals.total, expiresAt: expiresAt.toISOString(), testMode: cfg.testMode,
+      payToken, payUrl: channel === "qr" ? payUrlFor(payToken) : null, channel, qrAvailable: qrAvailable(),
+    };
   } catch (e) {
     const reason = e instanceof EpaycoError ? `No se pudo crear el cobro en ePayco (${e.kind}): ${e.message}` : `Error creando el cobro: ${e instanceof Error ? e.message : e}`;
     await transitionSale(saleId, ["esperando_pago"], "pago_fallido", { payment_status: "rechazado", payment_failure_reason: reason });

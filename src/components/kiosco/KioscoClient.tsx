@@ -14,19 +14,11 @@ import { cartTotals, formatCOP, type CartLine } from "@/lib/money";
 import type { PosConfig, TicketData } from "@/lib/sale-types";
 import CedulaStep, { type CedulaChoice } from "./CedulaStep";
 import CustomerStep from "./CustomerStep";
-import { findRef, openOnpageCheckout, shapeOf } from "./epayco-client";
+import KioskPayment, { KIOSK_STORE_KEY } from "./KioskPayment";
+import type { CreateResult, PayChannel, PaySale, Phase } from "@/components/epayco/useEpaycoPayment";
 import ExitDialog from "./ExitDialog";
 
-type Screen = "tienda" | "cedula" | "datos" | "confirmar_total" | "pagando" | "procesando" | "resultado";
-type Outcome = { tone: "ok" | "warn" | "error"; title: string; message: string; localNumber?: string; invoice?: string | null; retry: boolean };
-// Canal de pago (uno a la vez; lo hace cumplir el servidor): en el kiosco el predeterminado es "pantalla" (checkout de
-// ePayco aquí mismo) y "qr" (pagar en el celular) es la opción secundaria, solo si hay dominio público.
-type PayChannel = "qr" | "pantalla";
-type Sale = {
-  id: string; local: string; total: number; sessionId: string | null; expiresAt: string; test: boolean;
-  channel?: PayChannel; qrAvailable?: boolean; payUrl?: string | null;
-};
-type StatusResp = { status: string; payment_status: string | null; local_number: string; invoice_name: string | null };
+type Screen = "tienda" | "cedula" | "datos" | "pago";
 
 const IDLE_RESET_MS = 180_000; // 3 minutos sin actividad → vacía el carrito y vuelve al inicio
 const IDLE_WARN_MS = 155_000;
@@ -36,19 +28,10 @@ const isExitCombo = (e: KeyboardEvent) => e.ctrlKey && e.altKey && e.shiftKey &&
 
 const json = { "Content-Type": "application/json" };
 
-// La venta en curso se guarda en el navegador: al terminar, ePayco devuelve al cliente a /kiosco?ref_payco=... (recarga la
-// página) y así se retoma la verificación. Solo guarda datos de la venta (nunca llaves).
-const STORE_KEY = "fecp_kiosk_sale_v1";
-const saveSale = (s: Sale | null) => {
-  try {
-    if (s) localStorage.setItem(STORE_KEY, JSON.stringify(s));
-    else localStorage.removeItem(STORE_KEY);
-  } catch {}
-};
-
 export default function KioscoClient({
   uvt,
   sinTope,
+  qrAvailable,
   printer,
   defaultState,
   defaultCity,
@@ -56,6 +39,8 @@ export default function KioscoClient({
   uvt: number;
   /** CONSUMIDOR_FINAL_SIN_TOPE: true = Consumidor final sin tope de monto */
   sinTope: boolean;
+  /** ¿hay dominio público (APP_PUBLIC_URL)? Sin él no existe el pago con QR */
+  qrAvailable: boolean;
   printer: boolean;
   defaultState: string;
   defaultCity: string;
@@ -71,31 +56,24 @@ export default function KioscoClient({
   const [custMode, setCustMode] = useState<"cf" | "existing" | "new">("cf");
   const [formError, setFormError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [sale, setSale] = useState<Sale | null>(null);
-  const [outcome, setOutcome] = useState<Outcome | null>(null);
+  // Pago electrónico: el estado vive en <KioskPayment> (se desmonta al salir de la pantalla y no deja nada)
+  const [payPhase, setPayPhase] = useState<Phase>("choose");
+  const [resume, setResume] = useState<{ sale: PaySale; ref: string | null } | null>(null);
+  const abortPay = useRef<(() => void) | null>(null);
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
   const [offline, setOffline] = useState(false);
   const [exitOpen, setExitOpen] = useState(false);
   const [idleWarn, setIdleWarn] = useState(false);
-  const [checkoutClosed, setCheckoutClosed] = useState(false);
-  const [secondsLeft, setSecondsLeft] = useState(0);
   const [localTicket, setLocalTicket] = useState<{ data: TicketData; config: PosConfig; qr: string | null } | null>(null);
   const [startDismissed, setStartDismissed] = useState(false); // ya tocaron "Toque para iniciar"
-  const [switching, setSwitching] = useState(false);
-  const [payQr, setPayQr] = useState<string | null>(null); // imagen del QR del enlace (solo con canal QR)
   const { isFull, toggle: toggleFullscreen } = useFullscreen();
   const goFullscreen = useCallback(async () => {
     if (!document.fullscreenElement) await toggleFullscreen();
   }, [toggleFullscreen]);
 
-  const saleRef = useRef<Sale | null>(null);
-  const refPayco = useRef<string | null>(null);
-  const reopen = useRef<(() => void) | null>(null);
   const lastActivity = useRef(Date.now());
-  const tickBusy = useRef(false);
   const logoTaps = useRef<number[]>([]);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const hooksLogged = useRef(new Set<string>());
   const searchRef = useRef<HTMLInputElement>(null);
 
   const deferredQuery = useDeferredValue(query);
@@ -138,16 +116,12 @@ export default function KioscoClient({
     setCustMode("cf");
     setFormError("");
     setBusy(false);
-    setSale(null);
-    saleRef.current = null;
-    refPayco.current = null;
-    reopen.current = null;
-    hooksLogged.current = new Set();
-    saveSale(null);
-    setCheckoutClosed(false);
-    setPayQr(null);
-    setOutcome(null);
+    setResume(null);
+    try {
+      localStorage.removeItem(KIOSK_STORE_KEY);
+    } catch {}
     setIdleWarn(false);
+    setPayPhase("choose");
     setScreen("tienda");
     loadCatalog();
   }, [defaultCity, defaultState, loadCatalog]);
@@ -160,53 +134,22 @@ export default function KioscoClient({
   }, []);
 
   // ---------------------------------------------------------------- retomar una venta en curso
-  // (al volver de ePayco con ?ref_payco=..., o si se recargó la pantalla durante el pago)
+  // (al volver de ePayco con ?ref_payco=..., o si se recargó la pantalla durante el pago). La verificación la hace el servidor.
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORE_KEY);
+      const raw = localStorage.getItem(KIOSK_STORE_KEY);
       if (!raw) return;
-      const s = JSON.parse(raw) as Sale;
-      if (!s?.id || new Date(s.expiresAt).getTime() < Date.now() - 30 * 60_000) return saveSale(null);
+      const sv = JSON.parse(raw) as PaySale;
+      if (!sv?.id || new Date(sv.expiresAt).getTime() < Date.now() - 30 * 60_000) return void localStorage.removeItem(KIOSK_STORE_KEY);
       const q = new URLSearchParams(location.search);
       const ref = (q.get("ref_payco") || q.get("x_ref_payco") || "").trim();
       if (ref) history.replaceState(null, "", location.pathname); // limpia la URL
-      setSale(s);
-      saleRef.current = s;
-      refPayco.current = ref || null; // solo una PISTA: el servidor la verifica con ePayco
-      setCheckoutClosed(true); // ofrece "Abrir el pago de nuevo" por si aún no pagó
-      setScreen("pagando");
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setResume({ sale: sv, ref: ref || null }); // el ref es solo una PISTA: el servidor la verifica con ePayco
+      setScreen("pago");
     } catch {
       /* sin almacenamiento: no se puede retomar */
     }
-  }, []);
-
-  // ---------------------------------------------------------------- mensajes del checkout (sin depender de los hooks del SDK)
-  // El SDK solo acepta mensajes de 5 dominios *.epayco.co; si el checkout se sirve desde otro (p. ej. davipay.com) sus hooks
-  // nunca se disparan. Este receptor escucha directamente los mensajes del iframe, y registra (solo nombres de campos) qué manda.
-  useEffect(() => {
-    const onMsg = (e: MessageEvent) => {
-      let host = "";
-      try {
-        host = new URL(e.origin).hostname;
-      } catch {
-        return;
-      }
-      if (!/(^|\.)(epayco\.(co|io)|davipay\.com)$/.test(host)) return;
-      const s = saleRef.current;
-      const data = e.data as Record<string, unknown> | null;
-      if (!s || !data || typeof data !== "object") return;
-      const ref = findRef(data);
-      if (ref) refPayco.current = ref;
-      const ev = typeof data.event === "string" ? data.event : "mensaje";
-      if (ev === "onClosed") setCheckoutClosed(true);
-      const key = `raw:${ev}`.slice(0, 20);
-      if (!hooksLogged.current.has(key)) {
-        hooksLogged.current.add(key);
-        void fetch(`/api/kiosco/pagos/${s.id}/hooks`, { method: "POST", headers: json, body: JSON.stringify({ hook: key, keys: [`origen:${host}`, ...shapeOf(data)], refFound: !!ref }) }).catch(() => {});
-      }
-    };
-    window.addEventListener("message", onMsg);
-    return () => window.removeEventListener("message", onMsg);
   }, []);
 
   // ---------------------------------------------------------------- bloqueo del kiosco
@@ -292,16 +235,21 @@ export default function KioscoClient({
     const evs = ["pointerdown", "touchstart", "keydown", "wheel"] as const;
     evs.forEach((e) => window.addEventListener(e, touch, { passive: true }));
     const iv = setInterval(() => {
-      if (exitOpen || !["tienda", "cedula", "datos", "confirmar_total"].includes(screen)) return; // durante el pago no se reinicia
+      // Durante un pago en marcha (QR, ventana, verificando, en proceso, facturando) no se reinicia; en la elección y en los resultados sí
+      const payIdle = screen === "pago" && ["choose", "creating", "confirm_total", "in_process", "confirm_paid", "cancelled", "rejected", "expired", "paid", "paid_review", "review"].includes(payPhase);
+      if (exitOpen || !(["tienda", "cedula", "datos"].includes(screen) || payIdle)) return;
       const idle = Date.now() - lastActivity.current;
-      if (idle >= IDLE_RESET_MS) reset();
+      if (idle >= IDLE_RESET_MS) {
+        abortPay.current?.(); // si hay una venta abierta, se cancela en el servidor
+        reset();
+      }
       else setIdleWarn(idle >= IDLE_WARN_MS);
     }, 1000);
     return () => {
       evs.forEach((e) => window.removeEventListener(e, touch));
       clearInterval(iv);
     };
-  }, [screen, exitOpen, reset]);
+  }, [screen, exitOpen, payPhase, reset]);
 
   // ---------------------------------------------------------------- carrito
   const addProduct = useCallback(
@@ -373,230 +321,51 @@ export default function KioscoClient({
     };
   }, [localTicket]);
 
-  const finish = useCallback((o: Outcome) => {
-    saveSale(null); // la venta ya terminó: no se retoma
-    setOutcome(o);
-    setScreen("resultado");
-  }, []);
-
-  const handleStatus = useCallback(
-    (st: StatusResp) => {
-      const s = saleRef.current;
-      switch (st.status) {
-        case "esperando_pago":
-          return;
-        case "pagado":
-        case "pending":
-        case "invoicing":
-          setScreen("procesando");
-          return;
-        case "invoiced":
-          finish({ tone: "ok", title: "¡Gracias por su compra!", message: "Su pago fue recibido y su factura quedó generada.", localNumber: st.local_number, invoice: st.invoice_name, retry: false });
-          if (printer && s) void printTicket(s.id);
-          return;
-        case "failed":
-        case "revisar":
-          finish({ tone: "warn", title: "Pago recibido", message: "Su factura se está terminando de generar. Guarde este número de compra por si lo necesita.", localNumber: st.local_number, retry: false });
-          return;
-        case "pago_fallido":
-          finish({ tone: "error", title: "No se completó el pago", message: st.payment_status === "vencido" ? "Se agotó el tiempo para pagar." : "El pago no fue aprobado.", localNumber: st.local_number, retry: true });
-          return;
-        case "pago_por_revisar":
-        case "pago_tardio":
-          finish({ tone: "warn", title: "Estamos verificando su pago", message: `No pudimos confirmar su pago automáticamente. Acérquese a la caja con este número: ${st.local_number}.`, localNumber: st.local_number, retry: false });
-          return;
-      }
-    },
-    [finish, printer, printTicket]
-  );
-
   // ---------------------------------------------------------------- pago
-  const startCheckout = useCallback(
-    async (s: Sale) => {
-      setScreen("pagando");
-      if (s.channel === "qr" || !s.sessionId) {
-        // Canal QR: no se abre la ventana de ePayco en el kiosco
-        reopen.current = null;
-        setCheckoutClosed(true);
-        return;
-      }
-      setCheckoutClosed(false);
+  /** Crea la VENTA con el canal que eligió la persona. El navegador SOLO manda productos y cantidades (más el cliente): el servidor calcula precios, IVA y total. */
+  const createSale = useCallback(
+    async (channel: PayChannel): Promise<CreateResult> => {
       try {
-        reopen.current = await openOnpageCheckout(s.sessionId, s.test, {
-          onPayload: (hook, payload) => {
-            const ref = findRef(payload);
-            if (ref) refPayco.current = ref; // solo una PISTA: el servidor la verifica con ePayco
-            if (hook === "onClosed") setCheckoutClosed(true);
-            if (!hooksLogged.current.has(hook)) {
-              hooksLogged.current.add(hook);
-              void fetch(`/api/kiosco/pagos/${s.id}/hooks`, { method: "POST", headers: json, body: JSON.stringify({ hook, keys: shapeOf(payload), refFound: !!ref }) }).catch(() => {});
-            }
-          },
+        const res = await fetch("/api/kiosco/pagos", {
+          method: "POST",
+          headers: json,
+          body: JSON.stringify({
+            items: cart.map((l) => ({ product_id: l.productId, quantity: l.qty })),
+            // Solo tipo y número de un cliente que ya existe: el servidor lo vuelve a buscar (nunca se manda nombre ni id de Siigo)
+            checkout_type: custMode === "cf" ? "corto" : "completo",
+            customer:
+              custMode === "cf" ? null : custMode === "existing" ? { id_type: "13", identification: form.identification } : buildCustomerFromForm(form, "completo"),
+            notify_email: form.email.trim() || undefined,
+            channel,
+          }),
         });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) return { ok: false, error: d.error ?? "No se pudo iniciar el pago" };
+        return {
+          ok: true,
+          sale: {
+            id: d.sale_id, local: d.local_number, total: d.total, sessionId: d.session_id ?? null, expiresAt: d.expires_at, test: !!d.test,
+            channel: d.channel === "qr" ? "qr" : "pantalla", qrAvailable: !!d.qr_available, payUrl: d.pay_url ?? null, attempt: 1,
+          },
+        };
       } catch {
-        setCheckoutClosed(true);
-        showToast("No se pudo abrir la ventana de pago. Toque “Abrir el pago de nuevo”.", "err");
+        return { ok: false, error: "No se pudo conectar. Intente de nuevo." };
       }
     },
-    [showToast]
+    [cart, custMode, form]
   );
-
-  /** Cambia el canal EN EL SERVIDOR (el anterior queda cerrado) y luego en la pantalla. */
-  async function switchChannel(to: PayChannel) {
-    const s = saleRef.current;
-    if (!s || switching) return;
-    setSwitching(true);
-    try {
-      const r = await fetch(`/api/kiosco/pagos/${s.id}/canal`, { method: "POST", headers: json, body: JSON.stringify({ channel: to }) });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) return showToast(d.error ?? "No se pudo cambiar la forma de pago.", "err");
-      const next: Sale = { ...s, channel: d.channel, sessionId: d.session_id ?? null, payUrl: d.pay_url ?? null };
-      saleRef.current = next;
-      hooksLogged.current = new Set();
-      saveSale(next);
-      setSale(next);
-      void startCheckout(next);
-    } catch {
-      showToast("Sin conexión. Intente de nuevo.", "err");
-    } finally {
-      setSwitching(false);
-    }
-  }
-
-  // QR del enlace de pago (solo cuando el canal activo es QR)
-  const qrUrl = sale?.channel === "qr" ? sale.payUrl ?? null : null;
-  useEffect(() => {
-    if (!qrUrl) return;
-    let alive = true;
-    QRCode.toDataURL(qrUrl, { margin: 1, width: 320 })
-      .then((u) => alive && setPayQr(u))
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [qrUrl]);
-
-  async function createPayment() {
-    setBusy(true);
-    setFormError("");
-    try {
-      const res = await fetch("/api/kiosco/pagos", {
-        method: "POST",
-        headers: json,
-        body: JSON.stringify({
-          // El navegador SOLO manda productos y cantidades: el servidor calcula precios, IVA y total desde su base de datos
-          items: cart.map((l) => ({ product_id: l.productId, quantity: l.qty })),
-          // Solo tipo y número de un cliente que ya existe: el servidor lo vuelve a buscar (nunca se manda nombre ni id de Siigo)
-          checkout_type: custMode === "cf" ? "corto" : "completo",
-          customer:
-            custMode === "cf" ? null : custMode === "existing" ? { id_type: "13", identification: form.identification } : buildCustomerFromForm(form, "completo"),
-          notify_email: form.email.trim() || undefined,
-          channel: "pantalla", // en el kiosco se paga aquí mismo; el QR es la opción secundaria
-        }),
-      });
-      const d = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setFormError(d.error ?? "No se pudo iniciar el pago");
-        setBusy(false);
-        return;
-      }
-      const s: Sale = {
-        id: d.sale_id, local: d.local_number, total: d.total, sessionId: d.session_id ?? null, expiresAt: d.expires_at, test: !!d.test,
-        channel: d.channel === "qr" ? "qr" : "pantalla", qrAvailable: !!d.qr_available, payUrl: d.pay_url ?? null,
-      };
-      saleRef.current = s;
-      refPayco.current = null;
-      hooksLogged.current = new Set();
-      saveSale(s);
-      setSale(s);
-      setBusy(false);
-      // Si los precios cambiaron mientras compraba, se avisa antes de cobrar
-      if (Math.abs(s.total - totals.total) > 0.01) setScreen("confirmar_total");
-      else void startCheckout(s);
-    } catch {
-      setFormError("No se pudo conectar. Intente de nuevo.");
-      setBusy(false);
-    }
-  }
   function submitCustomer() {
     const err = custMode === "new" ? validateCustomerForm(form, "completo") : form.email.trim() && !EMAIL_RE.test(form.email.trim()) ? "El correo no es válido" : null;
     if (err) return setFormError(err);
     setFormError("");
-    void createPayment();
+    setScreen("pago"); // primero se elige cómo pagar; la venta y la sesión de ePayco se crean DESPUÉS de elegir
   }
-
-  // Cuenta regresiva del cobro
-  useEffect(() => {
-    if (screen !== "pagando" || !sale) return;
-    const tick = () => setSecondsLeft(Math.max(0, Math.ceil((new Date(sale.expiresAt).getTime() - Date.now()) / 1000)));
-    tick();
-    const iv = setInterval(tick, 1000);
-    return () => clearInterval(iv);
-  }, [screen, sale]);
-
-  // Cada 3 s: si ya hay un ref_payco se le pide al servidor que lo verifique; si no, se lee el estado en NUESTRA base de datos
-  useEffect(() => {
-    if (screen !== "pagando") return;
-    const tick = async () => {
-      const s = saleRef.current;
-      if (!s || tickBusy.current || offline) return;
-      tickBusy.current = true;
-      try {
-        if (refPayco.current) {
-          const r = await fetch(`/api/kiosco/pagos/${s.id}/confirmar`, { method: "POST", headers: json, body: JSON.stringify({ ref_payco: refPayco.current }) });
-          const d = await r.json().catch(() => ({}));
-          if (r.ok) {
-            if (d.outcome === "pagado") return void setScreen("procesando");
-            if (d.outcome === "rechazado") return finish({ tone: "error", title: "El pago fue rechazado", message: "Puede intentarlo de nuevo con otro medio de pago.", localNumber: s.local, retry: true });
-            if (["por_revisar", "tardio", "duplicado"].includes(d.outcome)) {
-              return finish({ tone: "warn", title: "Estamos verificando su pago", message: `No pudimos confirmar su pago automáticamente. Acérquese a la caja con este número: ${s.local}.`, localNumber: s.local, retry: false });
-            }
-          }
-        }
-        const st = await fetch(`/api/kiosco/pagos/${s.id}`, { cache: "no-store" });
-        if (st.ok) handleStatus((await st.json()) as StatusResp);
-      } catch {
-        /* se reintenta en 3 s */
-      } finally {
-        tickBusy.current = false;
-      }
-    };
-    const iv = setInterval(tick, 3000);
-    return () => clearInterval(iv);
-  }, [screen, offline, finish, handleStatus]);
-
-  // Pago confirmado: esperar a que la factura quede lista
-  useEffect(() => {
-    if (screen !== "procesando") return;
-    const started = Date.now();
-    const iv = setInterval(async () => {
-      const s = saleRef.current;
-      if (!s) return;
-      if (Date.now() - started > 90_000) {
-        finish({ tone: "warn", title: "Pago recibido", message: "Su factura se está terminando de generar. Guarde este número de compra por si lo necesita.", localNumber: s.local, retry: false });
-        return;
-      }
-      try {
-        const st = await fetch(`/api/kiosco/pagos/${s.id}`, { cache: "no-store" });
-        if (st.ok) handleStatus((await st.json()) as StatusResp);
-      } catch {}
-    }, 2000);
-    return () => clearInterval(iv);
-  }, [screen, finish, handleStatus]);
-
-  // Pantalla final: volver al inicio sola
-  useEffect(() => {
-    if (screen !== "resultado" || !outcome) return;
-    const t = setTimeout(reset, outcome.tone === "ok" ? 25_000 : 60_000);
-    return () => clearTimeout(t);
-  }, [screen, outcome, reset]);
 
   // El aviso "Toque para iniciar" solo si NO está en pantalla completa y aún no lo tocaron,
   // y nunca encima de una compra en curso (si se recargó durante el pago).
   const showStart = !isFull && !startDismissed && screen === "tienda" && cart.length === 0;
 
   // ================================================================ pantallas
-  const mmss =`${String(Math.floor(secondsLeft / 60)).padStart(2, "0")}:${String(secondsLeft % 60).padStart(2, "0")}`;
 
   return (
     <>
@@ -724,85 +493,22 @@ export default function KioscoClient({
             />
           )}
 
-          {screen === "confirmar_total" && sale && (
-            <Center>
-              <h1 className="text-3xl font-bold">El total cambió</h1>
-              <p className="text-xl text-soft max-w-xl">Los precios se actualizaron mientras compraba. Antes eran {formatCOP(totals.total)}; el total a pagar ahora es:</p>
-              <div className="text-5xl font-extrabold text-brand-text">{formatCOP(sale.total)}</div>
-              <div className="flex gap-4">
-                <button onClick={reset} className="px-8 py-4 rounded-xl border border-field text-xl font-medium text-body bg-surface">Cancelar</button>
-                <button onClick={() => void startCheckout(sale)} className="px-10 py-4 rounded-xl bg-go text-white text-2xl font-bold">Pagar {formatCOP(sale.total)}</button>
-              </div>
-            </Center>
-          )}
-
-          {screen === "pagando" && sale && (
-            <Center>
-              {sale.test && <div className="rounded-xl bg-warn-soft border border-warn-line text-warn-ink px-5 py-2 text-lg font-semibold">MODO DE PRUEBA: no se cobra dinero real</div>}
-              <h1 className="text-3xl font-bold">{sale.channel === "qr" ? "Escanee el código con su celular para pagar" : "Complete el pago en la ventana de ePayco"}</h1>
-              <div className="text-5xl font-extrabold text-brand-text">{formatCOP(sale.total)}</div>
-              {sale.channel === "qr" && (
-                <div className="rounded-2xl bg-white p-4 border border-line">
-                  {payQr ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img src={payQr} alt="QR para pagar desde el celular" className="w-64 h-64 max-w-full" />
-                  ) : (
-                    <div className="w-64 h-64 max-w-full grid place-items-center text-gray-600">Generando el código…</div>
-                  )}
-                </div>
-              )}
-              <p className="text-[18px] text-soft">Compra <b>{sale.local}</b> · Tiempo restante <b>{mmss}</b></p>
-              <p className="text-[16px] text-dim max-w-xl">Esta pantalla se actualiza sola cuando el pago sea aprobado. No toque nada más.</p>
-              <div className="flex flex-wrap justify-center gap-4">
-                <button onClick={reset} className="px-8 py-4 rounded-xl border border-field text-xl font-medium text-body bg-surface">Cancelar compra</button>
-                {sale.channel === "qr" ? (
-                  <button onClick={() => void switchChannel("pantalla")} disabled={switching} className="px-8 py-4 rounded-xl bg-brand text-white text-xl font-semibold disabled:opacity-50">
-                    {switching ? "Cambiando…" : "Pagar en esta pantalla"}
-                  </button>
-                ) : (
-                  checkoutClosed && (
-                    <>
-                      <button onClick={() => { setCheckoutClosed(false); if (reopen.current) reopen.current(); else void startCheckout(sale); }} className="px-8 py-4 rounded-xl bg-brand text-white text-xl font-semibold">
-                        Abrir el pago de nuevo
-                      </button>
-                      {sale.qrAvailable && (
-                        <button onClick={() => void switchChannel("qr")} disabled={switching} className="px-8 py-4 rounded-xl border border-brand text-brand-text text-xl font-semibold bg-surface disabled:opacity-50">
-                          {switching ? "Cambiando…" : "Pagar con el celular (QR)"}
-                        </button>
-                      )}
-                    </>
-                  )
-                )}
-              </div>
-            </Center>
-          )}
-
-          {screen === "procesando" && (
-            <Center>
-              <div className="w-16 h-16 border-8 border-field border-t-brand rounded-full animate-spin" />
-              <h1 className="text-3xl font-bold">Pago recibido</h1>
-              <p className="text-xl text-soft">Estamos generando su factura…</p>
-            </Center>
-          )}
-
-          {screen === "resultado" && outcome && (
-            <Center>
-              <div className={`text-7xl ${outcome.tone === "ok" ? "text-ok-ink" : outcome.tone === "warn" ? "text-warn-ink" : "text-err-ink"}`}>{outcome.tone === "ok" ? "✓" : outcome.tone === "warn" ? "!" : "✕"}</div>
-              <h1 className="text-4xl font-bold">{outcome.title}</h1>
-              <p className="text-xl text-soft max-w-2xl">{outcome.message}</p>
-              {outcome.invoice && <div className="text-3xl font-bold text-fg">Factura {outcome.invoice}</div>}
-              {outcome.localNumber && <div className="text-[18px] text-soft">Número de compra: <b>{outcome.localNumber}</b></div>}
-              <div className="flex gap-4 pt-2">
-                {outcome.retry && (
-                  <button onClick={() => { setOutcome(null); setSale(null); saleRef.current = null; setFormError(""); setScreen("datos"); }} className="px-8 py-4 rounded-xl bg-brand text-white text-xl font-semibold">
-                    Intentar de nuevo
-                  </button>
-                )}
-                <button onClick={reset} className="px-8 py-4 rounded-xl border border-field text-xl font-medium text-body bg-surface">
-                  {outcome.retry ? "Cancelar" : "Nueva compra"}
-                </button>
-              </div>
-            </Center>
+          {screen === "pago" && (
+            <KioskPayment
+              cartTotal={totals.total}
+              qrAvailable={qrAvailable}
+              resume={resume}
+              createSale={createSale}
+              onBack={() => setScreen("datos")}
+              onFinish={reset}
+              onPhase={setPayPhase}
+              registerAbort={(f) => {
+                abortPay.current = f;
+              }}
+              onInvoiced={(id) => {
+                if (printer) void printTicket(id);
+              }}
+            />
           )}
         </div>
 
@@ -817,7 +523,7 @@ export default function KioscoClient({
           <div className="fixed inset-0 z-[60] bg-surface flex flex-col items-center justify-center gap-4 text-center p-10">
             <div className="text-7xl">⚠</div>
             <h1 className="text-4xl font-bold text-fg">Autoservicio no disponible, acérquese a la caja</h1>
-            {screen === "pagando" || screen === "procesando" ? <p className="text-xl text-soft">Si ya realizó su pago, acérquese a la caja con el número {sale?.local}.</p> : null}
+            {screen === "pago" && !["choose", "creating"].includes(payPhase) ? <p className="text-xl text-soft">Si ya realizó su pago, acérquese a la caja y cuéntele a la persona que lo atiende.</p> : null}
           </div>
         )}
         {/* Aviso de inicio: el navegador NO deja entrar a pantalla completa sin un gesto del usuario,
@@ -850,9 +556,6 @@ export default function KioscoClient({
   );
 }
 
-function Center({ children }: { children: React.ReactNode }) {
-  return <div className="h-full flex flex-col items-center justify-center gap-5 text-center p-10">{children}</div>;
-}
 
 function KioskCard({ p, qty, onAdd }: { p: IndexedProduct; qty?: number; onAdd: () => void }) {
   return (

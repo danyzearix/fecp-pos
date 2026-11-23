@@ -12,7 +12,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ code: string }
   return NextResponse.json(
     {
       local_number: s.local_number, total: s.total, status: s.status, payment_status: s.payment_status, invoice_name: s.invoice_name,
-      expires_at: s.expires_at, can_pay: s.can_pay, channel_changed: s.channel_changed, test: getEpaycoConfig().testMode, message: publicMessageFor(s),
+      expires_at: s.expires_at, can_pay: s.can_pay, channel_changed: s.channel_changed, attempt_status: s.attempt_status, test: getEpaycoConfig().testMode, message: publicMessageFor(s),
     },
     { headers: { "Cache-Control": "no-store" } }
   );

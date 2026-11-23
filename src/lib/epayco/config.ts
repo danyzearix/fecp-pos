@@ -17,6 +17,8 @@ export type EpaycoConfig = {
   timeoutMs: number;
   /** minutos que dura un cobro antes de pasar a pago_fallido */
   expiresMinutes: number;
+  /** cada cuántos segundos el SERVIDOR consulta a ePayco por su cuenta los cobros que siguen esperando (0 = apagado). EPAYCO_POLL_SECONDS, por defecto 20. */
+  pollSeconds: number;
 };
 
 const strip = (s: string | undefined) => (s ?? "").trim().replace(/\/+$/, "");
@@ -41,6 +43,12 @@ export function getEpaycoConfig(): EpaycoConfig {
     validationUrl: strip(testOverride("EPAYCO_VALIDATION_URL", "https://secure.epayco.co/validation/v1/reference")),
     timeoutMs: Number(testOverride("EPAYCO_TIMEOUT_MS", "15000")) || 15_000,
     expiresMinutes: 10,
+    pollSeconds: (() => {
+      const raw = (e.EPAYCO_POLL_SECONDS ?? "").trim();
+      if (!raw) return 20;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= 0 ? Math.max(n === 0 ? 0 : 5, Math.floor(n)) : 20;
+    })(),
   };
 }
 

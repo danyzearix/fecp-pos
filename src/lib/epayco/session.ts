@@ -9,6 +9,8 @@ import { getEpaycoConfig } from "./config";
 export async function createSaleSession(p: {
   saleId: string;
   localNumber: string;
+  /** referencia que se manda a ePayco (x_id_invoice). Por defecto el número de compra; los reintentos llevan sufijo (K01-000123-2) */
+  invoice?: string;
   total: number;
   /** a dónde vuelve el NAVEGADOR del cliente al terminar (ePayco agrega ?ref_payco=...) */
   wantedUrl: string;
@@ -21,7 +23,7 @@ export async function createSaleSession(p: {
     name: getPosConfig().negocio.nombre || "FECP",
     amount: round2(p.total),
     description: `Compra ${p.localNumber}`,
-    invoice: p.localNumber,
+    invoice: p.invoice ?? p.localNumber,
     confirmation: cfg.confirmationUrl || undefined, // webhook: solo en modo con dominio público
     extra1: p.saleId,
   };

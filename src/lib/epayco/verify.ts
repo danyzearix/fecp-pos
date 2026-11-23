@@ -5,7 +5,7 @@ import { expectedSignature, signatureMatches, EpaycoError, type NormalizedTx } f
 export type Verdict =
   | { kind: "approved" }
   | { kind: "pending"; reason: string } // aún no es definitivo: no se factura, tampoco se da por fallido
-  | { kind: "rejected"; reason: string } // definitivo: no hubo pago
+  | { kind: "rejected"; reason: string; /** el cliente canceló o abandonó (no fue el banco) */ cancelled: boolean } // definitivo: no hubo pago
   | { kind: "review"; reason: string }; // algo no coincide o no se pudo confirmar: lo decide un admin
 
 const REJECT_TEXT: Record<number, string> = {
@@ -19,7 +19,7 @@ const EXPECTED_TEXT: Record<number, string> = { 1: "aceptada", 2: "rechazada", 3
 
 export function judgeTransaction(
   tx: NormalizedTx,
-  sale: { local_number: string; total: number },
+  sale: { local_number: string; total: number; /** referencias válidas: el número de compra y las de cada intento de pago */ invoices?: string[] },
   opts: { saleId: string; testMode: boolean }
 ): Verdict {
   // 1) Identidad y montos: si algo no coincide, es "por revisar" sin importar el estado reportado.
@@ -27,7 +27,7 @@ export function judgeTransaction(
   if (tx.extra1 && tx.extra1 !== opts.saleId) {
     return { kind: "review", reason: "x_extra1 de ePayco no corresponde a esta venta" };
   }
-  if (tx.invoice !== sale.local_number) {
+  if (tx.invoice !== sale.local_number && !(sale.invoices ?? []).includes(tx.invoice)) {
     return { kind: "review", reason: `El invoice de ePayco (${tx.invoice}) no corresponde a esta venta (${sale.local_number})` };
   }
   if (Math.abs(tx.amount - sale.total) >= 0.005) {
@@ -70,7 +70,12 @@ export function judgeTransaction(
     case 9:
     case 10:
     case 11:
-      return { kind: "rejected", reason: REJECT_TEXT[tx.codResponse] };
+      return {
+        kind: "rejected",
+        reason: REJECT_TEXT[tx.codResponse],
+        // 10 abandonada y 11 cancelada: lo hizo el cliente. También si el texto lo dice (la documentación de ePayco no publica los números)
+        cancelled: tx.codResponse === 10 || tx.codResponse === 11 || /cancel|abandon/i.test(tx.response ?? ""),
+      };
     default:
       // 6 reversada, 7 retenida u otro código: puede haber dinero en movimiento → un admin revisa
       return { kind: "review", reason: `Estado de ePayco que requiere revisión (código ${tx.codResponse})` };

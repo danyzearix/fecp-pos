@@ -51,10 +51,13 @@ export default function CajaClient({
   user,
   config,
   epaycoReady,
+  qrAvailable,
 }: {
   user: { name: string; role: Role };
   config: PosConfig;
   epaycoReady: boolean;
+  /** ¿hay dominio público (APP_PUBLIC_URL)? Sin él no existe el pago con QR */
+  qrAvailable: boolean;
 }) {
   const [products, setProducts] = useState<Product[]>([]);
   const [catalogState, setCatalogState] = useState<"cargando" | "ok" | "offline">("cargando");
@@ -559,6 +562,7 @@ export default function CajaClient({
       {epayCharge && (
         <EpaycoCharge
           start={epayCharge}
+          qrAvailable={qrAvailable}
           onFinished={() => {
             // El pago quedó recibido: ahora sí se vacía el carrito
             setCharge(null);

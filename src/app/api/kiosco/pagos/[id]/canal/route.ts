@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
 import { query } from "@/lib/db";
-import { changeChannel, isPayChannel } from "@/lib/epayco/channel";
+import { openAttempt } from "@/lib/epayco/attempts";
+import { isPayChannel } from "@/lib/epayco/channel";
 import { EpaycoError } from "@/lib/epayco/adapter";
 import { getEpaycoConfig } from "@/lib/epayco/config";
 import { sourceForRole } from "@/lib/kiosk";
@@ -14,8 +15,8 @@ export const maxDuration = 60;
 
 /**
  * Cambia el canal de un cobro en curso: { channel: "qr" | "pantalla" }. Solo quien creó el cobro (el kiosco o el cajero).
- * Cambiar cierra el canal anterior en el SERVIDOR: con "pantalla" el enlace /pagar deja de servir; con "qr" la pantalla
- * no vuelve a abrir el checkout (y si alguien igual pagara por los dos, el segundo pago no se factura).
+ * Abre un INTENTO nuevo (con su propia referencia hacia ePayco) y cierra el anterior ('reemplazado'). Con un pago pendiente o
+ * aprobado el servidor lo rechaza (409). Con "pantalla" el enlace /pagar deja de servir; con "qr" la pantalla no abre el checkout.
  */
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const g = await guardApi(req);
@@ -34,9 +35,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const origin = browserOrigin(req);
   const responseUrl = source === "caja" ? `${origin}/caja` : getEpaycoConfig().responseUrl || `${origin}/kiosco`;
   try {
-    const r = await changeChannel({ saleId: id, to: body.channel, userId: g.user.uid, responseUrl, where: source === "caja" ? "la caja" : "el kiosco" });
-    if (!r.ok) return NextResponse.json({ error: r.error }, { status: r.status });
-    return NextResponse.json({ channel: r.channel, session_id: r.sessionId, pay_url: r.payUrl });
+    const r = await openAttempt({ saleId: id, channel: body.channel, userId: g.user.uid, responseUrl, where: source === "caja" ? "la caja" : "el kiosco", replace: true });
+    if (!r.ok) return NextResponse.json({ error: r.error, code: r.code }, { status: r.status });
+    return NextResponse.json({ channel: r.channel, session_id: r.sessionId, pay_url: r.payUrl, attempt: r.attemptNo });
   } catch (e) {
     const reason = e instanceof EpaycoError ? `(${e.kind}) ${e.message}` : e instanceof Error ? e.message : String(e);
     await writeLog("pago", `No se pudo cambiar el canal de pago: ${reason}`, { level: "error", userId: g.user.uid, detail: { sale_id: id } });

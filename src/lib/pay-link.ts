@@ -3,6 +3,7 @@
 // número de compra, total, estado, factura y mensajes seguros (nunca datos del cliente ni detalles técnicos).
 import { query } from "./db";
 import { expireWaitingPayments } from "./epayco/process";
+import { latestAttemptView } from "./epayco/attempts";
 
 export const PAY_CODE_RE = /^[0-9a-f]{48}$/;
 
@@ -17,6 +18,8 @@ export type PublicSale = {
   can_pay: boolean;
   /** el cobro sigue abierto pero se pasó a "pagar en pantalla": este enlace ya no sirve */
   channel_changed: boolean;
+  /** estado del último intento de pago (abierto, pendiente, rechazado, cancelado…) */
+  attempt_status: string | null;
 };
 
 export const CHANNEL_CHANGED_MESSAGE = "Este cobro fue cambiado, pide uno nuevo en caja.";
@@ -36,7 +39,15 @@ const MESSAGE: Record<string, string> = {
 };
 export const publicMessage = (status: string) => MESSAGE[status] ?? "Procesando…";
 /** Mensaje para el cliente según el estado y el canal (si se cambió a "en pantalla", el enlace ya no sirve). */
-export const publicMessageFor = (s: Pick<PublicSale, "status" | "channel_changed">) => (s.channel_changed ? CHANNEL_CHANGED_MESSAGE : publicMessage(s.status));
+export const publicMessageFor = (s: Pick<PublicSale, "status" | "channel_changed"> & { attempt_status?: string | null }) => {
+  if (s.channel_changed) return CHANNEL_CHANGED_MESSAGE;
+  if (s.status === "esperando_pago") {
+    if (s.attempt_status === "cancelado") return "Usted canceló el pago. No se hizo ningún cobro.";
+    if (s.attempt_status === "rechazado") return "El pago fue rechazado. Puede intentarlo de nuevo.";
+    if (s.attempt_status === "pendiente") return "Su pago está en proceso. No lo repita: estamos esperando la confirmación de su banco.";
+  }
+  return publicMessage(s.status);
+};
 
 /**
  * Busca la venta por su código. Solo ventas de pago electrónico. Vence los cobros que ya pasaron de tiempo.
@@ -57,6 +68,7 @@ export async function findPublicSale(code: string): Promise<PublicSale | null> {
   const s = rows[0];
   if (!s) return null;
   const exp = s.payment_expires_at;
+  const att = await latestAttemptView(s.id);
   return {
     id: s.id,
     local_number: s.local_number,
@@ -65,7 +77,9 @@ export async function findPublicSale(code: string): Promise<PublicSale | null> {
     total: s.total,
     invoice_name: s.invoice_name,
     expires_at: exp?.toISOString() ?? null,
-    can_pay: s.status === "esperando_pago" && !!exp && exp.getTime() > Date.now() && s.pay_channel === "qr",
+    // Con un pago PENDIENTE (p. ej. PSE) no se puede pagar otra vez desde el enlace: riesgo de doble cobro
+    can_pay: s.status === "esperando_pago" && !!exp && exp.getTime() > Date.now() && s.pay_channel === "qr" && att?.status !== "pendiente" && att?.status !== "aprobado",
+    attempt_status: att?.status ?? null,
     channel_changed: s.status === "esperando_pago" && s.pay_channel !== "qr",
   };
 }

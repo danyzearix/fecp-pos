@@ -1,6 +1,7 @@
 import KioscoClient from "@/components/kiosco/KioscoClient";
 import { requirePage } from "@/lib/auth";
 import { getPosConfig } from "@/lib/config";
+import { qrAvailable } from "@/lib/epayco/channel";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = { title: "Kiosco" };
@@ -13,6 +14,7 @@ export default async function KioscoPage() {
     <KioscoClient
       uvt={pos.uvt}
       sinTope={pos.consumidorFinalSinTope}
+      qrAvailable={qrAvailable()}
       printer={process.env.KIOSCO_IMPRESORA === "true"}
       defaultState={pos.defaultStateCode}
       defaultCity={pos.defaultCityCode}

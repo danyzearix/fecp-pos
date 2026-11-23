@@ -14,7 +14,9 @@ const SELECT = `
          COALESCE(NULLIF(c.company_name,''), NULLIF(trim(c.first_name || ' ' || c.last_name),'')) AS customer_name,
          u.name AS cashier, ru.name AS refund_by,
          (SELECT COALESCE(json_agg(json_build_object('ref', r.ref_payco, 'outcome', r.outcome, 'reason', r.reason) ORDER BY r.started_at), '[]'::json)
-            FROM payment_refs r WHERE r.sale_id = s.id) AS refs
+            FROM payment_refs r WHERE r.sale_id = s.id) AS refs,
+         (SELECT COALESCE(json_agg(json_build_object('no', a.attempt_no, 'invoice', a.invoice, 'channel', a.channel, 'status', a.status, 'at', a.created_at) ORDER BY a.attempt_no), '[]'::json)
+            FROM payment_attempts a WHERE a.sale_id = s.id) AS attempts
     FROM sales s
     JOIN users u ON u.id = s.cashier_id
     LEFT JOIN users ru ON ru.id = s.refund_requested_by

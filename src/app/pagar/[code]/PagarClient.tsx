@@ -16,6 +16,8 @@ export type PublicInfo = {
   can_pay: boolean;
   /** el cobro se pasó a "pagar en pantalla" en la caja/kiosco: este enlace ya no sirve */
   channel_changed?: boolean;
+  /** estado del último intento de pago (abierto, pendiente, rechazado, cancelado…) */
+  attempt_status?: string | null;
   message: string;
   test: boolean;
   expires_at: string | null;
@@ -137,12 +139,13 @@ export default function PagarClient({ code, mode, initial }: { code: string; mod
         {waiting && info.can_pay && (
           <div className="space-y-2">
             <button onClick={() => void pay()} disabled={busy} className="w-full px-6 py-4 rounded-xl bg-brand text-white text-lg font-bold disabled:opacity-50">
-              {busy ? "Abriendo…" : opened ? "Abrir el pago de nuevo" : "Pagar ahora"}
+              {busy ? "Abriendo…" : info.attempt_status === "cancelado" || info.attempt_status === "rechazado" ? "Intentar de nuevo" : opened ? "Abrir el pago de nuevo" : "Pagar ahora"}
             </button>
             <p className="text-[12px] text-dim">Pago seguro con ePayco (tarjetas, PSE, Nequi y más).</p>
           </div>
         )}
-        {waiting && !info.can_pay && !info.channel_changed && <p className="text-[14px] text-dim">El tiempo para pagar se agotó.</p>}
+        {waiting && !info.can_pay && !info.channel_changed && info.attempt_status !== "pendiente" && info.attempt_status !== "aprobado" && <p className="text-[14px] text-dim">El tiempo para pagar se agotó.</p>}
+        {waiting && info.attempt_status === "pendiente" && <div className="mx-auto w-10 h-10 rounded-full border-4 border-line border-t-brand animate-spin" aria-label="Esperando la confirmación" />}
         {error && <p className="text-[14px] text-err-ink">{error}</p>}
 
         {mode === "respuesta" && info.status === "pago_fallido" && (

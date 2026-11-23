@@ -61,6 +61,9 @@ const CAJA_EPAYCO_API: ApiRule[] = [
   ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/confirmar$`)],
   ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/hooks$`)],
   ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/canal$`)], // QR en el celular ↔ en pantalla (uno a la vez)
+  ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/intento$`)], // "Intentar de nuevo": intento nuevo de la misma venta
+  ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/verificar$`)], // consulta activa del estado
+  ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/cancelar$`)], // "Cancelar compra"
 ];
 
 export const API_BY_ROLE: Record<Role, ApiRule[]> = {
@@ -84,6 +87,9 @@ export const API_BY_ROLE: Record<Role, ApiRule[]> = {
     ["GET", new RegExp(`^/api/kiosco/pagos/${UUID}$`)],
     ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/confirmar$`)],
     ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/canal$`)],
+    ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/intento$`)],
+    ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/verificar$`)],
+    ["POST", new RegExp(`^/api/kiosco/pagos/${UUID}/cancelar$`)],
   ],
 };
 
