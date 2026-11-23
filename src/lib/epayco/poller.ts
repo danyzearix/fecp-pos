@@ -1,5 +1,5 @@
 // Consulta activa periódica (en el servidor): mientras una venta esté 'esperando_pago' y su cobro siga vigente, cada
-// EPAYCO_POLL_SECONDS (20 por defecto) se le pregunta a ePayco por su cuenta por los intentos que ya tienen referencia larga.
+// EPAYCO_POLL_SECONDS (20 por defecto) se le pregunta a ePayco por su cuenta por los intentos que ya tienen alguna referencia (la larga, o el x_transaction_id / x_ref_payco que trajo el webhook).
 // Así un webhook retrasado (o que nunca llegue) no deja una venta pagada sin facturar. Cubre también la ruta del QR.
 // Es idempotente: usa processPayment (reclamo atómico del ref_payco) y la facturación de siempre (una sola factura).
 import { query } from "../db";
@@ -34,13 +34,19 @@ export async function pollWaitingPayments(): Promise<number> {
     );
     for (const r of abandoned.rows) await cancelSale(r.id, "abandonada tras un pago rechazado o cancelado").catch(() => {});
     // Con intento vivo: ventas esperando, y las que quedaron "por revisar" por inactividad mientras el cobro siga vigente
-    const rows = await query<{ sale_id: string }>(
-      `SELECT DISTINCT a.sale_id FROM payment_attempts a JOIN sales s ON s.id = a.sale_id
-        WHERE s.status IN ('esperando_pago','pago_por_revisar') AND s.payment_expires_at > now() AND a.status IN ('abierto','pendiente') AND a.ref_payco IS NOT NULL`
+    const rows = await query<{ sale_id: string; expired: boolean }>(
+      `SELECT DISTINCT a.sale_id, (s.payment_expires_at <= now()) AS expired FROM payment_attempts a JOIN sales s ON s.id = a.sale_id
+        WHERE s.status IN ('esperando_pago','pago_por_revisar') AND a.status IN ('abierto','pendiente')
+          AND (s.payment_expires_at > now()
+               -- el cobro venció con evidencia (aviso aprobado, pago en curso): se sigue consultando hasta 24 h
+               OR (s.status = 'pago_por_revisar' AND s.payment_status = 'por_confirmar' AND s.payment_expires_at > now() - interval '24 hours'))
+          AND (a.ref_payco IS NOT NULL OR ($1::boolean AND (a.x_transaction_id IS NOT NULL OR a.x_ref_payco IS NOT NULL)))`,
+      [getEpaycoConfig().altRefLookup]
     );
     for (const r of rows.rows) {
       try {
-        const res = await activeCheck(r.sale_id, "poller", Math.max(1000, (secs - 1) * 1000));
+        // Vencido con evidencia: se consulta como mucho cada minuto (hasta 24 h)
+        const res = await activeCheck(r.sale_id, "poller", r.expired ? 60_000 : Math.max(1000, (secs - 1) * 1000));
         if (!res) continue;
         n++;
         if (res.startInvoicing) await invoiceSale(r.sale_id).catch((e) => writeLog("factura", `Error facturando pago electrónico (consulta activa): ${e instanceof Error ? e.message : e}`, { level: "error", detail: { sale_id: r.sale_id } }));

@@ -30,6 +30,8 @@ type Attempt = {
   no: number; status: string; channel: PayChannel; reason: string | null;
   /** hay evidencia de pago en curso (ref_payco, pendiente en ePayco o aviso del webhook) */
   evidence?: boolean;
+  /** ePayco avisó (firmado) que el pago fue APROBADO, aunque aún no se pudo confirmar */
+  webhook_approved?: boolean;
   /** la página QR de este intento ya se abrió en un celular: no se puede cambiar de canal */
   qr_opened?: boolean;
 } | null;
@@ -144,6 +146,15 @@ export function useEpaycoPayment(o: {
           setPhase("paid_review");
           return;
         case "pago_por_revisar":
+          // Venció con un pago en curso (p. ej. ePayco ya avisó el pago PSE) y el servidor lo sigue confirmando: sigue "en proceso"
+          // (nunca "rechazado" ni "¿completó el pago?"); cuando se confirme, avanza sola a la factura.
+          if (st.payment_status === "por_confirmar") {
+            if (cur !== "in_process") setPhase("in_process");
+            return;
+          }
+          persist(null);
+          setPhase("review");
+          return;
         case "pago_tardio":
           persist(null);
           setPhase("review");
@@ -173,8 +184,9 @@ export function useEpaycoPayment(o: {
               if (cur !== "window") setPhase("in_process");
               return;
             default:
-              // Apareció evidencia de pago (ref_payco o aviso del webhook): de "¿completó el pago?" pasa a "en proceso"
-              if (cur === "confirm_paid" && a?.evidence) setPhase("in_process");
+              // Apareció evidencia de pago (ref_payco o aviso firmado del webhook, p. ej. PSE pagado en el celular): "en proceso".
+              // Con la ventana de ePayco todavía abierta en esta pantalla no se cambia.
+              if (a?.evidence && (cur === "confirm_paid" || cur === "qr" || cur === "verifying")) setPhase("in_process");
               return;
           }
           return;

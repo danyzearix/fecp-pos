@@ -73,6 +73,8 @@ Abre `.env.local` y completa los valores. **Nunca subas este archivo a un reposi
 | `APP_PUBLIC_URL` | Dominio público con HTTPS (solo en el deploy). Vacío = modo local: sin webhook y sin QR de pago |
 | `EPAYCO_CONFIRMATION_URL`, `EPAYCO_RESPONSE_URL` | Opcionales. Por defecto salen de `APP_PUBLIC_URL` / de la propia pantalla |
 | `EPAYCO_POLL_SECONDS` | Cada cuántos segundos el servidor consulta a ePayco por su cuenta los cobros que siguen esperando (**20** por defecto; mínimo 5; `0` = apagada). Ver §10b |
+| `EPAYCO_TRUST_SIGNED_WEBHOOK` | `false` (por defecto). `true` = factura **automáticamente** con el webhook firmado cuando no hay referencia larga para consultar, solo si se cumplen todas las condiciones de §10c. ⚠ Riesgo: no se consulta a ePayco |
+| `EPAYCO_ALT_REF_LOOKUP` | `false` (por defecto). `true` = prueba además consultar a ePayco con `x_transaction_id` y `x_ref_payco` (no documentado; experimental, §10c) |
 | `KIOSCO_IMPRESORA` | `true` = el kiosco imprime la tirilla al terminar · `false` = solo muestra el número de factura |
 
 > ⚠️ **`SIIGO_TEST_MODE=true` sigue creando documentos en la contabilidad real de Siigo** (no electrónicos, “PRUEBA POS - ELIMINAR”).
@@ -219,8 +221,8 @@ Estados de una venta electrónica:
 |---|---|---|
 | `esperando_pago` | Cobro creado, sin pago confirmado | No |
 | `pagado` | Pago verificado por el servidor | Sí, enseguida |
-| `pago_fallido` | Venció el tiempo, el cliente canceló la compra o no se pudo crear el cobro (un rechazo o una cancelación de UN intento **no** la cierra: la venta sigue esperando y se puede reintentar) | No |
-| `pago_por_revisar` | La verificación falló o algo no coincide (monto, factura, firma, formato inesperado…) | **No** — decide un admin |
+| `pago_fallido` | Venció el tiempo **sin ninguna evidencia de pago**, ePayco confirmó rechazo/cancelación, el cliente canceló la compra o no se pudo crear el cobro (un rechazo o una cancelación de UN intento **no** la cierra: la venta sigue esperando y se puede reintentar) | No |
+| `pago_por_revisar` | La verificación falló o algo no coincide (monto, factura, firma, formato inesperado…), **o el cobro venció con evidencia de pago sin confirmar** (`payment_status = por_confirmar`, p. ej. ePayco avisó un PSE aprobado) | **No** — decide un admin. Con `por_confirmar`, si ePayco lo confirma después (retorno del celular, consulta activa), **sí** se factura solo |
 | `pago_tardio` | Se aprobó **después** de vencer el cobro | **No** — decide un admin |
 
 Pendiente ≠ fallido: si ePayco dice “pendiente”, el cobro sigue esperando y **no se puede abrir otro intento**. “Rechazada” o “Cancelada” cierran solo ese **intento**; “Intentar de nuevo” abre otro intento de la **misma venta** (§10b).
@@ -278,23 +280,51 @@ Si el pago llega después de que la persona salió, sigue el manejo de siempre (
 - `POST /api/kiosco/pagos/<id>/verificar` (la pantalla, cada 2,5–3 s): devuelve el estado y el último intento, y hace la consulta si ya hay referencia (máx. una cada 2 s por intento).
 - **Consulta periódica en segundo plano:** cada `EPAYCO_POLL_SECONDS` (**20 s** por defecto; `0` la apaga) el servidor consulta los intentos de las ventas `esperando_pago` con cobro vigente (incluye la ruta del QR). Así un webhook retrasado no deja la venta sin facturar.
 - Todo pasa por el **mismo** `processPayment` (monto, firma, invoice, modo de prueba, reclamo atómico del `ref_payco`): varias vías a la vez (webhook + pantalla + consulta activa) producen **una sola factura**.
-- **Límite:** si el servidor nunca conoce la referencia larga (la ventana se cerró sin payload y el webhook no llega o solo trae la corta), no hay con qué preguntar: la pantalla pasa a «en proceso», el webhook sigue siendo la vía y, si el cobro vence y luego se aprueba, queda como `pago_tardio` para decidir. No se pudo verificar contra ePayco real que PSE entregue la referencia larga en `onResponse`; el registro `hook de ePayco` en *Admin → Logs* muestra qué manda en realidad.
+- **Sin referencia larga no hay consulta.** Si el servidor nunca la recibe (típico de **PSE por QR**: el celular sale al banco y quizá no vuelve), el webhook firmado queda como **evidencia** y el cobro **no** termina en fallido (§10c). `EPAYCO_ALT_REF_LOOKUP=true` (apagada por defecto, experimental) prueba además consultar con `x_transaction_id` y `x_ref_payco`.
+
+### 10c. Referencias de ePayco, URL de retorno y evidencia del webhook
+
+**Las tres referencias (cuál es cuál):**
+
+| Nombre | Ejemplo | Dónde llega | ¿Sirve para consultar a ePayco? |
+|---|---|---|---|
+| **Referencia larga** `ref_payco` | `6b048afc42f15b521510e422` (24 letras y números) | Solo por el **navegador**: `onResponse` del checkout o la URL de retorno `…?ref_payco=…` | **Sí** — es la única documentada (`GET secure.epayco.co/validation/v1/reference/{ref_payco}`) |
+| Referencia corta `x_ref_payco` («Referencia Davipay») | `395055851` | Webhook, panel de Davipay | **No** (se probó el 2026-11-13: responde error) |
+| `x_transaction_id` | PSE `395055851179545908`, tarjeta `103` | Webhook | **No documentado** (no se usa salvo `EPAYCO_ALT_REF_LOOKUP=true`) |
+
+La documentación de ePayco/Davipay (docs.davipay.com → *Respuesta y confirmación*, *APIFY*) **no** publica consulta por `sessionId`, por `x_ref_payco` ni por `x_id_invoice`. En el panel de Davipay, busque la referencia larga en el detalle de la transacción.
+
+**URL de retorno propia en cada canal.** Al crear la sesión de ePayco el POS manda su URL de respuesta:
+- **QR (celular):** `https://<dominio>/pagar/<código>/retorno`. Esa página la procesa el **servidor** al cargar (no depende de JavaScript, de la pestaña ni de cuánto tarde el cliente en volver del banco): toma `ref_payco`, la **guarda en el intento** y la verifica con ePayco (`x_id_invoice`, `x_extra1`, monto, moneda, modo, firma). Muestra «Pago aprobado. Ya puede volver al kiosco/a la caja…», «Su pago está en proceso» o «El pago no se completó». La antigua `/respuesta` hace lo mismo (cobros creados antes de actualizar).
+- **En pantalla:** `/kiosco` o `/caja` (o `EPAYCO_RESPONSE_URL`), como antes: la propia pantalla toma `ref_payco` y lo manda al servidor.
+
+**El webhook firmado cuenta como evidencia y frena el vencimiento.** Cada aviso firmado guarda en el intento un **resumen** (`payment_attempts.webhook_summary`: `x_ref_payco`, `x_transaction_id`, `x_id_invoice`, `x_extra1`, monto, moneda, estado, franquicia, `x_test_request`, fechas; **sin** firma ni datos personales). Con `x_cod_response=1` se marca `webhook_approved_at`. Reglas:
+- Un intento con aviso **aprobado** (o con referencia larga, o pendiente) **nunca** pasa a `vencido` ni la venta a `pago_fallido`: al vencer el cobro pasa a **`pago_por_revisar`** con `payment_status = por_confirmar` y el motivo *«ePayco avisó un pago aprobado que no se pudo confirmar automáticamente»*. La consulta activa lo sigue intentando (hasta 24 h, como mucho cada minuto) y, si llega la referencia larga, se **factura sola**.
+- `pago_fallido` solo **sin ninguna evidencia** o con rechazo/cancelación confirmados (un aviso firmado de rechazo no es evidencia de pago).
+- Una venta ya fallida/vencida que **después** recibe un aviso aprobado pasa a **`pago_tardio`** (decide un admin).
+- Kiosco y caja muestran **«Su pago está en proceso»** (sin contador) mientras haya evidencia; nunca «rechazado» ni «¿Completó el pago?». Con QR, el kiosco dice *«Termine el pago en su celular; si pagó por PSE puede tardar unos minutos»*. En cuanto se confirma, avanza sola a la factura.
+- Con un aviso recibido, el celular ya no ofrece «Pagar ahora» y el servidor no deja abrir otro cobro desde el enlace (409).
+
+**Facturar sin consultar a ePayco (último recurso).** Mismas condiciones en los dos casos (`src/lib/epayco/trust.ts`): aviso con **firma válida**, `x_cod_response=1`, `x_cod_transaction_state=1`, `x_amount` = total **guardado en la base**, `x_currency_code=COP`, `x_id_invoice` = referencia del **intento vigente**, `x_extra1` = UUID de la venta y `x_test_request` coherente con `EPAYCO_TEST_MODE`.
+- **Botón del admin «Facturar con evidencia del webhook»** (*Pagos por revisar*): pide confirmación y **nota obligatoria**; registra quién y cuándo (`payment_attempts.evidence_*` y log). Una sola factura aunque se pulse dos veces o coincida con el webhook o la consulta activa (409 al segundo).
+- **Automático:** `EPAYCO_TRUST_SIGNED_WEBHOOK=true` (**apagada por defecto**). ⚠ Riesgo: la firma **no** cubre el estado, el invoice, `x_extra1` ni `x_test_request`, y nadie le pregunta a ePayco; quien tenga la `P_KEY` podría fabricar un aviso. Por eso se exigen todas las condiciones contra la base de datos. Encenderla solo si la consulta por referencia larga no es viable y aceptando ese riesgo.
 
 ### Pagos por revisar (`/admin/pagos-por-revisar`, solo admin)
 
 - **Pendientes de decisión:** muestra fecha, venta, cliente, monto, motivo, `ref_payco` y de dónde vino (caja o autoservicio).
   - **Facturar** (pide confirmación): el admin confirma que el dinero **sí entró** en el panel de ePayco; la venta pasa a `pagado` y se factura.
   - **Marcar para reembolso** (pide confirmación): solo deja constancia (fecha y quién). **El reembolso real se hace en el panel de ePayco.** La venta no se factura y queda fuera de todos los reportes.
-- **Cobros sin confirmar (últimos 7 días):** por si el cliente **sí pagó** pero la pantalla no recibió la referencia (se cerró el navegador, se cortó la conexión…). El admin pega el enlace `…?ref_payco=…` o la referencia larga y el servidor la verifica con ePayco con las mismas reglas. Si el cobro ya había vencido, el pago aprobado pasa a `pago_tardio` para decidir.
+- **Cobros sin confirmar (últimos 7 días):** por si el cliente **sí pagó** pero el sistema no recibió la referencia larga. **Verificar con referencia** acepta la **referencia larga** o un **enlace con `ref_payco=`** (también está en *Pendientes de decisión* para las ventas por revisar). Si pega el número corto o el `x_transaction_id`, responde al instante que ese dato no sirve y cuál se necesita. Mensajes: *Pago aprobado y verificado*, *ePayco no respondió (se esperó 10 segundos)*, *ePayco respondió con un error (HTTP n)*, *ePayco no encontró esa referencia*, *El monto no coincide…*, *Estado: pendiente / rechazado / cancelado*. Cada verificación queda en el log (tipo de referencia, HTTP, tiempo, resultado; sin la referencia ni datos personales). Toda llamada a ePayco se corta a los **10 s**.
+- **Facturar con evidencia del webhook:** solo en ventas con un aviso firmado de pago **aprobado** sin confirmar (§10c).
 - **Pagos duplicados:** segundos pagos aprobados de una venta que ya estaba pagada. Nunca se facturan ni cuentan como recaudado. **Marcar para reembolso** deja constancia; el reembolso se hace en ePayco.
 - **Marcadas para reembolso:** historial de constancias.
 
-> La referencia que sirve para consultar a ePayco es la **larga** (24 caracteres hexadecimales, la que viene en `?ref_payco=`). El número corto “Referencia Davipay” (p. ej. `393429259`) **no** sirve para verificar.
+> La referencia que sirve para consultar a ePayco es la **larga** (24 caracteres hexadecimales, la que viene en `?ref_payco=`). El número corto “Referencia Davipay” (p. ej. `393429259`) y el `x_transaction_id` **no** sirven para verificar (§10c).
 
 ### Páginas públicas de pago (siempre activas)
 
 - **`/pagar/<código>`** — el cliente paga **esa** compra desde su celular. El `<código>` son 48 caracteres aleatorios (`pay_token`) imposibles de adivinar; la página solo muestra el número de compra, el total y el estado.
-- **`/pagar/<código>/respuesta`** — a donde ePayco devuelve al cliente al terminar. Llegar aquí **no** significa que pagó: la página manda la referencia al servidor y muestra el estado real.
+- **`/pagar/<código>/retorno`** (y la antigua `/respuesta`) — a donde ePayco devuelve al cliente al terminar. Llegar aquí **no** significa que pagó: el **servidor** guarda y verifica la referencia larga y la página muestra el estado real (§10c).
 - Sus endpoints (`/api/pagar/<código>…`) no exigen sesión, limitan los intentos por código, verifican **siempre** con ePayco y nunca devuelven datos del cliente ni detalles técnicos. No aparecen en buscadores (`noindex`).
 - El **QR** con el enlace sale **solo con el canal QR activo** y **solo si `APP_PUBLIC_URL` está definido** (un celular no puede abrir `127.0.0.1` del equipo de la caja). Si el cobro se pasó a "en pantalla", el enlace muestra *“Este cobro fue cambiado, pide uno nuevo en caja”*.
 
@@ -305,10 +335,11 @@ Si el pago llega después de que la persona salió, sigue el manejo de siempre (
 1. Define `APP_PUBLIC_URL=https://tu-dominio` (con HTTPS) y reinicia.
 2. El cobro se crea con la URL del webhook. ePayco avisa **sin depender del navegador**: exige `x_signature` válida, ubica la venta por `x_id_invoice` y **vuelve a consultar** a ePayco (no confía en el contenido del aviso). Es idempotente: ePayco puede reintentar.
 
-**Referencia corta y larga (importante).** ePayco identifica cada pago con dos referencias: la **larga** (`ref_payco`, 24 caracteres hexadecimales) y la **corta** (`x_ref_payco`, solo dígitos, la "Referencia Davipay"). La consulta a ePayco para verificar un pago **solo funciona con la larga**; con la corta responde un error. Por eso:
-- Si el webhook trae `ref_payco` (larga), se consulta y se verifica como siempre.
-- Si llega **solo con la corta**, el sistema **no decide nada**: anota que llegó un aviso firmado (se ve en *Pagos por revisar* → "sin la referencia larga") y la confirmación llega por el navegador (que sí recibe `ref_payco` al volver de ePayco) o la hace el admin desde el panel.
-- Si la consulta **no se pudo resolver** (ePayco caído, error de red, referencia no encontrada), la venta **no** pasa a "por revisar": sigue esperando y la referencia no se consume, así que se puede reintentar (el webhook responde 500 para que ePayco reintente). Solo tras 60 intentos sin poder verificar pasa a "por revisar", para que un admin la vea. Lo que **sí llega y no coincide** (monto, factura, `x_extra1`, modo de prueba, código distinto de 1, firma) va a "por revisar" como siempre.
+**Referencia corta y larga (importante, §10c).** El webhook trae `x_ref_payco` (corta) y `x_transaction_id`, **nunca** la larga. Por eso:
+- Exige `x_signature` válida; ubica la venta por `x_id_invoice` y, si viene `x_extra1` y **no** es el UUID de esa venta, **no lo procesa** y lo registra (nivel error).
+- Guarda en el intento el resumen del aviso (evidencia). Si el servidor ya conoce la referencia larga (la trajo el navegador), **consulta** a ePayco y confirma como siempre.
+- Si no la conoce, **no decide nada**: queda como evidencia (y frena el vencimiento si dice aprobado); la confirmación llega por el retorno del celular, la consulta activa o el admin. Con `EPAYCO_TRUST_SIGNED_WEBHOOK=true` (apagada por defecto) se aprobaría solo con el aviso, con todas las condiciones de §10c.
+- Si la consulta **no se pudo resolver** (ePayco caído, error de red), la venta sigue esperando y el webhook responde 500 para que ePayco reintente. Lo que **sí llega y no coincide** (monto, factura, `x_extra1`, modo de prueba, código distinto de 1, firma) va a "por revisar".
 - El mismo pago visto con las dos referencias es **un solo pago**, no un duplicado. Un pago es duplicado solo si es **otra transacción**; aun así, antes de reembolsar confirme en el panel de ePayco.
 
 Sin el webhook (modo local), la confirmación depende de que el navegador vuelva con el `ref_payco`; si no vuelve, el admin usa **Cobros sin confirmar** (arriba).

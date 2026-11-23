@@ -19,6 +19,16 @@ export type EpaycoConfig = {
   expiresMinutes: number;
   /** cada cuántos segundos el SERVIDOR consulta a ePayco por su cuenta los cobros que siguen esperando (0 = apagado). EPAYCO_POLL_SECONDS, por defecto 20. */
   pollSeconds: number;
+  /**
+   * EPAYCO_TRUST_SIGNED_WEBHOOK (APAGADA por defecto). Solo si NINGUNA referencia del webhook sirve para consultar a ePayco, permite aprobar
+   * el pago con el webhook firmado, exigiendo además TODAS las condiciones de src/lib/epayco/trust.ts. Ver README §10b.
+   */
+  trustSignedWebhook: boolean;
+  /**
+   * EPAYCO_ALT_REF_LOOKUP (APAGADA por defecto). Además de la referencia larga, PRUEBA consultar a ePayco con el x_transaction_id y la x_ref_payco
+   * (corta) del webhook. La documentación NO dice que eso funcione (y con la corta se observó que NO, 2026-11-13): es experimental.
+   */
+  altRefLookup: boolean;
 };
 
 const strip = (s: string | undefined) => (s ?? "").trim().replace(/\/+$/, "");
@@ -41,8 +51,11 @@ export function getEpaycoConfig(): EpaycoConfig {
     // (src/lib/test-hooks.ts). En producción siempre se usan las URLs oficiales.
     apifyUrl: strip(testOverride("EPAYCO_APIFY_URL", "https://apify.epayco.co")),
     validationUrl: strip(testOverride("EPAYCO_VALIDATION_URL", "https://secure.epayco.co/validation/v1/reference")),
-    timeoutMs: Number(testOverride("EPAYCO_TIMEOUT_MS", "15000")) || 15_000,
+    // Toda llamada a ePayco se corta a los 10 s (panel, consulta activa, /verificar, retorno): nunca queda colgada
+    timeoutMs: Number(testOverride("EPAYCO_TIMEOUT_MS", "10000")) || 10_000,
     expiresMinutes: 10,
+    trustSignedWebhook: (e.EPAYCO_TRUST_SIGNED_WEBHOOK ?? "").trim().toLowerCase() === "true",
+    altRefLookup: (e.EPAYCO_ALT_REF_LOOKUP ?? "").trim().toLowerCase() === "true",
     pollSeconds: (() => {
       const raw = (e.EPAYCO_POLL_SECONDS ?? "").trim();
       if (!raw) return 20;

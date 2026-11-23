@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { getEpaycoConfig } from "@/lib/epayco/config";
 import { markQrOpened } from "@/lib/epayco/attempts";
-import { findPublicSale, publicMessageFor } from "@/lib/pay-link";
+import { findPublicSale, publicInProcess, publicMessageFor } from "@/lib/pay-link";
 import LinkNotFound from "./LinkNotFound";
 import PagarClient from "./PagarClient";
 
@@ -20,7 +20,7 @@ export default async function PagarPage({ params }: { params: Promise<{ code: st
       code={code}
       mode="pagar"
       initial={{
-        local_number: s.local_number, total: s.total, status: s.status, invoice_name: s.invoice_name, can_pay: s.can_pay, channel_changed: s.channel_changed, attempt_status: s.attempt_status,
+        local_number: s.local_number, total: s.total, status: s.status, invoice_name: s.invoice_name, can_pay: s.can_pay, channel_changed: s.channel_changed, attempt_status: s.attempt_status, in_process: publicInProcess(s), source: s.source, payment_status: s.payment_status,
         message: publicMessageFor(s), test: getEpaycoConfig().testMode, expires_at: s.expires_at,
       }}
     />

@@ -107,7 +107,7 @@ export const API_PUBLIC: ApiRule[] = [
 ];
 
 /** Páginas públicas (sin sesión): el enlace de pago y la página a la que ePayco devuelve al cliente. */
-export const PUBLIC_PAGES: RegExp[] = [/^\/pagar\/[0-9a-f]{48}(\/respuesta)?$/];
+export const PUBLIC_PAGES: RegExp[] = [/^\/pagar\/[0-9a-f]{48}(\/respuesta|\/retorno)?$/];
 export const isPublicPage = (path: string) => PUBLIC_PAGES.some((re) => re.test(path));
 export const API_ANY_AUTHENTICATED: ApiRule[] = [["POST", /^\/api\/auth\/logout$/]];
 

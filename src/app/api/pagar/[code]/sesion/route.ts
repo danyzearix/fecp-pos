@@ -13,7 +13,8 @@ import { epaycoInvoicingBlocker } from "@/lib/siigo/payment";
 export const maxDuration = 60;
 
 /**
- * PÚBLICO (sin sesión). Crea una sesión de ePayco para pagar esta venta desde el celular; vuelve a /pagar/<código>/respuesta.
+ * PÚBLICO (sin sesión). Crea una sesión de ePayco para pagar esta venta desde el celular. URL de respuesta: /pagar/<código>/retorno
+ * (ahí el SERVIDOR toma el ref_payco largo, lo guarda en el intento y lo verifica).
  * El monto sale de NUESTRA base de datos. Solo si la venta sigue 'esperando_pago', no ha vencido y su canal activo es QR.
  */
 export async function POST(req: Request, ctx: { params: Promise<{ code: string }> }) {
@@ -39,7 +40,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ code: string }
   await markQrOpened(s.id).catch(() => {});
   try {
     const { sessionId, responseUrl } = await createSaleSession({
-      saleId: s.id, localNumber: s.local_number, invoice: att.invoice, total: s.total, wantedUrl: `${base}/pagar/${code}/respuesta`, where: "la página de pago",
+      saleId: s.id, localNumber: s.local_number, invoice: att.invoice, total: s.total, wantedUrl: `${base}/pagar/${code}/retorno`, where: "la página de pago",
     });
     await query("UPDATE sales SET epayco_session_id = $2 WHERE id = $1 AND status = 'esperando_pago'", [s.id, sessionId]);
     await query("UPDATE payment_attempts SET session_id = $2 WHERE sale_id = $1 AND attempt_no = $3", [s.id, sessionId, att.attemptNo]);

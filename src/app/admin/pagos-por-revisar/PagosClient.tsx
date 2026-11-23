@@ -23,7 +23,13 @@ export type PagoRow = {
   refund_by: string | null;
   refs: { ref: string; outcome: string; reason: string | null }[];
   /** historial de intentos de pago de la venta (referencia, canal, estado, fecha; sin datos de tarjeta) */
-  attempts: { no: number; invoice: string; channel: string; status: string; at: string }[];
+  attempts: { no: number; invoice: string; channel: string; status: string; at: string; ref_used: string | null }[];
+  /** último aviso firmado (webhook) de ePayco y las referencias que trajo */
+  webhook: {
+    at: string; short: string | null; txid: string | null; used: string | null; checks: number; has_long: boolean;
+    /** el aviso firmado dice APROBADO (x_cod_response=1) */
+    approved: boolean; franchise: string | null; amount: string | null; cod: string | null; invoice: string; evidence_at: string | null;
+  } | null;
   /** llegó un aviso FIRMADO del webhook, pero sin la referencia larga (no se pudo consultar a ePayco) */
   webhook_hint_at: string | null;
   webhook_hint_ref: string | null;
@@ -58,13 +64,88 @@ function Customer({ r }: { r: PagoRow }) {
   );
 }
 
-/** Aviso firmado del webhook que no se pudo confirmar (falta la referencia larga). No decide nada: es una pista para el admin. */
+const KIND_LABEL: Record<string, string> = { larga: "la referencia larga", transaction_id: "el número de transacción", corta: "la referencia corta", firma: "el aviso firmado" };
+
+/** Aviso firmado de ePayco: qué llegó, si ya se confirmó y qué falta. Es información para el admin; no decide nada. */
 function WebhookHint({ r }: { r: PagoRow }) {
-  if (!r.webhook_hint_at) return null;
+  const w = r.webhook;
+  if (!w && !r.webhook_hint_at) return null;
+  const at = w?.at ?? r.webhook_hint_at!;
+  const short = w?.short ?? r.webhook_hint_ref;
   return (
     <div className="mt-1 text-[12px] rounded-md bg-brand-soft text-brand-ink px-2 py-1 max-w-xs break-words">
-      ePayco avisó de un pago ({when(r.webhook_hint_at)}, ref. corta {r.webhook_hint_ref ?? "—"}) pero <b>sin la referencia larga</b>: el sistema no pudo confirmarlo.
-      Verifique en el panel de ePayco y pegue aquí la referencia larga.
+      {w?.used ? (
+        <>ePayco avisó de un pago ({when(at)}) y se confirmó con {KIND_LABEL[w.used] ?? w.used}.</>
+      ) : (
+        <>
+          ePayco avisó {w?.approved ? <b>un pago APROBADO</b> : "un pago"} ({when(at)}{w?.franchise ? `, ${w.franchise}` : ""}, ref. corta {short ?? "—"}), pero el sistema
+          no pudo confirmarlo: falta la <b>referencia larga</b> (24 letras y números) que el celular del cliente debía traer al volver de ePayco.
+          Búsquela en el panel de Davipay y péguela en «Verificar con referencia»{w?.approved ? ", o use «Facturar con evidencia del webhook» si ya comprobó que el dinero entró" : ""}.
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * "Facturar con evidencia del webhook" (último recurso): solo para ventas con un aviso firmado de pago APROBADO sin confirmar.
+ * Nota obligatoria y confirmación; el servidor exige todas las condiciones y factura una sola vez.
+ */
+function EvidenceInvoice({ r, onDone }: { r: PagoRow; onDone: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  if (!r.webhook?.approved || r.webhook.used || r.refund_requested_at) return null;
+  async function run() {
+    setBusy(true);
+    setMsg("");
+    try {
+      const res = await fetch(`/api/admin/pagos/${r.id}/facturar-evidencia`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) setMsg(d.error ?? `Error ${res.status}`);
+      else {
+        setMsg(d.status === "invoiced" ? `Facturada ${d.invoice_name ?? ""}` : d.error ?? `Estado: ${d.status}`);
+        setOpen(false);
+        onDone();
+      }
+    } catch {
+      setMsg("Sin conexión con el servidor");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="space-y-1.5 mt-2 max-w-[300px]">
+      {!open ? (
+        <button onClick={() => setOpen(true)} className="px-3 min-h-11 rounded-md border border-warn-line text-warn-ink text-[13px] font-medium hover:bg-warn-soft">
+          Facturar con evidencia del webhook
+        </button>
+      ) : (
+        <div className="rounded-md border border-warn-line bg-warn-soft text-warn-ink p-2 space-y-2">
+          <p className="text-[12px]">
+            Último recurso: se factura con el aviso firmado de ePayco, <b>sin</b> consultar a ePayco. Antes compruebe en el panel de Davipay que el dinero entró
+            ({formatCOP(r.total)}). El sistema exige que el aviso coincida en todo con la venta.
+          </p>
+          <textarea
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            rows={2}
+            maxLength={500}
+            placeholder="Nota obligatoria (p. ej. «verificado en el panel de Davipay, PSE aprobado»)"
+            className="w-full border border-field rounded-md px-2 py-1 text-[13px] bg-surface text-fg"
+          />
+          <div className="flex gap-2 flex-wrap">
+            <button onClick={run} disabled={busy || note.trim().length < 5} className="px-3 min-h-11 rounded-md bg-brand text-white text-[13px] font-semibold disabled:opacity-50">
+              {busy ? "Facturando…" : "Sí, facturar"}
+            </button>
+            <button onClick={() => setOpen(false)} disabled={busy} className="px-3 min-h-11 rounded-md border border-field bg-surface text-[13px] text-body">
+              No
+            </button>
+          </div>
+        </div>
+      )}
+      {msg && <div className="text-[12px] text-soft break-words">{msg}</div>}
     </div>
   );
 }
@@ -80,6 +161,7 @@ function Refs({ r }: { r: PagoRow }) {
           {r.attempts.map((a) => (
             <div key={a.no}>
               <span className="font-mono">{a.invoice}</span> · {a.channel === "qr" ? "QR" : "pantalla"} · <b>{a.status}</b> · <span className="text-dim">{when(a.at)}</span>
+              {a.ref_used && <span className="text-dim"> · confirmado con {KIND_LABEL[a.ref_used] ?? a.ref_used}</span>}
             </div>
           ))}
         </div>
@@ -196,6 +278,7 @@ function VerifyBox({ r, onDone }: { r: PagoRow; onDone: () => void }) {
   const [ref, setRef] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
+  const [ok, setOk] = useState(false);
 
   async function run() {
     setBusy(true);
@@ -204,6 +287,7 @@ function VerifyBox({ r, onDone }: { r: PagoRow; onDone: () => void }) {
       const res = await fetch(`/api/admin/pagos/${r.id}/verificar`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ref_payco: ref }) });
       const d = await res.json().catch(() => ({}));
       setMsg(!res.ok ? d.error ?? `Error ${res.status}` : d.message ?? `Resultado: ${d.outcome}`);
+      setOk(res.ok && d.outcome !== "no_verificado");
       if (res.ok) {
         setRef("");
         onDone();
@@ -221,14 +305,14 @@ function VerifyBox({ r, onDone }: { r: PagoRow; onDone: () => void }) {
         <input
           value={ref}
           onChange={(e) => setRef(e.target.value)}
-          placeholder="Enlace con ref_payco= o referencia larga"
+          placeholder="Referencia larga (24 caracteres) o enlace con ref_payco="
           className="flex-1 border border-field rounded-md px-2 min-h-11 text-[13px] bg-surface text-fg"
         />
         <button onClick={run} disabled={busy || !ref.trim()} className="px-3 min-h-11 rounded-md border border-brand text-brand-text text-[13px] font-medium hover:bg-brand-soft disabled:opacity-50">
           {busy ? "…" : "Verificar"}
         </button>
       </div>
-      {msg && <div className="text-[12px] text-soft">{msg}</div>}
+      {msg && <div className={`text-[12px] break-words ${ok ? "text-ok-ink" : "text-soft"}`}>{msg}</div>}
     </div>
   );
 }
@@ -285,7 +369,15 @@ export default function PagosClient({ review, unconfirmed, refunds, duplicates }
                       <WebhookHint r={r} />
                     </td>
                     <td className="px-4 py-2"><Refs r={r} /></td>
-                    <td className="px-4 py-2"><ReviewActions r={r} onDone={refresh} /></td>
+                    <td className="px-4 py-2">
+                      <ReviewActions r={r} onDone={refresh} />
+                      <EvidenceInvoice r={r} onDone={refresh} />
+                      {r.status === "pago_por_revisar" && (
+                        <div className="mt-2">
+                          <VerifyBox r={r} onDone={refresh} />
+                        </div>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -354,7 +446,7 @@ export default function PagosClient({ review, unconfirmed, refunds, duplicates }
       <section className="space-y-2">
         <h2 className="text-lg font-bold">Cobros sin confirmar <span className="text-[14px] font-medium text-dim">(últimos 7 días)</span></h2>
         <p className="text-[13px] text-dim">
-          Cobros que quedaron esperando o vencieron. Si el cliente SÍ pagó pero la pantalla no recibió la referencia, péguela aquí: el servidor la verifica con ePayco
+          Cobros que quedaron esperando o vencieron. Si el cliente SÍ pagó pero la pantalla no recibió la referencia, péguela aquí (la referencia LARGA de 24 letras y números, o el enlace con ref_payco=): el servidor la verifica con ePayco
           (monto, factura, moneda, modo de prueba y firma). Si el cobro ya había vencido, el pago aprobado pasa a «Pago tardío» arriba para que usted decida.
         </p>
         {unconfirmed.length === 0 ? (
@@ -385,7 +477,10 @@ export default function PagosClient({ review, unconfirmed, refunds, duplicates }
                       {r.payment_failure_reason && <div className="text-[12px] text-soft mt-1 max-w-xs break-words">{r.payment_failure_reason}</div>}
                       <WebhookHint r={r} />
                     </td>
-                    <td className="px-4 py-2"><VerifyBox r={r} onDone={refresh} /></td>
+                    <td className="px-4 py-2">
+                      <VerifyBox r={r} onDone={refresh} />
+                      <EvidenceInvoice r={r} onDone={refresh} />
+                    </td>
                   </tr>
                 ))}
               </tbody>

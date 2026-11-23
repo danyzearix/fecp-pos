@@ -18,7 +18,7 @@ import { transitionAllowed, transitionSale, type SaleStatus } from "../sale-stat
 import { EpaycoError, fetchTransaction, isShortRef, isUnresolvedError, type EpaycoDiag, type NormalizedTx } from "./adapter";
 import { getEpaycoConfig } from "./config";
 import { judgeTransaction } from "./verify";
-import { acceptedInvoices, attachRef, markAttempt } from "./attempts";
+import { acceptedInvoices, attachRef, markAttempt, markRefUsed, REF_KIND_TEXT, type RefKind } from "./attempts";
 
 export class PaymentInputError extends Error {
   constructor(public status: number, message: string) {
@@ -36,6 +36,12 @@ export type PaymentResult = {
   /** Mensaje seguro para mostrar al cliente en el kiosco (sin detalles internos) */
   message: string;
   startInvoicing: boolean;
+  /** (solo no_verificado) por qué no se pudo resolver la consulta: 'notfound' = ePayco no reconoció la referencia; 'network'/'http' = pasajero */
+  unresolvedKind?: string;
+  /** motivo interno (para el panel del admin; nunca para el cliente) */
+  reason?: string;
+  /** cómo fue la consulta a ePayco: tipo de referencia, HTTP, milisegundos (sin valores ni datos personales) */
+  lookup?: { ref_kind: string; http: number | null; ms: number; error_kind?: string; cod_response?: number; response?: string | null };
 };
 
 const REF_RE = /^[A-Za-z0-9_-]{4,64}$/;
@@ -89,9 +95,12 @@ const detailOf = (tx: NormalizedTx) => ({
   franchise: tx.franchise,
 });
 
-const result = async (saleId: string, outcome: PaymentOutcome, local: string, startInvoicing = false): Promise<PaymentResult> => {
+const result = async (
+  saleId: string, outcome: PaymentOutcome, local: string, startInvoicing = false, unresolvedKind?: string,
+  extra: Pick<PaymentResult, "reason" | "lookup"> = {}
+): Promise<PaymentResult> => {
   const s = await loadSale(saleId);
-  return { outcome, saleStatus: s?.status ?? "desconocido", message: customerMessage(outcome, local), startInvoicing };
+  return { outcome, saleStatus: s?.status ?? "desconocido", message: customerMessage(outcome, local), startInvoicing, ...(unresolvedKind ? { unresolvedKind } : {}), ...extra };
 };
 
 export const duplicateReason = (local: string, txRef?: string | null) =>
@@ -122,12 +131,15 @@ async function settle(p: {
   amount?: number;
   /** diagnóstico (solo códigos y nombres de campos) que se guarda cuando no hay transacción */
   diag?: unknown;
+  /** referencia que se guarda en payment_attempts.ref_payco: solo la LARGA (con la corta o el transaction_id no se debe guardar ahí) */
+  attemptRef?: string | null;
 }): Promise<PaymentOutcome> {
   const c = await pool.connect();
   const exec = (t: string, v: unknown[]) => c.query(t, v);
   try {
     await c.query("BEGIN");
-    const cur = (await c.query<{ status: SaleStatus }>("SELECT status FROM sales WHERE id = $1 FOR UPDATE", [p.saleId])).rows[0]?.status;
+    const row = (await c.query<{ status: SaleStatus; payment_status: string | null }>("SELECT status, payment_status FROM sales WHERE id = $1 FOR UPDATE", [p.saleId])).rows[0];
+    const cur = row?.status;
     let outcome: PaymentOutcome;
     let refOutcome: string;
     let refReason = p.reason;
@@ -143,7 +155,7 @@ async function settle(p: {
           },
           exec
         );
-        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.ref });
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.attemptRef ?? null });
         outcome = "pagado"; refOutcome = "aprobado";
       } else if (cur === "pago_fallido") {
         await transitionSale(
@@ -154,7 +166,7 @@ async function settle(p: {
           },
           exec
         );
-        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.ref });
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.attemptRef ?? null });
         outcome = "tardio"; refOutcome = "tardio";
       } else {
         // La venta ya está pagada/facturada/en revisión/anulada. ¿Es el MISMO pago visto con otra referencia (la corta y la
@@ -174,8 +186,22 @@ async function settle(p: {
         const pend = p.tx
           ? (await c.query<{ n: number }>("SELECT count(*)::int AS n FROM payment_attempts WHERE sale_id = $1 AND invoice = $2 AND status IN ('pendiente','abierto')", [p.saleId, p.tx.invoice])).rows[0]?.n ?? 0
           : 0;
-        if (pend > 0 && cur === "pago_por_revisar" && !same) {
-          await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.ref });
+        if (cur === "pago_por_revisar" && row?.payment_status === "por_confirmar") {
+          // El cobro venció con un aviso firmado de pago aprobado (o un pago en curso) que no se había podido confirmar. ePayco ACABA de
+          // confirmarlo: es el pago de esta venta, se factura normalmente (no es un duplicado ni necesita decisión del admin).
+          await transitionSale(
+            p.saleId, ["pago_por_revisar"], "pagado",
+            {
+              payment_status: "aprobado", payment_failure_reason: null, last_error: null,
+              epayco_ref: p.ref, epayco_transaction_id: p.tx?.transactionId ?? null, payment_reference: p.tx?.refPayco ?? p.ref,
+            },
+            exec
+          );
+          await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.attemptRef ?? null });
+          outcome = "pagado"; refOutcome = "aprobado";
+          refReason = "Pago aprobado y verificado (el cobro había vencido con el pago en curso)";
+        } else if (pend > 0 && cur === "pago_por_revisar" && !same) {
+          await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "aprobado", { ref: p.attemptRef ?? null });
           outcome = "por_revisar"; refOutcome = "por_revisar";
           refReason = `Pago APROBADO (ref. ${p.tx?.refPayco}) de un intento que estaba pendiente cuando se canceló la compra. Un administrador decide (Facturar si el dinero entró).`;
         } else if (same && (cur === "pago_por_revisar" || cur === "pago_tardio")) {
@@ -200,12 +226,12 @@ async function settle(p: {
         } else {
           await c.query("UPDATE sales SET payment_status = $2, payment_failure_reason = $3 WHERE id = $1 AND status = 'esperando_pago'", [p.saleId, status, p.reason]);
         }
-        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, status, { ref: p.ref, reason: p.reason });
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, status, { ref: p.attemptRef ?? null, reason: p.reason });
       } else if (cur === "pago_por_revisar") {
         // La venta quedó "por revisar" porque el kiosco se reinició o se canceló con el pago en curso. Si ePayco confirma que NO hubo pago
         // (rechazado/cancelado) y no hay otro intento aprobado o por revisar, ya no hay nada que revisar: se cierra.
         const status = p.cancelled ? "cancelado" : "rechazado";
-        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, status, { ref: p.ref, reason: p.reason });
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, status, { ref: p.attemptRef ?? null, reason: p.reason });
         const other = (await c.query<{ n: number }>("SELECT count(*)::int AS n FROM payment_attempts WHERE sale_id = $1 AND status IN ('abierto','pendiente','aprobado','por_revisar')", [p.saleId])).rows[0]?.n ?? 0;
         if (!other) await transitionSale(p.saleId, ["pago_por_revisar"], "pago_fallido", { payment_status: status, payment_failure_reason: p.reason }, exec);
       }
@@ -213,7 +239,7 @@ async function settle(p: {
     } else {
       if (cur === "esperando_pago") {
         await transitionSale(p.saleId, ["esperando_pago"], "pago_por_revisar", { payment_status: "por_revisar", payment_failure_reason: p.reason, epayco_ref: p.ref }, exec);
-        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "por_revisar", { ref: p.ref, reason: p.reason });
+        await markAttempt(exec, p.saleId, p.tx?.invoice ?? null, "por_revisar", { ref: p.attemptRef ?? null, reason: p.reason });
       }
       outcome = "por_revisar"; refOutcome = "por_revisar";
     }
@@ -237,7 +263,19 @@ export type PaymentCheckSource = "kiosco" | "webhook" | "publica" | "admin" | "p
 
 const g = globalThis as unknown as { __shortRefLogged?: Set<string> };
 
-export async function processPayment(saleId: string, refRaw: string, source: PaymentCheckSource): Promise<PaymentResult> {
+export type ProcessOpts = {
+  /**
+   * Permite consultar con una referencia que NO es la larga (x_transaction_id o x_ref_payco, que trae el webhook). Sin esto, una referencia
+   * corta (solo dígitos) que mande un navegador NO se consulta (comportamiento de siempre). 'kind' dice de qué tipo es.
+   */
+  kind?: RefKind;
+  /** (solo con kind distinto de 'larga') cuenta una consulta sin resolver en verify_attempts. Por defecto solo la larga cuenta. */
+  countUnresolved?: boolean;
+  /** Transacción ya construida desde un webhook FIRMADO (EPAYCO_TRUST_SIGNED_WEBHOOK): no se consulta a ePayco. Ver trust.ts */
+  trusted?: NormalizedTx;
+};
+
+export async function processPayment(saleId: string, refRaw: string, source: PaymentCheckSource, opts: ProcessOpts = {}): Promise<PaymentResult> {
   const ref = String(refRaw ?? "").trim();
   if (!REF_RE.test(ref)) throw new PaymentInputError(400, "ref_payco no válido");
 
@@ -247,7 +285,8 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
 
   // La consulta a ePayco SOLO funciona con la referencia larga. Con la corta (solo dígitos) no se llama a ePayco ni se
   // consume nada: se espera la larga (la trae el navegador al volver de ePayco, o el admin desde el panel).
-  if (isShortRef(ref)) {
+  const isLong = !opts.kind || opts.kind === "larga";
+  if (isShortRef(ref) && !opts.kind) {
     const seenKey = `${saleId}:${ref}`;
     const logged = (g.__shortRefLogged ??= new Set());
     if (!logged.has(seenKey)) {
@@ -292,18 +331,23 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
 
   await writeLog("pago", `Verificando pago de ${sale.local_number} (origen: ${source})`, { detail: { sale_id: saleId, ref_payco: ref, source } });
   // La referencia larga queda guardada en el intento: así el servidor puede seguir consultando a ePayco por su cuenta (poller)
-  await attachRef(saleId, ref).catch(() => {});
+  if (isLong) await attachRef(saleId, ref).catch(() => {});
+  const attemptRef = isLong ? ref : null;
 
   // ---- Consultar a ePayco (adaptador) y juzgar ----
   let tx: NormalizedTx | null = null;
+  const t0 = Date.now();
+  let lookup: PaymentResult["lookup"];
   let verdict;
   let diag: (EpaycoDiag & { error_kind?: string; ref_kind?: string; ref_len?: number }) | undefined;
   let unresolved = false;
   try {
-    tx = await fetchTransaction(ref);
+    tx = opts.trusted ?? (await fetchTransaction(ref));
+    lookup = { ref_kind: opts.trusted ? "firma" : (opts.kind ?? "larga"), http: opts.trusted ? null : 200, ms: Date.now() - t0, cod_response: tx.codResponse, response: tx.response };
     verdict = judgeTransaction(tx, { local_number: sale.local_number, total: sale.total, invoices: await acceptedInvoices(saleId, sale.local_number) }, { saleId, testMode: getEpaycoConfig().testMode });
   } catch (e) {
-    if (e instanceof EpaycoError) diag = { ...e.diag, error_kind: e.kind, ref_kind: "larga", ref_len: ref.length };
+    if (e instanceof EpaycoError) diag = { ...e.diag, error_kind: e.kind, ref_kind: opts.kind ?? "larga", ref_len: ref.length };
+    lookup = { ref_kind: opts.kind ?? "larga", http: e instanceof EpaycoError ? e.diag?.http ?? null : null, ms: Date.now() - t0, error_kind: e instanceof EpaycoError ? e.kind : "error" };
     const reason = e instanceof EpaycoError ? `No se pudo verificar con ePayco (${e.kind}): ${e.message}` : `Error inesperado verificando el pago: ${e instanceof Error ? e.message : e}`;
     verdict = { kind: "review" as const, reason };
     unresolved = isUnresolvedError(e);
@@ -312,20 +356,24 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
   // ---- No se pudo RESOLVER la consulta (red, error de ePayco, referencia no encontrada) ----
   // No es "algo no coincide": no se consume la referencia ni se manda a revisión de inmediato; la venta sigue esperando.
   if (unresolved) {
+    // Solo la referencia larga cuenta hacia "demasiados intentos": las demás (transaction_id / corta) son pruebas adicionales que pueden no servir nunca
+    const counts = isLong || opts.countUnresolved;
     const att = await query<{ n: number }>(
-      "UPDATE sales SET verify_attempts = verify_attempts + 1 WHERE id = $1 AND status = 'esperando_pago' RETURNING verify_attempts AS n",
+      counts
+        ? "UPDATE sales SET verify_attempts = verify_attempts + 1 WHERE id = $1 AND status = 'esperando_pago' RETURNING verify_attempts AS n"
+        : "SELECT verify_attempts AS n FROM sales WHERE id = $1",
       [saleId]
     );
     const attempts = att.rows[0]?.n ?? 0;
     // Se registra el 1.º, 2.º, 3.º intento y luego cada 10.º (la pantalla de la caja reintenta cada 3 s)
-    if (attempts <= 3 || attempts % 10 === 0) {
+    if (counts && (attempts <= 3 || attempts % 10 === 0)) {
       await writeLog("pago", `No se pudo verificar el pago de ${sale.local_number} con ePayco (intento ${attempts}): ${verdict.kind === "review" ? verdict.reason : ""}`, {
         level: "warn", detail: { sale_id: saleId, source, attempts, diag },
       });
     }
-    if (attempts < MAX_UNRESOLVED) {
+    if (attempts < MAX_UNRESOLVED || !counts) {
       await query("DELETE FROM payment_refs WHERE ref_payco = $1 AND outcome = 'procesando'", [ref]);
-      return result(saleId, "no_verificado", sale.local_number);
+      return result(saleId, "no_verificado", sale.local_number, false, diag?.error_kind ?? "notfound", { reason: verdict.kind === "review" ? verdict.reason : undefined, lookup });
     }
     // Demasiados intentos sin poder verificar: a revisión, para que un admin lo vea (más abajo, por el camino de siempre)
   }
@@ -333,22 +381,28 @@ export async function processPayment(saleId: string, refRaw: string, source: Pay
   if (verdict.kind === "pending") {
     // No es definitivo: se libera el ref para poder consultarlo de nuevo; la venta sigue esperando
     await query("DELETE FROM payment_refs WHERE ref_payco = $1 AND outcome = 'procesando'", [ref]);
-    await query("UPDATE sales SET payment_status = 'pendiente', epayco_ref = $2 WHERE id = $1 AND status = 'esperando_pago'", [saleId, ref]);
-    await markAttempt((t, v) => query(t, v), saleId, tx?.invoice ?? null, "pendiente", { ref });
+    await query("UPDATE sales SET payment_status = 'pendiente', epayco_ref = $2 WHERE id = $1 AND status = 'esperando_pago'", [saleId, isLong ? ref : null]);
+    await markAttempt((t, v) => query(t, v), saleId, tx?.invoice ?? null, "pendiente", { ref: attemptRef });
     await writeLog("pago", `Pago de ${sale.local_number} PENDIENTE en ePayco`, { detail: { sale_id: saleId, ref_payco: ref, tx: tx ? detailOf(tx) : null } });
-    return result(saleId, "pendiente", sale.local_number);
+    return result(saleId, "pendiente", sale.local_number, false, undefined, { reason: verdict.reason, lookup });
   }
 
   const kind = verdict.kind === "approved" ? "approved" : verdict.kind === "rejected" ? "rejected" : "review";
   let reason = verdict.kind === "approved" ? "Pago aprobado y verificado" : verdict.reason;
-  const outcome = await settle({ saleId, localNumber: sale.local_number, ref, kind, reason, tx: tx ?? undefined, diag, cancelled: verdict.kind === "rejected" && verdict.cancelled });
+  // ePayco SÍ devolvió la transacción con esta referencia: se anota cuál tipo funcionó (larga / transaction_id / corta / firma)
+  if (tx && !unresolved) {
+    const used: RefKind = opts.trusted ? "firma" : (opts.kind ?? "larga");
+    await markRefUsed(saleId, tx.invoice, used).catch(() => {});
+    if (!isLong || opts.trusted) await writeLog("pago", `Pago de ${sale.local_number}: ePayco ${opts.trusted ? "no se consultó (aviso firmado aceptado por EPAYCO_TRUST_SIGNED_WEBHOOK)" : `reconoció ${REF_KIND_TEXT[used]}`}`, { level: opts.trusted ? "warn" : "info", detail: { sale_id: saleId, ref_used: used, invoice: tx.invoice } });
+  }
+  const outcome = await settle({ saleId, localNumber: sale.local_number, ref, kind, reason, tx: tx ?? undefined, diag, cancelled: verdict.kind === "rejected" && verdict.cancelled, attemptRef });
   if (outcome === "duplicado") reason = duplicateReason(sale.local_number, tx?.refPayco ?? null);
 
   await writeLog("pago", `Pago de ${sale.local_number}: ${outcome.toUpperCase()}${outcome === "pagado" ? "" : ` — ${reason}`}`, {
     level: outcome === "pagado" || outcome === "rechazado" || outcome === "cancelado" ? "info" : "error",
     detail: { sale_id: saleId, ref_payco: ref, outcome, reason, source, tx: tx ? detailOf(tx) : null, diag: tx ? undefined : diag },
   });
-  return result(saleId, outcome, sale.local_number, outcome === "pagado");
+  return result(saleId, outcome, sale.local_number, outcome === "pagado", undefined, { reason, lookup });
 }
 
 /**
@@ -367,20 +421,63 @@ export async function recordWebhookHint(p: { saleId: string; ref: string; txId: 
   return (r.rowCount ?? 0) > 0;
 }
 
-/** Cobros que no se confirmaron en 10 minutos → pago_fallido ("tiempo agotado"). Se ejecuta al consultar el estado. */
+/** Motivo que ve el admin cuando el cobro vence con un aviso firmado de pago APROBADO que no se pudo confirmar */
+export const APPROVED_WEBHOOK_REASON = "ePayco avisó un pago aprobado que no se pudo confirmar automáticamente";
+
+/**
+ * Cobros que no se confirmaron a tiempo (10 minutos). Se ejecuta al consultar el estado y en la tarea de fondo. Reglas:
+ *  - CON evidencia de pago en un intento vivo (aviso firmado de ePayco, referencia larga conocida o estado pendiente): la venta NO falla.
+ *    Pasa a pago_por_revisar con payment_status 'por_confirmar' y el intento sigue abierto: la consulta activa lo sigue intentando y, si
+ *    ePayco confirma el pago, se factura sola. Si nunca se confirma, un admin decide (o usa "Facturar con evidencia del webhook").
+ *  - Aviso firmado que dice RECHAZADO/FALLIDO (x_cod_response 2/4/9/10/11) sin otra evidencia: eso NO es evidencia de pago.
+ *  - SIN ninguna evidencia: pago_fallido ("tiempo agotado"), como siempre.
+ */
 export async function expireWaitingPayments(saleId?: string): Promise<number> {
-  if (!transitionAllowed("esperando_pago", "pago_fallido")) throw new Error("Transición no permitida");
+  if (!transitionAllowed("esperando_pago", "pago_fallido") || !transitionAllowed("esperando_pago", "pago_por_revisar")) throw new Error("Transición no permitida");
+  const evidenceSql = `EXISTS (SELECT 1 FROM payment_attempts a WHERE a.sale_id = s.id AND a.status IN ('abierto','pendiente')
+                        AND (a.webhook_approved_at IS NOT NULL OR a.status = 'pendiente'
+                             OR (a.ref_payco IS NOT NULL AND a.ref_payco !~ '^[0-9]{1,12}$')
+                             OR (a.webhook_at IS NOT NULL AND COALESCE(a.webhook_summary->>'x_cod_response','') IN ('1','3','7','8'))))`;
+  const kept = await query<{ id: string; local_number: string; approved: boolean }>(
+    `UPDATE sales s SET status = 'pago_por_revisar', payment_status = 'por_confirmar',
+            payment_failure_reason = CASE WHEN EXISTS (SELECT 1 FROM payment_attempts a WHERE a.sale_id = s.id AND a.webhook_approved_at IS NOT NULL AND a.status IN ('abierto','pendiente'))
+                                          THEN '${APPROVED_WEBHOOK_REASON}'
+                                          ELSE 'El cobro venció con un pago en proceso que ePayco aún no confirma. El sistema lo sigue consultando; si se confirma, se factura solo.' END
+      WHERE s.status = 'esperando_pago' AND s.payment_expires_at IS NOT NULL AND s.payment_expires_at < now()
+        AND ($1::uuid IS NULL OR s.id = $1) AND ${evidenceSql}
+      RETURNING s.id, s.local_number, (s.payment_failure_reason = '${APPROVED_WEBHOOK_REASON}') AS approved`,
+    [saleId ?? null]
+  );
+  for (const r of kept.rows) {
+    await writeLog("pago", `Cobro ${r.local_number} venció CON evidencia de pago${r.approved ? " (aviso firmado de pago APROBADO)" : ""}: queda por revisar (no pago fallido) y se sigue consultando`, {
+      level: "warn", detail: { sale_id: r.id, approved_webhook: r.approved },
+    });
+  }
   const { rows } = await query<{ id: string; local_number: string }>(
-    `UPDATE sales SET status = 'pago_fallido', payment_status = 'vencido',
+    `UPDATE sales s SET status = 'pago_fallido', payment_status = 'vencido',
             payment_failure_reason = 'Tiempo agotado: el pago no se confirmó en ${getEpaycoConfig().expiresMinutes} minutos'
-      WHERE status = 'esperando_pago' AND payment_expires_at IS NOT NULL AND payment_expires_at < now()
-        AND ($1::uuid IS NULL OR id = $1)
-      RETURNING id, local_number`,
+      WHERE s.status = 'esperando_pago' AND s.payment_expires_at IS NOT NULL AND s.payment_expires_at < now()
+        AND ($1::uuid IS NULL OR s.id = $1) AND NOT ${evidenceSql}
+      RETURNING s.id, s.local_number`,
     [saleId ?? null]
   );
   if (rows.length) {
     await query("UPDATE payment_attempts SET status = 'vencido', closed_at = now() WHERE sale_id = ANY($1::uuid[]) AND status = 'abierto'", [rows.map((r) => r.id)]);
   }
   for (const r of rows) await writeLog("pago", `Cobro ${r.local_number} VENCIDO (tiempo agotado)`, { level: "warn", detail: { sale_id: r.id } });
-  return rows.length;
+  return rows.length + kept.rows.length;
+}
+
+/**
+ * Llegó un aviso FIRMADO de pago APROBADO para una venta que ya estaba fallida/vencida (pago_fallido) y no se pudo confirmar con ePayco:
+ * pasa a pago_tardio (no se factura sola; un admin decide). Guarda las referencias del aviso para reconocer el MISMO pago después.
+ */
+export async function markLateApprovedWebhook(saleId: string, s: { x_ref_payco: string; x_transaction_id: string }): Promise<boolean> {
+  const moved = await transitionSale(saleId, ["pago_fallido"], "pago_tardio", {
+    payment_status: "tardio",
+    payment_reference: s.x_ref_payco || null,
+    epayco_transaction_id: s.x_transaction_id || null,
+    payment_failure_reason: `${APPROVED_WEBHOOK_REASON}, y llegó DESPUÉS de vencer el cobro. Un administrador decide (facturar o reembolsar).`,
+  });
+  return moved;
 }

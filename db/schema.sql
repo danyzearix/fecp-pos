@@ -404,3 +404,21 @@ ALTER TABLE payment_refs ADD CONSTRAINT payment_refs_outcome_check CHECK (outcom
 -- "Evidencia" = ref_payco conocido, estado pendiente en ePayco o aviso del webhook. Con evidencia el servidor NO deja abrir otro intento.
 ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS webhook_at   TIMESTAMPTZ;
 ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS qr_opened_at TIMESTAMPTZ;
+
+-- Referencias que trae el WEBHOOK de ePayco. OJO: ninguna es la referencia LARGA (ref_payco, 24 hex) con la que se consulta a ePayco:
+--   x_ref_payco = número corto ("Referencia Davipay", p. ej. 395055851); x_transaction_id = id del procesador (PSE: 18 dígitos; tarjeta: "103").
+-- La larga solo llega por el NAVEGADOR (onResponse del checkout o la URL de retorno ?ref_payco=). Se guardan para el panel y la evidencia.
+--   ref_used: con qué se confirmó el pago: larga | transaction_id | corta (estas dos solo con EPAYCO_ALT_REF_LOOKUP=true) | firma (aviso firmado:
+--             EPAYCO_TRUST_SIGNED_WEBHOOK=true o "Facturar con evidencia del webhook" del admin)
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS x_ref_payco      TEXT;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS x_transaction_id TEXT;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS webhook_invoice  TEXT;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS ref_used         TEXT;
+-- Resumen del ÚLTIMO aviso firmado (sin firma ni datos personales): referencias, invoice, extra1, monto, moneda, estado, franquicia, modo y fechas.
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS webhook_summary     JSONB;
+-- Cuándo llegó un aviso firmado de pago APROBADO (x_cod_response=1). Con esto el cobro NO vence como fallido: pasa a "por revisar".
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS webhook_approved_at TIMESTAMPTZ;
+-- "Facturar con evidencia del webhook" (admin): quién, cuándo y la nota obligatoria
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS evidence_by   INTEGER;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS evidence_at   TIMESTAMPTZ;
+ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS evidence_note TEXT;

@@ -1,6 +1,6 @@
 "use client";
 
-// Pantalla PÚBLICA de pago (sin sesión), para el celular del cliente: /pagar/<código> y /pagar/<código>/respuesta.
+// Pantalla PÚBLICA de pago (sin sesión), para el celular del cliente: /pagar/<código> y /pagar/<código>/retorno (antes /respuesta).
 // Solo muestra lo mínimo (compra, total, estado). Nunca marca nada como pagado por lo que diga el navegador: el servidor
 // verifica el ref_payco con ePayco y esta pantalla solo refleja el estado que el servidor guarda.
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -18,6 +18,11 @@ export type PublicInfo = {
   channel_changed?: boolean;
   /** estado del último intento de pago (abierto, pendiente, rechazado, cancelado…) */
   attempt_status?: string | null;
+  payment_status?: string | null;
+  /** el pago está en curso (aviso firmado de ePayco, referencia o pendiente) pero aún sin confirmar */
+  in_process?: boolean;
+  /** de dónde salió el cobro: kiosco o caja (para decirle al cliente a dónde volver) */
+  source?: string;
   message: string;
   test: boolean;
   expires_at: string | null;
@@ -27,7 +32,7 @@ const json = { "Content-Type": "application/json" };
 const WAITING = ["esperando_pago"];
 const PROCESSING = ["pagado", "pending", "invoicing"];
 
-export default function PagarClient({ code, mode, initial }: { code: string; mode: "pagar" | "respuesta"; initial: PublicInfo }) {
+export default function PagarClient({ code, mode, initial }: { code: string; mode: "pagar" | "retorno"; initial: PublicInfo }) {
   const [info, setInfo] = useState<PublicInfo>(initial);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -64,10 +69,11 @@ export default function PagarClient({ code, mode, initial }: { code: string; mod
 
   const waiting = WAITING.includes(info.status);
   const processing = PROCESSING.includes(info.status);
+  const inProcess = !!info.in_process;
 
   // Cada 3 s: si hay ref_payco se le pide al servidor que lo verifique (como mucho cada 8 s); si no, se lee el estado
   useEffect(() => {
-    if (!waiting && !processing) return;
+    if (!waiting && !processing && !inProcess) return;
     const tick = async () => {
       if (tickBusy.current) return;
       tickBusy.current = true;
@@ -87,7 +93,7 @@ export default function PagarClient({ code, mode, initial }: { code: string; mod
     void tick();
     const iv = setInterval(tick, 3000);
     return () => clearInterval(iv);
-  }, [code, waiting, processing]);
+  }, [code, waiting, processing, inProcess]);
 
   const pay = useCallback(async () => {
     setBusy(true);
@@ -114,7 +120,10 @@ export default function PagarClient({ code, mode, initial }: { code: string; mod
   }, [code]);
 
   const ok = info.status === "invoiced";
-  const warn = ["failed", "revisar", "pago_por_revisar", "pago_tardio"].includes(info.status);
+  const warn = !inProcess && ["failed", "revisar", "pago_por_revisar", "pago_tardio"].includes(info.status);
+  // En el retorno desde ePayco: con el pago aprobado se le dice al cliente que ya puede volver al kiosco (o a la caja)
+  const paidOk = ["pagado", "pending", "invoicing", "invoiced", "failed", "revisar"].includes(info.status);
+  const backTo = info.source === "caja" ? "a la caja" : "al kiosco";
   const bad = ["pago_fallido", "anulada"].includes(info.status);
 
   return (
@@ -131,12 +140,22 @@ export default function PagarClient({ code, mode, initial }: { code: string; mod
         {(ok || warn || bad) && (
           <div className={`text-5xl ${ok ? "text-ok-ink" : warn ? "text-warn-ink" : "text-err-ink"}`}>{ok ? "✓" : warn ? "!" : "✕"}</div>
         )}
-        {processing && <div className="mx-auto w-10 h-10 rounded-full border-4 border-line border-t-brand animate-spin" />}
+        {(processing || inProcess) && <div className="mx-auto w-10 h-10 rounded-full border-4 border-line border-t-brand animate-spin" />}
 
-        <p className="text-[16px] font-medium">{info.message}</p>
+        {mode === "retorno" && paidOk ? (
+          <div className="space-y-1">
+            <p className="text-xl font-bold">Pago aprobado</p>
+            <p className="text-[16px] font-medium">Ya puede volver {backTo}. Si dejó su correo, allí le llegará la factura.</p>
+          </div>
+        ) : mode === "retorno" && info.status === "pago_fallido" ? (
+          <p className="text-[16px] font-medium">El pago no se completó.</p>
+        ) : (
+          <p className="text-[16px] font-medium">{info.message}</p>
+        )}
+        {inProcess && <p className="text-[13px] text-dim">Puede cerrar esta página: la compra se confirma sola cuando el banco responda.</p>}
         {ok && info.invoice_name && <p className="text-xl font-bold">Factura {info.invoice_name}</p>}
 
-        {waiting && info.can_pay && (
+        {waiting && info.can_pay && !inProcess && (
           <div className="space-y-2">
             <button onClick={() => void pay()} disabled={busy} className="w-full px-6 py-4 rounded-xl bg-brand text-white text-lg font-bold disabled:opacity-50">
               {busy ? "Abriendo…" : info.attempt_status === "cancelado" || info.attempt_status === "rechazado" ? "Intentar de nuevo" : opened ? "Abrir el pago de nuevo" : "Pagar ahora"}
@@ -148,7 +167,7 @@ export default function PagarClient({ code, mode, initial }: { code: string; mod
         {waiting && info.attempt_status === "pendiente" && <div className="mx-auto w-10 h-10 rounded-full border-4 border-line border-t-brand animate-spin" aria-label="Esperando la confirmación" />}
         {error && <p className="text-[14px] text-err-ink">{error}</p>}
 
-        {mode === "respuesta" && info.status === "pago_fallido" && (
+        {mode === "retorno" && info.status === "pago_fallido" && (
           <a href={`/pagar/${code}`} className="inline-block text-[14px] text-brand-text underline">
             Volver al enlace de pago
           </a>

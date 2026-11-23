@@ -152,12 +152,15 @@ Abre la app por **`http://127.0.0.1:3000`** (no `localhost`). Tarjeta de prueba 
 - [ ] Lista fecha, venta, cliente, monto, motivo y `ref_payco`.
 - [ ] **Facturar** pide confirmación; al aceptar genera la factura y la venta sale de la lista.
 - [ ] **Marcar para reembolso** pide confirmación; queda en “Marcadas para reembolso” con fecha y quién, no se factura y no cuenta en reportes. No se puede marcar ni facturar dos veces.
-- [ ] **Cobros sin confirmar:** pegar el enlace `…landingresume?ref_payco=…` de un pago real de prueba en una venta que quedó esperando → el servidor lo verifica y la factura sale sola.
+- [ ] **Cobros sin confirmar:** pegar el enlace `…?ref_payco=…` (o la referencia larga de 24 caracteres) de un pago real de prueba en una venta que quedó esperando → «Pago aprobado y verificado…» y la factura sale sola.
+- [ ] Pegar el número corto (`395055851`) o el `x_transaction_id` (`395055851179545908`) → responde **al instante** «Eso parece la referencia corta / el número de transacción: con ese dato ePayco no permite consultar…» y explica dónde está la larga (nunca se queda en «Estamos verificando»).
+- [ ] Pegar una referencia larga inventada → «ePayco no encontró esa referencia». En *Admin → Logs* (tipo pago) cada verificación muestra tipo de referencia, HTTP y tiempo.
+- [ ] **Facturar con evidencia del webhook** (venta con aviso de pago aprobado sin confirmar): sin nota no deja; con nota factura **una vez**; un segundo clic dice que ya se resolvió. En una venta sin aviso el botón no aparece.
 - [ ] Un cajero que abre `/admin/pagos-por-revisar` o llama a `/api/admin/pagos/...` recibe `403` (queda log de seguridad).
 
 ### Páginas públicas
 - [ ] `/pagar/<código>` abre **sin iniciar sesión** y solo muestra número de compra, total y estado. Un código inventado → “Enlace no válido”.
-- [ ] Con un celular en la misma red (o con `APP_PUBLIC_URL`): “Pagar ahora” abre ePayco; al terminar vuelve a `/pagar/<código>/respuesta` y muestra la factura.
+- [ ] Con un celular en la misma red (o con `APP_PUBLIC_URL`): “Pagar ahora” abre ePayco; al terminar vuelve a **`/pagar/<código>/retorno`** y muestra «Pago aprobado. Ya puede volver al kiosco…» (o «Su pago está en proceso» / «El pago no se completó»).
 - [ ] Con `APP_PUBLIC_URL` definido, el panel de cobro de la caja muestra el **QR**.
 - [ ] Con `APP_PUBLIC_URL` definido y un dominio con HTTPS: el webhook confirma el pago aunque se cierre el navegador.
 
@@ -178,6 +181,8 @@ Abre la app por **`http://127.0.0.1:3000`** (no `localhost`). Tarjeta de prueba 
 - [ ] Inactividad (3 min) en «en proceso» o «¿Completó el pago?»: el kiosco vuelve al inicio y la venta aparece en **Pagos por revisar** (no cancelada).
 - [ ] **Reportes:** una venta electrónica en espera o rechazada no suma en *Total recaudado*, *Total facturado* ni en el cuadre de efectivo.
 - [ ] Controles ≥ 44 px, sin scroll horizontal y buen contraste en modo oscuro (360, 768, 1024 y 1366 px).
+- [ ] **QR:** junto al código dice «Termine el pago en su celular; si pagó por PSE puede tardar unos minutos».
+- [ ] Con un aviso firmado de ePayco recibido y sin confirmar, kiosco y caja dicen **«Su pago está en proceso»** sin contador de tiempo; a los 10 min **no** pasa a «vencido» ni «rechazado» (la venta queda en *Pagos por revisar* con «ePayco avisó un pago aprobado que no se pudo confirmar automáticamente») y avanza sola a la factura si se confirma.
 
 ## 12b-real. Prueba real de ePayco (producción)
 
@@ -225,6 +230,18 @@ SELECT created_at, type, message FROM logs WHERE message LIKE '%K01-000123%' OR 
 1. Elige **Pagar con mi celular (QR)**; escanea con la **cámara** (no desde la app del banco) y paga con tarjeta.
 2. Esperado: al abrir el enlace, el kiosco dice «Este pago se abrió en un celular…» y ya no deja cambiar de forma de pago; al aprobarse, el kiosco **avanza solo** a «¡Gracias por su compra!».
 3. SQL: `qr_opened_at` con fecha en el intento QR, `status = 'aprobado'`; la venta `invoiced`.
+
+**e) PSE por QR en el celular (el caso de K01-000025)**
+1. En el kiosco elige **Pagar con mi celular (QR)**; escanea con la **cámara** y en el celular paga con **PSE** (aprueba en el banco). Cuando el banco termine, **deja que el celular vuelva** a la página del POS.
+2. Esperado en el celular: la dirección es `https://pos.fecp.me/pagar/<código>/retorno?ref_payco=…` y dice **«Pago aprobado. Ya puede volver al kiosco…»** (o «Su pago está en proceso» unos segundos). En el kiosco: «Su pago está en proceso» y luego la factura, sin tocar nada.
+3. SQL: el intento QR con `ref_payco` (24 caracteres) **lleno**, `webhook_at` y `webhook_approved_at` con fecha, `ref_used = 'larga'`, `status = 'aprobado'`; la venta `invoiced` una sola vez. Consulta extra:
+   ```sql
+   SELECT attempt_no, status, ref_payco, ref_used, webhook_approved_at, webhook_summary->>'x_franchise' AS franquicia,
+          webhook_summary->>'x_cod_response' AS cod, evidence_at, evidence_note
+     FROM payment_attempts WHERE sale_id = (SELECT id FROM sales WHERE local_number = 'K01-000123');
+   ```
+4. **Variante «no vuelve»:** repite pero **cierra el navegador del celular** en el banco, sin volver al POS. Esperado: el webhook llega (log «Webhook firmado de K01-… (APROBADO) sin poder confirmarlo…»), el kiosco sigue en «Su pago está en proceso» y a los 10 min la venta queda en **Pagos por revisar** (`por_confirmar`, **no** `pago_fallido`). Resuélvela con **Verificar con referencia** (busca la referencia larga en el detalle de la transacción del panel de Davipay) o, si no la encuentras y ya comprobaste que el dinero entró, con **Facturar con evidencia del webhook** (nota obligatoria). Anota **si el panel de Davipay muestra la referencia larga** y en qué campo: con eso se completa la documentación.
+5. Anota si ePayco devolvió el celular a `/retorno` (en el log «Retorno del celular de K01-… con la referencia larga») y cuánto tardó.
 
 Al terminar, borra o anula en Siigo las facturas de prueba y **reembolsa en el panel de ePayco** los cobros de estos pasos si no fueron ventas reales.
 

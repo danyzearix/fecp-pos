@@ -20,6 +20,10 @@ export type PublicSale = {
   channel_changed: boolean;
   /** estado del último intento de pago (abierto, pendiente, rechazado, cancelado…) */
   attempt_status: string | null;
+  /** hay evidencia de pago en curso en el último intento (aviso firmado de ePayco, referencia larga o pendiente) */
+  attempt_evidence: boolean;
+  /** origen del cobro: para decir "vuelva al kiosco" o "vuelva a la caja" */
+  source: string;
 };
 
 export const CHANNEL_CHANGED_MESSAGE = "Este cobro fue cambiado, pide uno nuevo en caja.";
@@ -39,9 +43,16 @@ const MESSAGE: Record<string, string> = {
 };
 export const publicMessage = (status: string) => MESSAGE[status] ?? "Procesando…";
 /** Mensaje para el cliente según el estado y el canal (si se cambió a "en pantalla", el enlace ya no sirve). */
-export const publicMessageFor = (s: Pick<PublicSale, "status" | "channel_changed"> & { attempt_status?: string | null }) => {
+/** ¿El pago está en curso (aviso de ePayco, referencia larga, pendiente) pero aún sin confirmar? Entonces se dice "en proceso". */
+export const publicInProcess = (s: Pick<PublicSale, "status" | "payment_status" | "attempt_status" | "attempt_evidence">) =>
+  (s.status === "pago_por_revisar" && s.payment_status === "por_confirmar") ||
+  (s.status === "esperando_pago" && s.attempt_evidence && (s.attempt_status === "abierto" || s.attempt_status === "pendiente"));
+const IN_PROCESS = "Su pago está en proceso. No lo repita: estamos esperando la confirmación (con PSE puede tardar unos minutos).";
+export const publicMessageFor = (s: Pick<PublicSale, "status" | "channel_changed"> & { attempt_status?: string | null; attempt_evidence?: boolean; payment_status?: string | null }) => {
   if (s.channel_changed) return CHANNEL_CHANGED_MESSAGE;
+  if (s.status === "pago_por_revisar" && s.payment_status === "por_confirmar") return IN_PROCESS;
   if (s.status === "esperando_pago") {
+    if (s.attempt_evidence && (s.attempt_status === "abierto" || s.attempt_status === "pendiente")) return IN_PROCESS;
     if (s.attempt_status === "cancelado") return "Usted canceló el pago. No se hizo ningún cobro.";
     if (s.attempt_status === "rechazado") return "El pago fue rechazado. Puede intentarlo de nuevo.";
     if (s.attempt_status === "pendiente") return "Su pago está en proceso. No lo repita: estamos esperando la confirmación de su banco.";
@@ -60,9 +71,9 @@ export async function findPublicSale(code: string): Promise<PublicSale | null> {
   await expireWaitingPayments(first.rows[0].id).catch(() => {});
   const { rows } = await query<{
     id: string; local_number: string; status: string; payment_status: string | null; total: number; invoice_name: string | null; payment_expires_at: Date | null;
-    pay_channel: string | null;
+    pay_channel: string | null; source: string;
   }>(
-    "SELECT id, local_number, status, payment_status, total::float8 AS total, invoice_name, payment_expires_at, pay_channel FROM sales WHERE id = $1",
+    "SELECT id, local_number, status, payment_status, total::float8 AS total, invoice_name, payment_expires_at, pay_channel, source FROM sales WHERE id = $1",
     [first.rows[0].id]
   );
   const s = rows[0];
@@ -80,6 +91,8 @@ export async function findPublicSale(code: string): Promise<PublicSale | null> {
     // Con un pago PENDIENTE (p. ej. PSE) no se puede pagar otra vez desde el enlace: riesgo de doble cobro
     can_pay: s.status === "esperando_pago" && !!exp && exp.getTime() > Date.now() && s.pay_channel === "qr" && att?.status !== "pendiente" && att?.status !== "aprobado",
     attempt_status: att?.status ?? null,
+    attempt_evidence: !!att?.evidence,
+    source: s.source,
     channel_changed: s.status === "esperando_pago" && s.pay_channel !== "qr",
   };
 }

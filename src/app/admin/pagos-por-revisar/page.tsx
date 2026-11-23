@@ -15,8 +15,13 @@ const SELECT = `
          u.name AS cashier, ru.name AS refund_by,
          (SELECT COALESCE(json_agg(json_build_object('ref', r.ref_payco, 'outcome', r.outcome, 'reason', r.reason) ORDER BY r.started_at), '[]'::json)
             FROM payment_refs r WHERE r.sale_id = s.id) AS refs,
-         (SELECT COALESCE(json_agg(json_build_object('no', a.attempt_no, 'invoice', a.invoice, 'channel', a.channel, 'status', a.status, 'at', a.created_at) ORDER BY a.attempt_no), '[]'::json)
-            FROM payment_attempts a WHERE a.sale_id = s.id) AS attempts
+         (SELECT COALESCE(json_agg(json_build_object('no', a.attempt_no, 'invoice', a.invoice, 'channel', a.channel, 'status', a.status, 'at', a.created_at, 'ref_used', a.ref_used) ORDER BY a.attempt_no), '[]'::json)
+            FROM payment_attempts a WHERE a.sale_id = s.id) AS attempts,
+         -- último aviso (webhook) de ePayco recibido y las referencias que trajo
+         (SELECT json_build_object('at', a.webhook_at, 'short', a.x_ref_payco, 'txid', a.x_transaction_id, 'used', a.ref_used, 'checks', a.checks, 'has_long', a.ref_payco IS NOT NULL,
+                                  'approved', a.webhook_approved_at IS NOT NULL, 'franchise', a.webhook_summary->>'x_franchise', 'amount', a.webhook_summary->>'x_amount',
+                                  'cod', a.webhook_summary->>'x_cod_response', 'invoice', a.invoice, 'evidence_at', a.evidence_at)
+            FROM payment_attempts a WHERE a.sale_id = s.id AND a.webhook_at IS NOT NULL ORDER BY (a.webhook_approved_at IS NOT NULL) DESC, a.attempt_no DESC LIMIT 1) AS webhook
     FROM sales s
     JOIN users u ON u.id = s.cashier_id
     LEFT JOIN users ru ON ru.id = s.refund_requested_by

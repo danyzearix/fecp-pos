@@ -2,32 +2,49 @@
 // Usa EXACTAMENTE el mismo camino de verificación (processPayment: consulta a ePayco, monto, firma, invoice, modo de prueba,
 // reclamo atómico del ref_payco, una sola factura). Aquí solo se decide CUÁNDO consultar y con qué referencia.
 //
-// ⚠ LÍMITE de la API de ePayco: la consulta solo funciona por la referencia LARGA (ref_payco). La documentación oficial no
-// publica consulta por invoice ni por sessionId. Por eso la consulta activa solo se puede hacer cuando el servidor YA conoce la
-// referencia larga del intento (la trae el navegador desde los hooks / la URL de regreso, o el webhook). Si nunca llegó ninguna,
-// no hay forma de preguntar: se espera el webhook y, si el cobro vence, queda como siempre (pago_tardio si luego se aprueba).
+// ⚠ LÍMITE de la API de ePayco: lo ÚNICO documentado es consultar por la referencia LARGA (ref_payco, la de ?ref_payco=...). No hay consulta
+// documentada por invoice, sessionId, x_transaction_id ni x_ref_payco. El webhook de PSE llega SIN ref_payco (solo x_ref_payco corta y
+// x_transaction_id), así que además de la larga se PRUEBAN esas dos, en orden (ver candidates.ts). Si ninguna sirve, no hay forma de
+// preguntar: se espera la referencia larga (navegador o panel del admin) y, si el cobro vence, queda como siempre (pago_tardio).
 import { query } from "../db";
-import { isShortRef } from "./adapter";
-import { latestAttemptView, type AttemptView } from "./attempts";
-import { processPayment, type PaymentResult } from "./process";
+import { writeLog } from "../log";
+import { candidatesOf, latestAttemptView, type Attempt, type AttemptView } from "./attempts";
+import { triedText, verifyByCandidates } from "./candidates";
+import { getEpaycoConfig } from "./config";
+import type { PaymentResult } from "./process";
+
+/** Sin referencia larga (solo lo que trajo el webhook: x_transaction_id / x_ref_payco) la consulta es una PRUEBA: no se repite más seguido que esto */
+const MIN_GAP_WITHOUT_LONG_MS = 15_000;
 
 /**
- * Consulta a ePayco el intento abierto/pendiente de la venta que ya tenga referencia larga. `minGapMs` limita la frecuencia POR
- * INTENTO (un UPDATE atómico reclama el turno: varios procesos o pantallas a la vez no consultan de más).
+ * Consulta a ePayco el intento abierto/pendiente de la venta que ya tenga alguna referencia: la larga (ref_payco) o, si solo llegó el
+ * webhook (PSE), el x_transaction_id y la x_ref_payco. Usa la MISMA lista y el mismo orden que el webhook (candidatesOf), y la que ya
+ * funcionó va primero. `minGapMs` limita la frecuencia POR INTENTO (un UPDATE atómico reclama el turno).
  * Devuelve null si no había nada que consultar (sin referencia, o aún no toca).
  */
 export async function activeCheck(saleId: string, source: "kiosco" | "poller" | "publica", minGapMs: number): Promise<PaymentResult | null> {
-  const claim = await query<{ ref_payco: string }>(
+  const claim = await query<Pick<Attempt, "invoice" | "ref_payco" | "x_transaction_id" | "x_ref_payco" | "ref_used" | "checks">>(
     `UPDATE payment_attempts SET last_check_at = now(), checks = checks + 1
-      WHERE id = (SELECT id FROM payment_attempts WHERE sale_id = $1 AND status IN ('abierto','pendiente') AND ref_payco IS NOT NULL
-                  ORDER BY attempt_no DESC LIMIT 1)
-        AND (last_check_at IS NULL OR last_check_at < now() - ($2 || ' milliseconds')::interval)
-      RETURNING ref_payco`,
-    [saleId, String(Math.max(0, Math.floor(minGapMs)))]
+      WHERE id = (SELECT id FROM payment_attempts
+                   WHERE sale_id = $1 AND status IN ('abierto','pendiente')
+                     AND (ref_payco IS NOT NULL OR ($4::boolean AND (x_transaction_id IS NOT NULL OR x_ref_payco IS NOT NULL)))
+                   ORDER BY attempt_no DESC LIMIT 1)
+        AND (last_check_at IS NULL OR last_check_at < now() - ((CASE WHEN ref_payco IS NULL THEN GREATEST($2::int, $3::int) ELSE $2::int END) || ' milliseconds')::interval)
+      RETURNING invoice, ref_payco, x_transaction_id, x_ref_payco, ref_used, checks`,
+    [saleId, Math.max(0, Math.floor(minGapMs)), MIN_GAP_WITHOUT_LONG_MS, getEpaycoConfig().altRefLookup]
   );
-  const ref = claim.rows[0]?.ref_payco;
-  if (!ref || isShortRef(ref)) return null;
-  return processPayment(saleId, ref, source);
+  const a = claim.rows[0];
+  if (!a) return null;
+  const cands = candidatesOf(a);
+  const run = await verifyByCandidates(saleId, cands, source);
+  if (!run) return null;
+  // Se anota lo probado cuando NINGUNA referencia sirvió (la 1.ª, 2.ª, 3.ª vez y luego cada 10.ª)
+  if (run.outcome === "no_verificado" && cands.some((c) => c.kind !== "larga") && (a.checks <= 3 || a.checks % 10 === 0)) {
+    await writeLog("pago", `Consulta activa de ${a.invoice} (consulta ${a.checks}): ePayco no devolvió la transacción con ninguna referencia conocida — ${triedText(run.tried)}`, {
+      level: "warn", detail: { sale_id: saleId, invoice: a.invoice, source, tried: run.tried },
+    });
+  }
+  return run;
 }
 
 export type PaymentState = {

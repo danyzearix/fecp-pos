@@ -124,6 +124,7 @@ export function QrScan(p: { size: Size; qr: string | null; local: string; total:
       <p className={cx("text-soft", k ? "text-[18px]" : "text-[13px]")}>
         Compra <b>{p.local}</b> · Tiempo restante <b>{p.mmss}</b>
       </p>
+      <p className={cx("font-semibold text-body", k ? "text-[19px]" : "text-[14px]")}>Termine el pago en su celular; si pagó por PSE puede tardar unos minutos.</p>
       <p className={cx("text-dim", k ? "text-[16px]" : "text-[13px]")}>Esta pantalla se actualiza sola cuando el pago sea aprobado.</p>
     </div>
   );
@@ -154,8 +155,9 @@ export function InProcessView(p: { size: Size; local: string; mmss: string; onWa
       <Spinner size={p.size} />
       <h1 className={cx("font-bold text-fg", k ? "text-4xl" : "text-xl")}>Su pago está en proceso</h1>
       <p className={cx("text-soft", k ? "text-2xl" : "text-[15px]")}>No lo repita. Estamos esperando la confirmación de su banco.</p>
+      {/* Sin contador: con un pago en curso el cobro no termina en "fallido" por tiempo (queda por confirmar) */}
       <p className={cx("text-dim", k ? "text-[18px]" : "text-[13px]")}>
-        Compra <b>{p.local}</b> · Tiempo restante <b>{p.mmss}</b>
+        Compra <b>{p.local}</b> · Con PSE la confirmación puede tardar unos minutos. Esta pantalla avanza sola.
       </p>
       {waiting && !ask && <p className={cx("text-ok-ink font-semibold", k ? "text-xl" : "text-[14px]")}>Seguimos esperando la confirmación…</p>}
       {!ask ? (
