@@ -19,6 +19,8 @@ import { creditInvoicingBlocker, epaycoInvoicingBlocker } from "./payment";
 import { buildObservations, buildSiigoPayments, PaymentsMismatchError, type SalePayLine } from "./payment-body";
 import { CONSUMIDOR_FINAL_ID } from "../sale-types";
 import { siigo, SiigoHttpError, SiigoNetworkError } from "./client";
+import { getSetting } from "../settings";
+import { SETTING_LAST_SIIGO_PRODUCT_SYNC } from "./product-sync";
 import { ensureSiigoCustomer, type CustomerRow } from "./customers";
 
 type SaleRow = {
@@ -31,6 +33,9 @@ type SaleRow = {
   payment_reference: string | null;
   siigo_invoice_id: string | null;
   created_at: Date;
+  /** bodega de Siigo con la que se VENDIÓ (los reintentos y las ventas sin conexión facturan con esta, no con la asignación actual del usuario) */
+  warehouse_id: number | null;
+  warehouse_name: string | null;
 };
 
 type SiigoInvoice = {
@@ -71,7 +76,7 @@ async function claim(saleId: string, from: string[]): Promise<SaleRow | null> {
     // chequeo de invoiceSale, este UPDATE no la toma). Solo se factura desde Admin → Precios por revisar, tras aprobarla.
     `UPDATE sales SET status = 'invoicing', invoicing_started_at = now(), last_error = NULL
       WHERE id = $1 AND status = ANY($2::text[]) AND price_review_status IS DISTINCT FROM 'pendiente'
-      RETURNING id, local_number, cashier_id, customer_id, total, payment_method, payment_reference, siigo_invoice_id, created_at`,
+      RETURNING id, local_number, cashier_id, customer_id, total, payment_method, payment_reference, siigo_invoice_id, created_at, warehouse_id, warehouse_name`,
     [saleId, from]
   );
   return rows[0] ?? null;
@@ -116,13 +121,22 @@ async function buildInvoiceBody(sale: SaleRow) {
   if (!sellerId) throw new Error("El cajero no tiene siigo_seller_id y falta SIIGO_SELLER_ID en .env.local");
 
   const items = await query<{
-    sku: string; quantity: string; unit_price: string; tax_rate: number; prices_include_tax: boolean; siigo_tax_class: string | null;
+    sku: string; name: string; quantity: string; unit_price: string; tax_rate: number; prices_include_tax: boolean; siigo_tax_class: string | null;
+    siigo_code: string | null; origin: string | null; siigo_active: boolean | null; siigo_checked_at: Date | null;
   }>(
-    `SELECT si.sku, si.quantity, si.unit_price, si.tax_rate, si.prices_include_tax, p.siigo_tax_class
+    `SELECT si.sku, si.name, si.quantity, si.unit_price, si.tax_rate, si.prices_include_tax, p.siigo_tax_class,
+            p.siigo_code, p.origin, p.siigo_active, p.siigo_checked_at
        FROM sale_items si LEFT JOIN products p ON p.id = si.product_id
       WHERE si.sale_id = $1 ORDER BY si.id`,
     [sale.id]
   );
+  // Un producto que se sabe que NO existe en Siigo (de WooCommerce, y ya hubo una sincronización completa de productos de Siigo que no lo encontró) o que está inactivo allá NO se factura:
+  // error claro y la venta queda sin facturar para revisión (nunca se factura mal).
+  const catalogSynced = !!(await getSetting(SETTING_LAST_SIIGO_PRODUCT_SYNC));
+  const bad = catalogSynced ? items.rows.find((i) => i.origin === "woocommerce") : undefined;
+  if (bad) throw new Error(`El producto "${bad.name}" (código ${bad.sku}) no existe en Siigo: no se puede facturar. Créelo en Siigo (o corrija el SKU en WooCommerce), sincronice y reintente.`);
+  const inactive = items.rows.find((i) => i.siigo_active === false);
+  if (inactive) throw new Error(`El producto "${inactive.name}" (código ${inactive.siigo_code ?? inactive.sku}) está inactivo en Siigo: no se puede facturar. Actívelo en Siigo, sincronice y reintente.`);
 
   const siigoItems = items.rows.map((i) => {
     const rate = Number(i.tax_rate);
@@ -136,7 +150,10 @@ async function buildInvoiceBody(sale: SaleRow) {
       if (!id) throw new Error(`No hay id de impuesto de Siigo para la tarifa ${rate}% (src/config/siigo-map.ts)`);
       taxes = [{ id }];
     }
-    const item: Record<string, unknown> = { code: i.sku, quantity: Number(i.quantity) };
+    // El código de Siigo del producto (si ya se unió/sincronizó); si no, el SKU de siempre
+    const item: Record<string, unknown> = { code: i.siigo_code || i.sku, quantity: Number(i.quantity) };
+    // Bodega de la VENTA en cada ítem (items.warehouse, número = id de GET /v1/warehouses). Sin bodega no se manda el campo.
+    if (sale.warehouse_id) item.warehouse = sale.warehouse_id;
     if (i.prices_include_tax) {
       // taxed_price = precio con IVA incluido; Siigo calcula la base. price se envía igual por ser obligatorio.
       item.price = Math.round((unit / (1 + rate / 100)) * 1e6) / 1e6;
@@ -157,7 +174,7 @@ async function buildInvoiceBody(sale: SaleRow) {
   const lines: SalePayLine[] = pl.rows.map((r) => ({ method: r.method, amount: Number(r.amount), reference: r.reference, credit_days: r.credit_days, due_date: r.due_date }));
   // Si la suma no coincide con el total, lanza PaymentsMismatchError ANTES de enviar nada: la venta queda en revisión con el motivo
   const payments = buildSiigoPayments(lines, Number(sale.total));
-  const obs = buildObservations({ saleId: sale.id, lines, test });
+  const obs = buildObservations({ saleId: sale.id, lines, test, warehouse: sale.warehouse_name });
 
   const hasEmail = !!customer.email && customer.identification !== CONSUMIDOR_FINAL_ID;
 

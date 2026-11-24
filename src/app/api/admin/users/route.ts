@@ -6,6 +6,7 @@ import { query } from "@/lib/db";
 import { writeLog } from "@/lib/log";
 import { isRole } from "@/lib/permissions";
 import { parseSellerId } from "@/lib/users";
+import { assignUserWarehouse, warehouseExists } from "@/lib/warehouse";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -13,7 +14,7 @@ export async function GET(req: Request) {
   const g = await guardApi(req);
   if (!g.ok) return g.res;
   const { rows } = await query(
-    `SELECT id, name, email, role, active, siigo_seller_id, locked_until, created_at FROM users ORDER BY active DESC, role, name`
+    `SELECT id, name, email, role, active, siigo_seller_id, warehouse_id, locked_until, created_at FROM users ORDER BY active DESC, role, name`
   );
   return NextResponse.json({ users: rows, me: g.user.uid });
 }
@@ -39,12 +40,16 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "El id de vendedor de Siigo debe ser un número" }, { status: 400 });
   }
 
+  const wh = b?.warehouse_id === undefined || b?.warehouse_id === null || b?.warehouse_id === "" ? null : Number(b?.warehouse_id);
+  if (wh !== null && (!Number.isInteger(wh) || !(await warehouseExists(wh)))) return NextResponse.json({ error: "Bodega no válida" }, { status: 400 });
+
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await query<{ id: number }>(
       `INSERT INTO users (name, email, password_hash, role, siigo_seller_id) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
       [name, email, hash, role, seller ?? null]
     );
+    await assignUserWarehouse(rows[0].id, wh, g.user.uid);
     await writeLog("admin", `Usuario creado: ${email} (${role})`, { userId: g.user.uid, detail: { new_user_id: rows[0].id, role } });
     return NextResponse.json({ ok: true, id: rows[0].id });
   } catch (e) {

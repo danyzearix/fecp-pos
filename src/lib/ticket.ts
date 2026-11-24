@@ -41,7 +41,7 @@ export function ticketPayments(sale: SaleIn, total: number): PaymentLineView[] {
   }));
 }
 
-export function buildTicketFromSale(sale: SaleIn, cashierName: string): TicketData {
+export function buildTicketFromSale(sale: SaleIn, cashierName: string, warehouseName?: string | null): TicketData {
   const lines = sale.items.map(itemToLine);
   const t = cartTotals(lines);
   const cust = customerDisplay(sale.customer);
@@ -54,6 +54,7 @@ export function buildTicketFromSale(sale: SaleIn, cashierName: string): TicketDa
     status: "pending",
     created_at: sale.created_at_device,
     cashier_name: cashierName,
+    warehouse_name: warehouseName ?? null,
     customer_name: cust.name,
     customer_id_type: cust.idType,
     customer_identification: cust.identification,

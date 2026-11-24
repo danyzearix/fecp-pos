@@ -10,6 +10,7 @@ import { query } from "@/lib/db";
 import { LEGACY_PAYMENT_METHODS, PAYMENT_METHODS } from "@/lib/payments";
 import { sweepStuckInvoicing } from "@/lib/siigo/invoice";
 import { formatCOP } from "@/lib/money";
+import CatalogConfig from "./CatalogConfig";
 import ConnectionTests from "./ConnectionTests";
 import ProblemSales, { type Problem } from "./ProblemSales";
 import type { Metadata } from "next";
@@ -73,6 +74,11 @@ export default async function ConfiguracionPage() {
       <section className="bg-surface rounded-xl border border-line p-4 space-y-3">
         <h2 className="font-semibold text-fg">Probar conexiones</h2>
         <ConnectionTests />
+      </section>
+
+      <section className="bg-surface rounded-xl border border-line p-4 space-y-3">
+        <h2 className="font-semibold text-fg">Catálogo de Siigo y bodegas</h2>
+        <CatalogConfig />
       </section>
 
       <section className="bg-surface rounded-xl border border-line p-4 space-y-3">

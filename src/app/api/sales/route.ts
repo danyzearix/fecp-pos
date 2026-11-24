@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
 import { writeLog } from "@/lib/log";
+import { resolveSaleWarehouse } from "@/lib/warehouse";
 import { createSale, isDateStr, isReceiptFilter, listSales, parseSale, todayBogota, yesterdayBogota } from "@/lib/sales";
 import { invoiceSale, sweepStuckInvoicing } from "@/lib/siigo/invoice";
 
@@ -19,7 +20,10 @@ export async function POST(req: Request) {
   }
 
   try {
-    const r = await createSale(sale, user.uid);
+    // Bodega de Siigo: la valida el SERVIDOR (cola sin conexión incluida). Un cajero no puede mandar otra bodega.
+    const wh = await resolveSaleWarehouse(user.uid, user.role, sale.warehouse_claimed, sale.created_at_device);
+    if (!wh.ok) return NextResponse.json({ error: wh.error }, { status: 400 });
+    const r = await createSale(sale, user.uid, { id: wh.id, name: wh.name });
     if (!r.ok) return NextResponse.json({ error: r.error }, { status: 400 });
 
     // Facturar. Si la venta ya está facturada o en proceso (envío repetido), invoiceSale no hace nada.

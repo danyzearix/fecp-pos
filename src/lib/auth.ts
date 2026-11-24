@@ -11,6 +11,7 @@ import { canCallApi, canOpenPage, homeFor, isRole } from "./permissions";
 import { query } from "./db";
 import { writeLog } from "./log";
 import { logSecurityBlock } from "./security-log";
+import { clearSessionWarehouse } from "./warehouse";
 import { SESSION_COOKIE, SESSION_HOURS, SessionPayload, signSession, verifySession } from "./session";
 
 export const MAX_ATTEMPTS = 5;
@@ -80,6 +81,8 @@ export async function attemptLogin(emailRaw: string, password: string): Promise<
 
   await query("UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = $1", [u.id]);
   await writeLog("login", `Login correcto: ${email}`, { userId: u.id });
+  // El cambio de bodega de la sesión de caja de un admin vale solo para esa sesión
+  if (isRole(u.role)) await clearSessionWarehouse(u.id, u.role).catch(() => {});
   if (!isRole(u.role)) return { ok: false, status: 403, error: "Rol de usuario no válido" };
   return { ok: true, user: { uid: u.id, name: u.name, role: u.role } };
 }

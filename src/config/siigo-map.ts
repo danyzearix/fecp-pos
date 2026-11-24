@@ -62,3 +62,11 @@ export const SIIGO_CUSTOMER_SYNC_PER_MINUTE = 40;
 export const SIIGO_CUSTOMER_SYNC_YIELD_ABOVE = 60;
 /** Consulta de cliente en vivo (caja y kiosco): si ya van estas peticiones en el último minuto, no se consulta (límite de Siigo: 100/min). */
 export const SIIGO_LIVE_LOOKUP_MAX_PER_MINUTE = 80;
+
+/**
+ * Sincronización de productos de Siigo (src/lib/siigo/product-sync.ts). SOLO LEE (GET /v1/products). El catálogo completo son ~33 páginas de 100.
+ * Con 80 peticiones por minuto toda la lectura tarda ~1,5 min (la latencia de Siigo, ~3 s por página, manda). El límite de Siigo es 100/min para TODA la empresa.
+ */
+export const SIIGO_PRODUCT_SYNC_PER_MINUTE = 80;
+/** Prioridad baja: si en el último minuto ya van más de estas peticiones (p. ej. facturación), la sincronización espera. */
+export const SIIGO_PRODUCT_SYNC_YIELD_ABOVE = 70;

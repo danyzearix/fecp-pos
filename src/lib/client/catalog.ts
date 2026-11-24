@@ -36,8 +36,11 @@ export function saveLocalCatalog(products: Product[]) {
   }
 }
 
-/** Cuándo se verificó por última vez el catálogo contra el servidor, y qué versión tiene guardada. */
-export type CatalogMeta = { updatedAt: number; version: string };
+/** Bodega de Siigo del usuario cuando se descargó el catálogo (la decide el servidor). */
+export type CatalogWarehouse = { id: number; name: string } | null;
+
+/** Cuándo se verificó por última vez el catálogo contra el servidor, qué versión y qué bodega tiene guardadas. (Catálogos viejos no traen warehouse: siguen sirviendo.) */
+export type CatalogMeta = { updatedAt: number; version: string; warehouse?: CatalogWarehouse };
 const META_KEY = "fecp_catalog_meta_v1";
 
 export function loadCatalogMeta(): CatalogMeta | null {
@@ -56,14 +59,14 @@ export function saveCatalogMeta(meta: CatalogMeta) {
 }
 
 /** Descarga el catálogo. Lanza error si no hay conexión. */
-export async function fetchCatalog(): Promise<{ products: Product[]; version: string }> {
+export async function fetchCatalog(): Promise<{ products: Product[]; version: string; warehouse?: CatalogWarehouse }> {
   const res = await fetch("/api/products", { cache: "no-store" });
   if (res.status === 401) {
     window.location.href = "/login";
     throw new Error("Sesión vencida");
   }
   if (!res.ok) throw new Error(`Error ${res.status}`);
-  return (await res.json()) as { products: Product[]; version: string };
+  return (await res.json()) as { products: Product[]; version: string; warehouse?: CatalogWarehouse };
 }
 
 /** Pide al servidor una sincronización incremental. Devuelve la versión actual del catálogo, o null si falló. */

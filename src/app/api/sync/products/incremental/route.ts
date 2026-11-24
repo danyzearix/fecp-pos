@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
-import { getCatalogVersion } from "@/lib/catalog-version";
+import { userCatalogVersion } from "@/lib/catalog";
 import { writeLog } from "@/lib/log";
 import { syncProductsIncremental } from "@/lib/woo";
 
@@ -18,7 +18,7 @@ export async function POST(req: Request) {
 
   try {
     const out = await syncProductsIncremental(user.uid);
-    const version = await getCatalogVersion();
+    const version = await userCatalogVersion(user.uid, user.role);
 
     if (out.status === "busy") return NextResponse.json({ ok: true, skipped: "busy", version });
     if (out.status === "needs_full") {

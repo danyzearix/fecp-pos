@@ -2,6 +2,7 @@
 import { pool, query } from "./db";
 import { writeLog } from "./log";
 import { getSetting, setSetting, SETTING_LAST_SYNC, SETTING_PRICES_INCLUDE_TAX } from "./settings";
+import { withSyncLock } from "./sync-lock";
 import { syncSiigoTaxClassesAll, syncSiigoTaxClassesFor, type SiigoTaxSyncResult } from "./siigo/products";
 
 /** Clasificación de IVA desde Siigo. Si Siigo falla, la sincronización de Woo NO falla: se avisa en logs. */
@@ -203,12 +204,23 @@ async function upsertRows(rows: Row[], pricesIncludeTax: boolean) {
   const client = await pool.connect();
   try {
     for (const r of rows) {
+      // Un producto que antes existía SOLO en Siigo (sin woo_id) y ahora aparece en Woo con el mismo código se UNE a esa fila (origin 'ambos')
+      // en vez de duplicarse. Si hay más de uno con ese código no se une (ambiguo): se inserta aparte y se reporta en la sincronización de Siigo.
+      if (r.sku) {
+        await client.query(
+          `UPDATE products SET woo_id = $1
+            WHERE id = (SELECT id FROM products WHERE woo_id IS NULL AND origin = 'siigo' AND upper(regexp_replace(sku, '\\s', '', 'g')) = upper(regexp_replace($2, '\\s', '', 'g')))
+              AND (SELECT count(*) FROM products WHERE woo_id IS NULL AND origin = 'siigo' AND upper(regexp_replace(sku, '\\s', '', 'g')) = upper(regexp_replace($2, '\\s', '', 'g'))) = 1
+              AND NOT EXISTS (SELECT 1 FROM products WHERE woo_id = $1)`,
+          [r.woo_id, r.sku]
+        );
+      }
       // xmax = 0 significa que la fila fue insertada (no actualizada)
       const res = await client.query<{ inserted: boolean }>(
         // tax_rate es la tarifa EFECTIVA: si Siigo ya clasificó el producto se conserva la de Siigo (fuente fiscal).
         // Si cambia el SKU, la clasificación de Siigo deja de valer y se vuelve a consultar.
-        `INSERT INTO products (woo_id, sku, barcode, name, price, tax_rate, woo_tax_rate, prices_include_tax, image_url, category, active, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,TRUE,now())
+        `INSERT INTO products (woo_id, sku, barcode, name, price, tax_rate, woo_tax_rate, prices_include_tax, image_url, category, active, updated_at, woo_seen_at, origin)
+         VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,TRUE,now(),now(),'woocommerce')
          ON CONFLICT (woo_id) DO UPDATE SET
            sku=EXCLUDED.sku, barcode=EXCLUDED.barcode, name=EXCLUDED.name, price=EXCLUDED.price,
            woo_tax_rate=EXCLUDED.woo_tax_rate,
@@ -216,7 +228,8 @@ async function upsertRows(rows: Row[], pricesIncludeTax: boolean) {
                            THEN EXCLUDED.woo_tax_rate ELSE products.tax_rate END,
            siigo_tax_class = CASE WHEN products.sku IS DISTINCT FROM EXCLUDED.sku THEN NULL ELSE products.siigo_tax_class END,
            prices_include_tax=EXCLUDED.prices_include_tax,
-           image_url=EXCLUDED.image_url, category=EXCLUDED.category, active=TRUE, updated_at=now()
+           image_url=EXCLUDED.image_url, category=EXCLUDED.category, active=TRUE, updated_at=now(), woo_seen_at=now(),
+           origin = CASE WHEN products.siigo_id IS NOT NULL THEN 'ambos' ELSE 'woocommerce' END
          RETURNING (xmax = 0) AS inserted`,
         [r.woo_id, r.sku, r.barcode, r.name, r.price, r.tax_rate, pricesIncludeTax, r.image_url, r.category]
       );
@@ -232,29 +245,6 @@ async function upsertRows(rows: Row[], pricesIncludeTax: boolean) {
 async function fetchPricesIncludeTax() {
   const { data } = await wooGet<{ value: string }>("/settings/tax/woocommerce_prices_include_tax");
   return data.value === "yes";
-}
-
-// ---------- Bloqueo en la base de datos ----------
-
-const LOCK_KEY = 727001; // número cualquiera, único para "sincronizar productos"
-
-/**
- * Evita dos sincronizaciones a la vez (completa o incremental, de cualquier cajero o proceso).
- * Usa un advisory lock de Postgres: si el servidor se cae, la conexión se cierra y el bloqueo se libera solo.
- */
-async function withSyncLock<T>(fn: () => Promise<T>): Promise<T | { status: "busy" }> {
-  const client = await pool.connect();
-  try {
-    const { rows } = await client.query<{ ok: boolean }>("SELECT pg_try_advisory_lock($1) AS ok", [LOCK_KEY]);
-    if (!rows[0].ok) return { status: "busy" };
-    try {
-      return await fn();
-    } finally {
-      await client.query("SELECT pg_advisory_unlock($1)", [LOCK_KEY]).catch(() => {});
-    }
-  } finally {
-    client.release();
-  }
 }
 
 // ---------- Sincronización ----------
@@ -291,9 +281,18 @@ export async function syncProductsFull(userId?: number): Promise<SyncOutcome> {
     const rows = await toRows(products, unknownClasses);
     const { created, updated } = await upsertRows(rows, pricesIncludeTax);
 
-    // Lo que ya no viene de Woo (despublicado/borrado) se desactiva, sin borrarlo (las ventas lo referencian)
+    // Lo que ya no viene de Woo (despublicado/borrado) se desactiva, sin borrarlo (las ventas lo referencian).
+    // SOLO productos con woo_id: lo que es solo de Siigo NUNCA se toca. Si un producto unido ('ambos') deja Woo, pasa a ser solo de
+    // Siigo (con los datos de Siigo) y queda activo mientras Siigo lo tenga activo y sea vendible.
+    const toSiigo = await query(
+      `UPDATE products SET origin = 'siigo', woo_id = NULL, name = COALESCE(siigo_name, name), price = COALESCE(siigo_price, price),
+              prices_include_tax = COALESCE(siigo_price_includes_tax, prices_include_tax), image_url = NULL, category = siigo_group,
+              active = COALESCE(siigo_active, FALSE) AND COALESCE(siigo_type, 'Product') = 'Product', updated_at = now()
+        WHERE woo_id IS NOT NULL AND origin = 'ambos' AND woo_seen_at < $1`,
+      [startedAt]
+    );
     const deact = await query(
-      "UPDATE products SET active = FALSE, updated_at = now() WHERE active AND updated_at < $1",
+      "UPDATE products SET active = FALSE, updated_at = now() WHERE active AND woo_id IS NOT NULL AND origin = 'woocommerce' AND woo_seen_at < $1",
       [startedAt]
     );
 
@@ -314,7 +313,7 @@ export async function syncProductsFull(userId?: number): Promise<SyncOutcome> {
       mode: "full",
       created,
       updated,
-      deactivated: deact.rowCount ?? 0,
+      deactivated: (deact.rowCount ?? 0),
       total: rows.length,
       noSku: noSkuRows.length,
       pricesIncludeTax,
@@ -326,7 +325,7 @@ export async function syncProductsFull(userId?: number): Promise<SyncOutcome> {
       {
         userId,
         level: result.noSku > 0 || unknownClasses.size > 0 ? "warn" : "info",
-        detail: { ...result, sinSku: noSkuRows.slice(0, 100).map((r) => ({ woo_id: r.woo_id, name: r.name })) },
+        detail: { ...result, unidos_que_dejaron_woo_y_pasaron_a_solo_siigo: toSiigo.rowCount ?? 0, sinSku: noSkuRows.slice(0, 100).map((r) => ({ woo_id: r.woo_id, name: r.name })) },
       }
     );
     return { status: "ok", result };
@@ -368,7 +367,7 @@ export async function syncProductsIncremental(userId?: number): Promise<SyncOutc
 
     // Productos nuevos, sin verificar en Siigo o con SKU cambiado: consultar su IVA en Siigo (máx. 60 por ciclo)
     const pendingSiigo = await query<{ sku: string }>(
-      "SELECT sku FROM products WHERE active AND sku IS NOT NULL AND siigo_tax_class IS NULL ORDER BY siigo_checked_at NULLS FIRST LIMIT 60"
+      "SELECT sku FROM products WHERE active AND woo_id IS NOT NULL AND sku IS NOT NULL AND siigo_tax_class IS NULL ORDER BY siigo_checked_at NULLS FIRST LIMIT 60"
     );
     const siigoTax = pendingSiigo.rows.length
       ? await siigoTaxStep(() => syncSiigoTaxClassesFor(pendingSiigo.rows.map((r) => r.sku)), userId)

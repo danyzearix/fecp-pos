@@ -77,6 +77,8 @@ export type SaleIn = {
   items: SaleItemIn[];
   /** formato nuevo: líneas de pago (los montos aplicados deben sumar el total que calcula el servidor) */
   payments?: PayLineIn[];
+  /** Bodega de Siigo con la que se vendió (la informa la caja; el SERVIDOR la valida contra el usuario). Ausente en ventas viejas de la cola. */
+  warehouse_id?: number | null;
   /** formato viejo (solo para ventas ya encoladas): */
   payment_method?: LineMethod;
   payment_reference?: string | null;
@@ -126,6 +128,8 @@ export type TicketData = {
   payments: PaymentLineView[];
   invoice_name: string | null;
   cufe: string | null;
+  /** bodega de Siigo con la que se vendió (si la hay) */
+  warehouse_name?: string | null;
 };
 
 export type { PaymentMethod as SalePaymentMethod };

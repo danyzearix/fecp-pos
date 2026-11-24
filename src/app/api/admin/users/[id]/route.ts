@@ -6,6 +6,7 @@ import { pool, query } from "@/lib/db";
 import { writeLog } from "@/lib/log";
 import { isRole } from "@/lib/permissions";
 import { parseSellerId } from "@/lib/users";
+import { assignUserWarehouse, warehouseExists } from "@/lib/warehouse";
 
 const ADMIN_LOCK_KEY = 727002; // candado para cambios que afectan a los administradores
 
@@ -56,6 +57,14 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     add("siigo_seller_id", s);
     changes.push(`vendedor Siigo → ${s ?? "(usa el del .env)"}`);
   }
+  // Bodega de Siigo del usuario (null = usa la de por defecto de Configuración)
+  let newWarehouse: number | null | undefined;
+  if (b.warehouse_id !== undefined) {
+    const w = b.warehouse_id === null || b.warehouse_id === "" ? null : Number(b.warehouse_id);
+    if (w !== null && (!Number.isInteger(w) || !(await warehouseExists(w)))) return NextResponse.json({ error: "Bodega no válida" }, { status: 400 });
+    newWarehouse = w;
+    changes.push(`bodega → ${w ?? "(la de por defecto)"}`);
+  }
   if (b.password !== undefined) {
     // Restablecer: el mínimo depende del rol que tendrá el usuario (administrador: 12; cajero y cliente: 8)
     const pwdErr = passwordError(isRole(b.role) ? b.role : cur.role, b.password);
@@ -64,7 +73,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     sets.push("failed_attempts = 0", "locked_until = NULL"); // restablecer también desbloquea la cuenta
     changes.push("contraseña restablecida");
   }
-  if (!sets.length) return NextResponse.json({ error: "Nada que cambiar" }, { status: 400 });
+  if (!sets.length && newWarehouse === undefined) return NextResponse.json({ error: "Nada que cambiar" }, { status: 400 });
 
   // Siempre debe quedar al menos un admin activo. La comprobación y el cambio van en una transacción con un
   // candado de Postgres: así dos admins que se desactiven mutuamente a la vez no pueden dejar el sistema sin admin.
@@ -82,8 +91,10 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
         return NextResponse.json({ error: "Debe quedar al menos un administrador activo" }, { status: 400 });
       }
     }
-    vals.push(id);
-    await client.query(`UPDATE users SET ${sets.join(", ")} WHERE id = $${vals.length}`, vals);
+    if (sets.length) {
+      vals.push(id);
+      await client.query(`UPDATE users SET ${sets.join(", ")} WHERE id = $${vals.length}`, vals);
+    }
     await client.query("COMMIT");
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {});
@@ -91,6 +102,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
   } finally {
     client.release();
   }
+  if (newWarehouse !== undefined) await assignUserWarehouse(id, newWarehouse, g.user.uid);
   await writeLog("admin", `Usuario ${cur.email} editado: ${changes.join(", ")}`, { userId: g.user.uid, detail: { user_id: id, changes } });
   return NextResponse.json({ ok: true });
 }

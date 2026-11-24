@@ -1,8 +1,11 @@
-import { requirePage } from "@/lib/auth";
 import { query } from "@/lib/db";
 import { formatCOP } from "@/lib/money";
 import { getSetting, SETTING_LAST_SYNC } from "@/lib/settings";
 import SyncButton from "./SyncButton";
+import SiigoSync from "./SiigoSync";
+import ProductThumb from "@/components/ProductThumb";
+import { requirePage } from "@/lib/auth";
+import { effectiveWarehouse, storedWarehouses } from "@/lib/warehouse";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = { title: "Productos" };
@@ -16,23 +19,36 @@ type Row = {
   tax_rate: number;
   category: string | null;
   active: boolean;
+  origin: string;
+  siigo_ambiguous: string | null;
+  stock: number | null;
+  has_stock_row: boolean;
 };
 
 const LIMIT = 200;
 
-export default async function ProductosPage({ searchParams }: { searchParams: Promise<{ q?: string }> }) {
-  await requirePage("/admin");
-  const { q = "" } = await searchParams;
+const ORIGIN_LABEL: Record<string, string> = { woocommerce: "WooCommerce", siigo: "Siigo", ambos: "Ambos" };
+
+export default async function ProductosPage({ searchParams }: { searchParams: Promise<{ q?: string; b?: string; o?: string }> }) {
+  const me = await requirePage("/admin");
+  const { q = "", b = "", o = "" } = await searchParams;
+  const whs = await storedWarehouses();
+  // Bodega cuyas existencias se muestran: la elegida, o la del propio admin
+  const mine = await effectiveWarehouse(me.uid, "admin");
+  const wid = Number(b) > 0 ? Number(b) : mine?.id ?? null;
+  const origin = ["woocommerce", "siigo", "ambos"].includes(o) ? o : "";
   const term = q.trim().replace(/[\\%_]/g, "\\$&");
 
   const lastSync = await getSetting(SETTING_LAST_SYNC);
   const [{ rows }, noSku, counts] = await Promise.all([
     query<Row>(
-      `SELECT id, sku, barcode, name, price::float8 AS price, tax_rate, category, active
-         FROM products
-        WHERE $1 = '' OR name ILIKE '%' || $1 || '%' OR sku ILIKE '%' || $1 || '%' OR barcode ILIKE '%' || $1 || '%'
-        ORDER BY active DESC, name LIMIT ${LIMIT}`,
-      [term]
+      `SELECT p.id, p.sku, p.barcode, p.name, p.price::float8 AS price, p.tax_rate, p.category, p.active, p.origin, p.siigo_ambiguous,
+              s.quantity::float8 AS stock, (s.product_id IS NOT NULL) AS has_stock_row
+         FROM products p LEFT JOIN product_stock s ON s.product_id = p.id AND s.warehouse_id = $2
+        WHERE ($1 = '' OR p.name ILIKE '%' || $1 || '%' OR p.sku ILIKE '%' || $1 || '%' OR p.barcode ILIKE '%' || $1 || '%')
+          AND ($3 = '' OR p.origin = $3)
+        ORDER BY p.active DESC, p.name LIMIT ${LIMIT}`,
+      [term, wid, origin]
     ),
     query<{ id: number; name: string }>(
       "SELECT id, name FROM products WHERE active AND (sku IS NULL OR sku = '') ORDER BY name"
@@ -59,7 +75,10 @@ export default async function ProductosPage({ searchParams }: { searchParams: Pr
             (detecta productos eliminados).
           </p>
         </div>
-        <SyncButton />
+        <div className="space-y-4 min-w-0">
+          <SyncButton />
+          <SiigoSync />
+        </div>
       </div>
 
       {noSku.rows.length > 0 && (
@@ -76,13 +95,25 @@ export default async function ProductosPage({ searchParams }: { searchParams: Pr
         </div>
       )}
 
-      <form className="flex gap-2">
+      <form className="flex gap-2 flex-wrap items-center">
         <input
           name="q"
           defaultValue={q}
           placeholder="Buscar por nombre, SKU o código"
           className="flex-1 max-w-md bg-surface border border-field rounded-lg px-4 min-h-11 text-base text-fg placeholder:text-base outline-none focus:border-brand"
         />
+        <select name="o" defaultValue={origin} aria-label="Origen" className="bg-surface border border-field rounded-lg px-3 min-h-11 text-base text-fg">
+          <option value="">Todos los orígenes</option>
+          <option value="woocommerce">Solo WooCommerce</option>
+          <option value="siigo">Solo Siigo</option>
+          <option value="ambos">En ambos</option>
+        </select>
+        <select name="b" defaultValue={wid ?? ""} aria-label="Bodega de las existencias" className="bg-surface border border-field rounded-lg px-3 min-h-11 text-base text-fg max-w-[260px]">
+          <option value="">Existencias: (ninguna bodega)</option>
+          {whs.filter((w) => w.active).map((w) => (
+            <option key={w.id} value={w.id}>Existencias: {w.name}</option>
+          ))}
+        </select>
         <button className="px-5 min-h-11 rounded-lg border border-field bg-surface text-base font-medium text-body">Buscar</button>
       </form>
 
@@ -91,30 +122,42 @@ export default async function ProductosPage({ searchParams }: { searchParams: Pr
           <thead className="bg-subtle text-left text-sm text-soft">
             <tr>
               <th className="px-4 py-2">Nombre</th>
+              <th className="px-4 py-2">Origen</th>
               <th className="px-4 py-2">SKU</th>
               <th className="px-4 py-2">Código</th>
               <th className="px-4 py-2">Categoría</th>
               <th className="px-4 py-2 text-right">Precio</th>
               <th className="px-4 py-2 text-right">IVA</th>
+              <th className="px-4 py-2 text-right">Existencias</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line">
             {rows.map((p) => (
               <tr key={p.id} className={p.active ? "" : "text-dim"}>
                 <td className="px-4 py-2">
-                  {p.name}
-                  {!p.active && <span className="ml-2 text-xs bg-off-soft rounded px-1.5">desactivado</span>}
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 shrink-0 flex items-center justify-center bg-subtle rounded-md overflow-hidden">
+                      <ProductThumb name={p.name} src={null} textClass="text-sm" />
+                    </div>
+                    <div>
+                      {p.name}
+                      {!p.active && <span className="ml-2 text-xs bg-off-soft rounded px-1.5">desactivado</span>}
+                      {p.siigo_ambiguous && <div className="text-xs text-warn-ink">⚠ {p.siigo_ambiguous}</div>}
+                    </div>
+                  </div>
                 </td>
+                <td className="px-4 py-2 whitespace-nowrap text-sm">{ORIGIN_LABEL[p.origin] ?? p.origin}</td>
                 <td className="px-4 py-2">{p.sku ?? <span className="text-warn-ink">Sin SKU</span>}</td>
                 <td className="px-4 py-2">{p.barcode ?? "—"}</td>
                 <td className="px-4 py-2">{p.category ?? "—"}</td>
                 <td className="px-4 py-2 text-right">{formatCOP(p.price)}</td>
                 <td className="px-4 py-2 text-right">{p.tax_rate}%</td>
+                <td className="px-4 py-2 text-right whitespace-nowrap">{p.has_stock_row ? p.stock : <span className="text-dim">—</span>}</td>
               </tr>
             ))}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-dim">
+                <td colSpan={8} className="px-4 py-8 text-center text-dim">
                   Sin productos. Presiona “Sincronizar productos”.
                 </td>
               </tr>

@@ -79,6 +79,7 @@ export default function TicketView({ data, config, qrDataUrl }: { data: TicketDa
       <Row left={final ? "Venta" : "Número"} right={data.local_number} />
       <Row left="Fecha" right={fmtDate.format(new Date(data.created_at))} />
       <Row left="Cajero" right={data.cashier_name} />
+      {data.warehouse_name && <Row left="Bodega" right={data.warehouse_name} />}
       <div>Cliente: {data.customer_name}</div>
       {/* El tipo de documento va en su propia línea, antes del número */}
       {data.customer_id_type && <div>{data.customer_id_type}</div>}

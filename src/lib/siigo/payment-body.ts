@@ -58,12 +58,14 @@ const amountText = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(2
  * Texto de observations. Incluye el UUID (la búsqueda por observations para reconciliar depende de él) y cada medio con su
  * monto y referencia, p. ej.:  POS FECP venta {UUID} | Tarjeta 40000 ref 4821 | Credito FECP 30400 30d | Efectivo 50000
  */
-export function buildObservations(p: { saleId: string; lines: SalePayLine[]; test: boolean }): string {
+export function buildObservations(p: { saleId: string; lines: SalePayLine[]; test: boolean; warehouse?: string | null }): string {
   const parts = p.lines.map((l) => {
     let s = `${noAccents(paymentShortLabel(l.method))} ${amountText(round2(l.amount))}`;
     if (l.reference) s += ` ref ${l.reference}`;
     if (l.credit_days) s += ` ${l.credit_days}d`;
     return s;
   });
-  return (p.test ? "PRUEBA POS - ELIMINAR | " : "") + `POS FECP venta ${p.saleId} | ${parts.join(" | ")}`;
+  // La bodega va DESPUÉS del UUID de la venta (la reconciliación busca el UUID) y con tope de largo para no pasarse del límite de Siigo
+  const wh = p.warehouse ? ` | Bodega ${noAccents(p.warehouse).replace(/s+/g, " ").trim().slice(0, 40)}` : "";
+  return (p.test ? "PRUEBA POS - ELIMINAR | " : "") + `POS FECP venta ${p.saleId}${wh} | ${parts.join(" | ")}`;
 }

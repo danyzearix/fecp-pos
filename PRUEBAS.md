@@ -284,6 +284,26 @@ node --env-file=.env.local db/prueba-kiosco-precio.mjs http://127.0.0.1:3000
   ```
   Termina con `RESULTADO: OK` y código 0. Comprueba que el rol *cliente* recibe **403** en `/api/customers` y en `/api/admin/clientes/sync`; que `POST /api/kiosco/cliente` devuelve **solo datos enmascarados** (y `{"found":false}` idéntico para todo lo demás); que el cobro del kiosco con la cédula de un cliente existente **no lo modifica** aunque el navegador mande otro nombre, id de Siigo o customer_id, ni devuelve sus datos; y que la tirilla del kiosco solo muestra `***` + 3 dígitos. Borra todo lo que crea.
 
+## 12e. Catálogo unificado y bodega de Siigo
+
+> Requiere `db:setup`. Las pruebas con Siigo real solo leen (GET), salvo UNA factura de prueba (comprobante 6503): elimínela en Siigo al terminar.
+
+- [ ] **Admin → Productos → Sincronizar productos de Siigo** (primera vez ~1 min): barra de progreso «página X de Y» y, al final, el resumen (creados, unidos con WooCommerce, omitidos, ambiguos, con error). Mientras corre los dos botones quedan deshabilitados.
+- [ ] Pulsarlo mientras corre (o mientras corre la de WooCommerce) → «Ya hay una sincronización de productos en curso».
+- [ ] La tabla muestra el **Origen** (WooCommerce / Siigo / Ambos), el marcador con iniciales en los de Siigo y las **Existencias** de la bodega elegida en el selector.
+- [ ] Un producto de WooCommerce conserva nombre, foto, categoría y precio después de sincronizar Siigo; el resumen avisa cuántos tienen IVA/precio distinto (no se cambian).
+- [ ] **Admin → Usuarios:** el selector «Bodega Siigo» lista las bodegas activas; «Actualizar bodegas» consulta Siigo; cambiar la bodega de un usuario se guarda.
+- [ ] **Admin → Configuración → Catálogo de Siigo y bodegas:** bodega por defecto, minutos de existencias (5–1440, 0 = apagado), lista de precios, tipos de producto y «incluir WooCommerce» por bodega.
+- [ ] **Caja como admin:** «Vendiendo desde: …» permite cambiar de bodega (con el carrito vacío); el catálogo cambia; queda el log «Cambio de bodega de la sesión de caja». Al cerrar sesión y volver a entrar vuelve a la suya.
+- [ ] **Caja como cajero:** ve «Vendiendo desde: …» sin selector. El catálogo trae los productos de su bodega (aunque la cantidad sea 0) y los de WooCommerce.
+- [ ] **Kiosco del evento:** en Configuración quite «incluir WooCommerce» de la bodega del evento (p. ej. «6 ASAMBLEA DTO 9 Y 22 NOV 2026»): el kiosco muestra solo los productos de esa bodega, sin selector ni nombre de bodega.
+- [ ] **Factura:** venta de un producto solo-Siigo + uno de WooCommerce → en Siigo, cada ítem de la factura muestra la bodega del usuario y las observaciones traen «Bodega …» después del UUID. La tirilla muestra «Bodega».
+- [ ] **Sin conexión:** desconecte la caja, venda, reasigne el usuario a otra bodega, reconecte: la venta se factura con la bodega **original**.
+- [ ] Un cajero con la sesión abierta no puede vender con otra bodega (manipulando la pantalla): responde «La bodega de esta venta no corresponde a su usuario…».
+- [ ] Producto de WooCommerce que no existe en Siigo → la venta queda «Fallida» con «no existe en Siigo…» y no se factura.
+- [ ] **Reportes:** filtro «Bodega» y tabla «Por bodega de Siigo».
+- [ ] La caja con catálogo grande (~1.800 productos) busca por nombre, SKU y código de barras sin trabarse.
+
 ## 13. Antes de pasar a producción
 - [ ] `RESOLUCION_DIAN_*`, `NEGOCIO_*` y `POS_ADDRESS` completos.
 - [ ] FECP corrigió (o aceptó) los productos de `docs/productos-iva-diferente.csv`.

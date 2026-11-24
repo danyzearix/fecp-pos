@@ -53,10 +53,10 @@ async function apply(found: Map<string, SiigoProduct>, skus: string[]): Promise<
     const r = await client.query(
       `UPDATE products p SET siigo_tax_class = v.cls, tax_rate = v.rate, updated_at = now()
          FROM unnest($1::text[], $2::text[], $3::int[]) AS v(sku, cls, rate)
-        WHERE p.sku = v.sku AND (p.siigo_tax_class IS DISTINCT FROM v.cls OR p.tax_rate <> v.rate)`,
+        WHERE p.sku = v.sku AND p.woo_id IS NOT NULL AND (p.siigo_tax_class IS DISTINCT FROM v.cls OR p.tax_rate <> v.rate)`,
       [codes, classes, rates]
     );
-    await client.query("UPDATE products SET siigo_checked_at = now() WHERE sku = ANY($1::text[])", [skus]);
+    await client.query("UPDATE products SET siigo_checked_at = now() WHERE woo_id IS NOT NULL AND sku = ANY($1::text[])", [skus]);
     return { checked: skus.length, changed: r.rowCount ?? 0, notFound, oddRates };
   } finally {
     client.release();
@@ -72,7 +72,7 @@ export async function syncSiigoTaxClassesAll(): Promise<SiigoTaxSyncResult> {
     const total = r.pagination?.total_results ?? 0;
     if (!r.results?.length || page * 100 >= total) break;
   }
-  const { rows } = await pool.query<{ sku: string }>("SELECT sku FROM products WHERE active AND sku IS NOT NULL");
+  const { rows } = await pool.query<{ sku: string }>("SELECT sku FROM products WHERE active AND woo_id IS NOT NULL AND sku IS NOT NULL");
   return apply(found, rows.map((x) => x.sku));
 }
 

@@ -459,6 +459,50 @@ El monto **ya no decide** el tipo de checkout. Siempre se identifica al cliente 
 - **No existe:** **Consumidor final** o **Factura electrónica a mi nombre** (formulario en blanco, sin autocompletar). También hay un enlace "No quiero dar mi cédula (Consumidor final)" en el primer paso.
 - Todo el estado de la consulta vive en la pantalla: al volver atrás, al terminar la compra o por inactividad (3 minutos) se borra.
 
+## 11g. Catálogo unificado WooCommerce + Siigo y bodega por usuario
+
+### Qué hace
+- **Un solo catálogo** (tabla `products`) con los productos de WooCommerce **y** los de Siigo (todas las bodegas), sin duplicados. La llave de unión es el **código de Siigo = SKU de WooCommerce**, sin espacios y en MAYÚSCULAS. Si un código está repetido (en Siigo o en WooCommerce) **no se une**: se marca (`siigo_ambiguous`) y se reporta en el resumen de la sincronización.
+- `products.origin`: `woocommerce` (solo Woo) · `siigo` (solo Siigo, sin `woo_id`) · `ambos` (unidos). Columnas nuevas: `siigo_id`, `siigo_code` (el código **tal como está en Siigo**: es el que va en la factura), `siigo_type`, `siigo_active`, `siigo_group`, `siigo_name`, `siigo_price`, `siigo_price_includes_tax`, `siigo_synced_at`, `woo_seen_at`. Tablas nuevas: `warehouses` (bodegas), `product_stock` (existencias por producto y bodega), `user_warehouse_log` (historial de la bodega de cada usuario) y `product_sync_runs` (corridas de la sincronización). `users.warehouse_id`, `users.session_warehouse_id`, `sales.warehouse_id` y `sales.warehouse_name`.
+- **Producto en ambos:** nombre, imagen, categoría, precio e IVA **siguen siendo los de WooCommerce**. De Siigo solo se agregan `siigo_*` y las existencias. Si el precio o el IVA difieren **no se cambian**: el resumen de la sincronización los cuenta («55 con IVA distinto, 5 con precio distinto» en los datos reales) y el detalle del IVA sigue en `npm run report:iva`.
+- **Producto solo en Siigo:** nombre, código, precio, IVA y existencias salen de Siigo. Categoría = grupo de inventario de Siigo. **Siigo no tiene imágenes**: en la caja, el kiosco y Admin → Productos se muestra un marcador neutro con las iniciales (mismo tamaño que las fotos, claro y oscuro).
+- **No entran al catálogo vendible:** los inactivos en Siigo y los tipos que no sean producto (servicios, etc.; el admin lo cambia en *Configuración → Tipos de producto de Siigo*), ni los productos sin precio o con IVA que no sea 0/5/19 %.
+- **Quién manda:** la sincronización de WooCommerce (completa, incremental y la de IVA) **nunca** borra, desactiva ni cambia un producto solo-Siigo; la de Siigo **nunca** pisa nombre, imagen, categoría, precio ni IVA de un producto de WooCommerce. Si un producto unido deja WooCommerce pasa a ser solo de Siigo (con los datos de Siigo); si aparece en WooCommerce uno con el código de un solo-Siigo, **se une a esa fila** (no se duplica) y quedan los datos de WooCommerce.
+
+### Precio e IVA de Siigo (verificado con la API real el 2026-11-24)
+- `GET /v1/products` trae `prices[].price_list[]` con **listas por NOMBRE** (el orden cambia de un producto a otro). Para los productos solo-Siigo se usa la lista **«Precio de venta 2»** (configurable) y, si el producto no la tiene, «Precio de venta 1». Motivo: en los 703 productos que están en las dos partes, el precio de WooCommerce **coincide con «Precio de venta 2» en 684 (97 %)** y con «Precio de venta 1» solo en 17 (los que solo tienen lista 1); la lista 1 es ~10 % más cara.
+- `tax_included` dice si el precio **incluye** IVA (`true` en los gravados al 19 %, `false` en exentos y excluidos); el POS lo guarda en `prices_include_tax`. `tax_classification` = Taxed / Exempt / Excluded; los gravados traen el impuesto `IVA 19%` (id 2785) y los exentos `IVA 0%` (id 26387).
+
+### Sincronización de Siigo (Admin → Productos)
+- Botón **Sincronizar productos de Siigo** (junto al de WooCommerce) y **Solo existencias**. Corre en segundo plano con barra de progreso y, al final, el resumen: creados, actualizados, unidos con WooCommerce, omitidos (inactivos, servicios u otros tipos, sin precio), ambiguos, con error, desactivados, bodegas y existencias.
+- Solo lee (`GET /v1/products`, `GET /v1/warehouses`): páginas de 100, **máximo 80 peticiones por minuto**, cede el paso a la facturación (espera si ya van más de 70 en el último minuto), reintenta 4 veces con espera creciente y respeta el 429 de Siigo. **Primera sincronización real: 61 segundos** (33 páginas, 3.281 productos, 52 bodegas con existencias, 15.299 registros).
+- **Un solo candado** para toda sincronización de productos (WooCommerce completa/incremental y Siigo completa/existencias): si hay otra en curso responde 409 («Ya hay una sincronización de productos en curso»). La incremental de la caja simplemente se salta ese turno.
+- **Automática** (después de la primera completa manual): una vez al día entre las 2:00 y las 5:59 (hora de Colombia) catálogo completo + existencias, y las **existencias de todas las bodegas cada 30 minutos** (Admin → Configuración; 5 a 1440 min; 0 = apagado). Si Siigo falla se reintenta como mucho cada hora (la diaria) o en el siguiente turno (existencias). La API no ofrece filtro por bodega, así que cada actualización de existencias lee el catálogo completo (33 peticiones).
+- Solo admin. Logs de tipo `sync` con conteos y sin datos sensibles. Una venta **nunca** se bloquea por inventario (las existencias son informativas); Admin → Productos muestra las existencias de la bodega elegida.
+
+### Bodega de Siigo por usuario
+- **Admin → Usuarios:** selector «Bodega de Siigo» (lista en vivo de `GET /v1/warehouses` con caché de 5 min y botón «Actualizar bodegas»; si Siigo no responde se usa la última lista guardada y se avisa). **Admin → Configuración:** bodega por defecto para los usuarios sin asignar, frecuencia de existencias, lista de precios, tipos de producto y, por bodega, si su catálogo incluye también los productos de WooCommerce (por defecto sí).
+- **Kiosco:** bodega fija del usuario; el cliente no la ve ni la cambia, y el servidor solo vende lo que el catálogo de esa bodega muestra. **Cajero:** usa su bodega y no puede cambiarla (lo impide el servidor: una venta con otra bodega responde 400 y queda en logs de seguridad). **Admin:** usa la suya (o la de por defecto) y puede cambiarla **solo para su sesión de caja** con «Vendiendo desde: …» (se bloquea con el carrito lleno); queda en el log quién cambió y a cuál, y al volver a iniciar sesión se descarta.
+- **Catálogo por bodega:** productos con registro en la bodega del usuario (aunque la cantidad sea 0) + los de WooCommerce si la bodega lo permite. Sin bodega: solo los de WooCommerce.
+- **La venta guarda la bodega** (`sales.warehouse_id`/`warehouse_name`) al cobrar, también en la cola sin conexión. El servidor la valida contra el usuario: acepta la actual o la que el usuario tenía cuando se hizo la venta (historial ±5 min), así una venta hecha sin conexión en la bodega A y enviada después de reasignar al usuario a B **factura en A**. Los reintentos facturan con la bodega guardada.
+
+### Factura
+- Cada ítem lleva `warehouse` = bodega de la venta (**confirmado con la API real**: la factura de prueba devolvió `items[].warehouse = {id: 764, name: …}`; la documentación dice que el campo es opcional, que debe existir y estar activo). Sin bodega no se manda el campo.
+- Los ítems se facturan con el **código de Siigo** del producto (`siigo_code`; si no hay, el SKU de siempre).
+- Un producto de WooCommerce que **no existe en Siigo** (después de una sincronización completa de Siigo) o que está **inactivo** en Siigo **no se factura**: la venta queda en «Fallida» con el motivo claro («no existe en Siigo…», «inactivo en Siigo…») y se reintenta desde Ventas cuando se corrija. Antes de la primera sincronización de Siigo todo funciona como siempre.
+- Observaciones de la factura: `POS FECP venta <UUID> | Bodega <nombre, máx. 40 caracteres> | <pagos>`. La tirilla muestra la bodega. Reportes: filtro y tabla «Por bodega de Siigo».
+
+### Caja sin conexión y rendimiento
+- El catálogo se guarda en el navegador (localStorage, sin imágenes). Medido con los datos reales: bodega 764 (Asamblea) con WooCommerce = 986 productos, **179 KB**; **solo su bodega = 883 productos, 161 KB**; bodega 738 (la más grande) = 1.785 productos, 324 KB; **peor caso, todos los 3.227 productos activos = 567 KB** (≈ 1,1 MB en UTF-16 de los ~5 MB de localStorage). Por eso **no hizo falta IndexedDB**; si un día el catálogo pasa de ~3 MB de texto habría que migrar (la cola de ventas ya usa localStorage y no cambia). Búsqueda por nombre, SKU y código de barras con ~1.800 productos: 74 ms; escribiendo letra por letra el peor cuadro fue 38 ms.
+- Una caja con un catálogo viejo guardado (sin bodega) se abre, muestra ese catálogo y vende; la versión del catálogo depende de la bodega, así que se actualiza sola.
+
+### Qué debe confirmar el contador antes de usarlo
+1. Que **«Precio de venta 2»** es el precio de venta al público para los productos solo-Siigo (en los productos de WooCommerce coincide en el 97 %). Se cambia en Configuración sin tocar código.
+2. Que facturar con `warehouse` descuenta el inventario de **esa bodega** en Siigo (la documentación no dice qué bodega usa Siigo si no se envía; con bodega asignada se envía siempre). Los comprobantes de prueba (6503) también pueden mover inventario: elimine el documento de prueba.
+3. Qué hacer con los productos **sin control de inventario** (199 en Siigo) y con **existencias negativas** (17): el POS no bloquea ventas por inventario.
+4. Los **servicios** (31 en Siigo: IBP Virtual, etc.) quedan fuera del catálogo por defecto; si se incluyen, se venden sin existencias.
+5. Los **55 productos con IVA distinto** entre WooCommerce y Siigo siguen usando el IVA de Siigo al facturar (regla de siempre) y las cifras de WooCommerce en pantalla.
+
 ## 12. Comandos útiles
 
 | Comando | Para qué |

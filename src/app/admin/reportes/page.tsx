@@ -2,6 +2,7 @@ import { requirePage } from "@/lib/auth";
 import { query } from "@/lib/db";
 import { formatCOP } from "@/lib/money";
 import { paymentLabel } from "@/lib/payments";
+import { storedWarehouses } from "@/lib/warehouse";
 import { isDateStr, SALE_DAY_SQL, todayBogota } from "@/lib/sales";
 import { statusInfo } from "@/components/sales/status";
 import { NOT_REVENUE_SQL } from "@/lib/sale-states";
@@ -15,22 +16,29 @@ export const metadata: Metadata = { title: "Reportes" };
 // Los totales por medio, el recaudado, el crédito y el cuadre de efectivo salen de sale_payments (una fila por línea de pago).
 // "Total recaudado" = lo realmente cobrado (efectivo, tarjeta, transferencia, pago electrónico). El Crédito FECP NO es dinero
 // recaudado: queda por cobrar en Siigo y se muestra aparte en "Ventas a crédito".
-const WHERE = `${SALE_DAY_SQL} BETWEEN $1::date AND $2::date AND s.status NOT IN (${NOT_REVENUE_SQL})`;
+// $3 = bodega de Siigo con la que se vendió (NULL = todas)
+const WH = "($3::int IS NULL OR s.warehouse_id = $3::int)";
+const WHERE = `${SALE_DAY_SQL} BETWEEN $1::date AND $2::date AND s.status NOT IN (${NOT_REVENUE_SQL}) AND ${WH}`;
 
 const th = "px-4 py-2";
 const card = "bg-surface rounded-xl border border-line overflow-x-auto";
 const head = "bg-subtle text-left text-[13px] text-body";
 
-export default async function ReportesPage({ searchParams }: { searchParams: Promise<{ from?: string; to?: string }> }) {
+export default async function ReportesPage({ searchParams }: { searchParams: Promise<{ from?: string; to?: string; bodega?: string }> }) {
   await requirePage("/admin");
   const sp = await searchParams;
   const today = todayBogota();
   let from = isDateStr(sp.from) ? sp.from : today;
   let to = isDateStr(sp.to) ? sp.to : from;
   if (from > to) [from, to] = [to, from];
-  const p = [from, to];
+  const whList = await storedWarehouses();
+  const wid = Number(sp.bodega) > 0 ? Number(sp.bodega) : null;
+  const p = [from, to, wid];
 
-  const [totals, byStatus, byCashier, byPay, payDetail, top, byDay, toReview, creditRows, cashByCashier, priceHeld, annulled] = await Promise.all([
+  const [byWarehouse, totals, byStatus, byCashier, byPay, payDetail, top, byDay, toReview, creditRows, cashByCashier, priceHeld, annulled] = await Promise.all([
+    query<{ name: string; n: number; total: number }>(
+      `SELECT COALESCE(s.warehouse_name, '(sin bodega)') AS name, count(*)::int n, sum(s.total)::float8 total FROM sales s
+        WHERE ${WHERE} GROUP BY 1 ORDER BY total DESC`, p),
     query<{ n: number; subtotal: number; tax: number; total: number; facturado: number; n_facturadas: number }>(
       `SELECT count(*)::int n, coalesce(sum(s.subtotal),0)::float8 subtotal, coalesce(sum(s.tax_total),0)::float8 tax, coalesce(sum(s.total),0)::float8 total,
               coalesce(sum(s.total) FILTER (WHERE s.status = 'invoiced'),0)::float8 facturado,
@@ -88,7 +96,7 @@ export default async function ReportesPage({ searchParams }: { searchParams: Pro
               COALESCE(s.price_review_note, s.last_error) AS note, ru.name AS by_name
          FROM sales s JOIN users u ON u.id = s.cashier_id LEFT JOIN users ru ON ru.id = s.price_review_by
          JOIN sale_payments sp ON sp.sale_id = s.id
-        WHERE ${SALE_DAY_SQL} BETWEEN $1::date AND $2::date AND s.status = 'anulada'
+        WHERE ${SALE_DAY_SQL} BETWEEN $1::date AND $2::date AND s.status = 'anulada' AND ${WH}
         GROUP BY s.id, u.name, ru.name
        HAVING coalesce(sum(sp.amount) FILTER (WHERE sp.method <> 'credito_fecp' AND (sp.method <> 'epayco' OR s.payment_status = 'aprobado')), 0) > 0
         ORDER BY s.created_at`, p),
@@ -131,6 +139,15 @@ export default async function ReportesPage({ searchParams }: { searchParams: Pro
           <label className="text-[13px] font-semibold text-body">
             Hasta
             <input type="date" name="to" defaultValue={to} max={today} className="mt-1 block border border-field rounded-lg px-3 min-h-11 text-[14px] bg-surface text-fg" />
+          </label>
+          <label className="text-[13px] font-semibold text-body">
+            Bodega
+            <select name="bodega" defaultValue={wid ?? ""} className="mt-1 block border border-field rounded-lg px-3 min-h-11 text-[14px] bg-surface text-fg max-w-[220px]">
+              <option value="">Todas</option>
+              {whList.map((w) => (
+                <option key={w.id} value={w.id}>{w.name}</option>
+              ))}
+            </select>
           </label>
           <button className="px-5 min-h-11 rounded-lg bg-brand text-white font-semibold text-[14px]">Ver</button>
           <a href="/admin/reportes" className="px-4 inline-flex items-center min-h-11 rounded-lg border border-field bg-surface text-[14px] text-body">Hoy</a>
@@ -257,6 +274,18 @@ export default async function ReportesPage({ searchParams }: { searchParams: Pro
             <thead className={head}><tr><th className={th}>Cajero</th><th className={`${th} text-right`}>Ventas</th><th className={`${th} text-right`}>Total</th></tr></thead>
             <tbody className="divide-y divide-line">
               {byCashier.rows.map((r) => (
+                <tr key={r.name}><td className={th}>{r.name}</td><td className={`${th} text-right`}>{r.n}</td><td className={`${th} text-right`}>{formatCOP(r.total)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+
+        <section className={card}>
+          <h2 className="px-4 pt-3 font-semibold">Por bodega de Siigo</h2>
+          <table className="w-full text-[14px] mt-2">
+            <thead className={head}><tr><th className={th}>Bodega</th><th className={`${th} text-right`}>Ventas</th><th className={`${th} text-right`}>Total</th></tr></thead>
+            <tbody className="divide-y divide-line">
+              {byWarehouse.rows.map((r) => (
                 <tr key={r.name}><td className={th}>{r.name}</td><td className={`${th} text-right`}>{r.n}</td><td className={`${th} text-right`}>{formatCOP(r.total)}</td></tr>
               ))}
             </tbody>

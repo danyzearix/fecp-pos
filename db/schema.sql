@@ -422,3 +422,85 @@ ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS webhook_approved_at TIMEST
 ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS evidence_by   INTEGER;
 ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS evidence_at   TIMESTAMPTZ;
 ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS evidence_note TEXT;
+
+-- ---------------------------------------------------------------------------
+-- CATÁLOGO UNIFICADO WooCommerce + Siigo, y BODEGA de Siigo por usuario / venta
+-- ---------------------------------------------------------------------------
+-- products: llave de unión = código de Siigo = SKU de Woo (sin espacios, MAYÚSCULAS). origin dice de dónde viene cada producto.
+--   woocommerce: solo en Woo · siigo: solo en Siigo (no tiene woo_id) · ambos: unidos por el código.
+-- Reglas de propiedad: la sincronización de Woo nunca toca ni desactiva origin='siigo'; la de Siigo nunca pisa nombre, imagen,
+-- categoría ni precio de un producto con woo_id (de esos solo agrega siigo_* y existencias).
+ALTER TABLE products ALTER COLUMN woo_id DROP NOT NULL;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS origin        TEXT NOT NULL DEFAULT 'woocommerce';
+ALTER TABLE products DROP CONSTRAINT IF EXISTS products_origin_check;
+ALTER TABLE products ADD CONSTRAINT products_origin_check CHECK (origin IN ('woocommerce','siigo','ambos'));
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_id      TEXT;               -- id (UUID) del producto en Siigo
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_code    TEXT;               -- código TAL COMO está en Siigo (es el que va en la factura)
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_type    TEXT;               -- Product | Service | ...
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_active  BOOLEAN;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_group   TEXT;               -- grupo de inventario (account_group)
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_name    TEXT;               -- lo que dice Siigo (para el reporte de diferencias y si el producto deja Woo)
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_price   NUMERIC(14,2);      -- precio de Siigo (lista configurada), informativo si el producto es de Woo
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_price_includes_tax BOOLEAN;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_synced_at TIMESTAMPTZ;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS siigo_ambiguous TEXT;             -- motivo si el código es repetido/ambiguo: NO se unió
+ALTER TABLE products ADD COLUMN IF NOT EXISTS woo_seen_at   TIMESTAMPTZ;        -- última vez que Woo lo trajo (decide qué desactivar en la sync completa)
+UPDATE products SET woo_seen_at = updated_at WHERE woo_seen_at IS NULL AND woo_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_siigo_id ON products (siigo_id) WHERE siigo_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_products_sku_norm ON products (upper(regexp_replace(sku, '\s', '', 'g')));
+CREATE INDEX IF NOT EXISTS idx_products_origin ON products (origin);
+
+-- Bodegas de Siigo (última lista conocida: sirve si Siigo no responde). include_woo: en el catálogo de esa bodega, ¿se incluyen los de Woo?
+CREATE TABLE IF NOT EXISTS warehouses (
+  id          INTEGER PRIMARY KEY,           -- id de Siigo (GET /v1/warehouses); -1 = "Sin asignar" (solo existencias)
+  name        TEXT NOT NULL,
+  active      BOOLEAN NOT NULL DEFAULT TRUE,
+  include_woo BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Existencias por producto y bodega (INFORMATIVAS: el POS no bloquea ventas por inventario)
+CREATE TABLE IF NOT EXISTS product_stock (
+  product_id   INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  warehouse_id INTEGER NOT NULL,
+  quantity     NUMERIC(14,3) NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (product_id, warehouse_id)
+);
+CREATE INDEX IF NOT EXISTS idx_product_stock_wh ON product_stock (warehouse_id);
+
+-- Bodega del usuario (NULL = usa la bodega por defecto de Configuración) y bodega elegida por un admin para su sesión de caja
+ALTER TABLE users ADD COLUMN IF NOT EXISTS warehouse_id INTEGER;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS session_warehouse_id INTEGER;
+-- Historial de la bodega con la que podía vender cada usuario (asignación, cambio de sesión del admin). Una venta hecha sin conexión
+-- con la bodega A se acepta aunque al llegar el usuario ya esté en B, si A era su bodega cuando se hizo la venta.
+CREATE TABLE IF NOT EXISTS user_warehouse_log (
+  id           BIGSERIAL PRIMARY KEY,
+  user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  warehouse_id INTEGER,                      -- NULL = sin bodega
+  kind         TEXT NOT NULL,                -- asignada | sesion | defecto
+  valid_from   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  valid_to     TIMESTAMPTZ,
+  changed_by   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_uwl_user ON user_warehouse_log (user_id, valid_from);
+
+-- La bodega con la que SE VENDIÓ queda en la venta; las reintentos y las ventas sin conexión facturan con ella, no con la asignación actual
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS warehouse_id INTEGER;
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS warehouse_name TEXT;
+CREATE INDEX IF NOT EXISTS idx_sales_warehouse ON sales (warehouse_id);
+
+-- Corridas de la sincronización de productos de Siigo (progreso, resumen y candado visible)
+CREATE TABLE IF NOT EXISTS product_sync_runs (
+  id          SERIAL PRIMARY KEY,
+  kind        TEXT NOT NULL CHECK (kind IN ('completa','existencias')),
+  trigger     TEXT NOT NULL DEFAULT 'manual',     -- manual | automatica
+  status      TEXT NOT NULL DEFAULT 'running' CHECK (status IN ('running','done','error')),
+  started_by  INTEGER,
+  started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at TIMESTAMPTZ,
+  heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  progress    JSONB,                              -- { page, pages, products }
+  summary     JSONB,                              -- creados, actualizados, unidos, omitidos, ambiguos, errores...
+  error       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_psr_started ON product_sync_runs (started_at DESC);

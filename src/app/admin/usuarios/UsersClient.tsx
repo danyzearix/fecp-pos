@@ -11,8 +11,11 @@ type U = {
   role: Role;
   active: boolean;
   siigo_seller_id: number | null;
+  warehouse_id: number | null;
   locked_until: string | null;
 };
+
+type Wh = { id: number; name: string; active: boolean };
 
 const input =
   "w-full border border-field rounded-lg px-3 min-h-11 text-[14px] text-fg placeholder:text-[14px] placeholder:text-faint outline-none focus:border-brand bg-surface";
@@ -22,7 +25,10 @@ export default function UsersClient() {
   const [users, setUsers] = useState<U[]>([]);
   const [me, setMe] = useState(0);
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
-  const [form, setForm] = useState({ name: "", email: "", password: "", role: "cajero" as Role, seller: "" });
+  const [form, setForm] = useState({ name: "", email: "", password: "", role: "cajero" as Role, seller: "", warehouse: "" });
+  const [warehouses, setWarehouses] = useState<Wh[]>([]);
+  const [whNote, setWhNote] = useState("");
+  const [whBusy, setWhBusy] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -38,6 +44,25 @@ export default function UsersClient() {
     load();
   }, [load]);
 
+  /** Bodegas de Siigo en vivo (caché corta). refresh = botón «Actualizar». Si Siigo no responde se usa la última lista guardada y se avisa. */
+  const loadWarehouses = useCallback(async (refresh: boolean) => {
+    setWhBusy(true);
+    try {
+      const res = await fetch(`/api/admin/bodegas${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+      if (res.ok) {
+        const d = await res.json();
+        setWarehouses(d.warehouses ?? []);
+        setWhNote(d.stale ? d.error ?? "Siigo no respondió: se muestra la última lista guardada." : "");
+      }
+    } finally {
+      setWhBusy(false);
+    }
+  }, []);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadWarehouses(false);
+  }, [loadWarehouses]);
+
   async function call(url: string, method: string, body: unknown, ok: string) {
     const res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const d = await res.json().catch(() => ({}));
@@ -52,10 +77,10 @@ export default function UsersClient() {
     const ok = await call(
       "/api/admin/users",
       "POST",
-      { name: form.name, email: form.email, password: form.password, role: form.role, siigo_seller_id: form.seller },
+      { name: form.name, email: form.email, password: form.password, role: form.role, siigo_seller_id: form.seller, warehouse_id: form.warehouse === "" ? null : Number(form.warehouse) },
       `Usuario ${form.email} creado`
     );
-    if (ok) setForm({ name: "", email: "", password: "", role: "cajero", seller: "" });
+    if (ok) setForm({ name: "", email: "", password: "", role: "cajero", seller: "", warehouse: "" });
     setBusy(false);
   }
 
@@ -66,8 +91,15 @@ export default function UsersClient() {
       <div>
         <h1 className="text-2xl font-bold text-fg">Usuarios</h1>
         <p className="text-[13px] text-dim">
-          El vendedor de Siigo se usa al facturar las ventas de ese usuario. Si está vacío se usa SIIGO_SELLER_ID del .env.
+          El vendedor de Siigo se usa al facturar las ventas de ese usuario. Si está vacío se usa SIIGO_SELLER_ID del .env. La bodega de Siigo es de donde se descuenta el inventario al facturar; si está en «(por defecto)» se usa la de Admin → Configuración.
         </p>
+        <div className="mt-2 flex items-center gap-2 flex-wrap">
+          <button onClick={() => void loadWarehouses(true)} disabled={whBusy} className="px-3 min-h-11 rounded-lg border border-field bg-surface text-[13px] font-medium text-body disabled:opacity-60">
+            {whBusy ? "Consultando Siigo…" : "Actualizar bodegas"}
+          </button>
+          <span className="text-[12px] text-dim">{warehouses.filter((w) => w.active).length} bodegas activas</span>
+          {whNote && <span className="text-[13px] text-warn-ink">⚠ {whNote}</span>}
+        </div>
       </div>
 
       {msg && (
@@ -100,6 +132,15 @@ export default function UsersClient() {
           <span className={label}>Vendedor en Siigo (opcional)</span>
           <input className={input} inputMode="numeric" value={form.seller} onChange={(e) => setForm({ ...form, seller: e.target.value })} placeholder="Ej. 744" />
         </label>
+        <label className="col-span-2">
+          <span className={label}>Bodega de Siigo</span>
+          <select className={input} value={form.warehouse} onChange={(e) => setForm({ ...form, warehouse: e.target.value })}>
+            <option value="">(por defecto)</option>
+            {warehouses.filter((w) => w.active).map((w) => (
+              <option key={w.id} value={w.id}>{w.name}</option>
+            ))}
+          </select>
+        </label>
         <button disabled={busy} className="col-span-2 bg-brand text-white font-semibold rounded-lg py-2.5 disabled:opacity-60">
           {busy ? "Creando…" : "Crear usuario"}
         </button>
@@ -108,19 +149,20 @@ export default function UsersClient() {
       <div className="bg-surface rounded-xl border border-line overflow-x-auto">
         {/* min-w: esta tabla lleva controles (select, campos, botones). En pantallas angostas se desplaza
             de lado DENTRO de la tarjeta en vez de aplastar los controles hasta que no se puedan tocar. */}
-        <table className="w-full min-w-[760px] text-[14px] text-fg">
+        <table className="w-full min-w-[900px] text-[14px] text-fg">
           <thead className="bg-subtle text-left text-[13px] text-body">
             <tr>
               <th className="px-4 py-2">Usuario</th>
               <th className="px-4 py-2">Rol</th>
               <th className="px-4 py-2">Vendedor Siigo</th>
+              <th className="px-4 py-2">Bodega Siigo</th>
               <th className="px-4 py-2">Estado</th>
               <th className="px-4 py-2">Acciones</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-line">
             {users.map((u) => (
-              <UserRow key={u.id} u={u} isMe={u.id === me} patch={patch} />
+              <UserRow key={u.id} u={u} isMe={u.id === me} patch={patch} warehouses={warehouses} />
             ))}
           </tbody>
         </table>
@@ -129,7 +171,7 @@ export default function UsersClient() {
   );
 }
 
-function UserRow({ u, isMe, patch }: { u: U; isMe: boolean; patch: (u: U, body: unknown, ok: string) => Promise<boolean> }) {
+function UserRow({ u, isMe, patch, warehouses }: { u: U; isMe: boolean; patch: (u: U, body: unknown, ok: string) => Promise<boolean>; warehouses: Wh[] }) {
   const [seller, setSeller] = useState(u.siigo_seller_id?.toString() ?? "");
   const [pwd, setPwd] = useState("");
   const [showPwd, setShowPwd] = useState(false);
@@ -168,6 +210,19 @@ function UserRow({ u, isMe, patch }: { u: U; isMe: boolean; patch: (u: U, body: 
             </button>
           )}
         </div>
+      </td>
+      <td className="px-4 py-2">
+        <select
+          value={u.warehouse_id ?? ""}
+          onChange={(e) => patch(u, { warehouse_id: e.target.value === "" ? null : Number(e.target.value) }, `Bodega de ${u.email} actualizada`)}
+          className="border border-field rounded-lg px-2 min-h-11 text-[14px] text-fg bg-surface max-w-[220px]"
+          aria-label={`Bodega de Siigo de ${u.email}`}
+        >
+          <option value="">(por defecto)</option>
+          {warehouses.filter((w) => w.active || w.id === u.warehouse_id).map((w) => (
+            <option key={w.id} value={w.id}>{w.name}{w.active ? "" : " (inactiva)"}</option>
+          ))}
+        </select>
       </td>
       <td className="px-4 py-2 whitespace-nowrap">
         {u.active ? <span className="text-ok-ink">Activo</span> : <span>Desactivado</span>}

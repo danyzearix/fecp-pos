@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import ProductThumb from "@/components/ProductThumb";
 import QRCode from "qrcode";
 import FullscreenButton from "@/components/FullscreenButton";
 import Logo from "@/components/Logo";
@@ -562,12 +563,7 @@ function KioskCard({ p, qty, onAdd }: { p: IndexedProduct; qty?: number; onAdd: 
     <button onClick={onAdd} className="relative text-left bg-surface rounded-2xl border border-line p-3 active:scale-[0.98] active:border-brand transition">
       {qty ? <span className="absolute -top-2 -right-2 min-w-9 h-9 px-2 rounded-full bg-go text-white text-lg font-bold flex items-center justify-center shadow">{qty}</span> : null}
       <div className="h-32 flex items-center justify-center bg-subtle rounded-xl overflow-hidden">
-        {p.image_url ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={p.image_url} alt="" loading="lazy" className="max-h-full max-w-full object-contain" />
-        ) : (
-          <span className="text-4xl font-bold text-dim">{p.name.slice(0, 2).toUpperCase()}</span>
-        )}
+        <ProductThumb name={p.name} src={p.image_url} textClass="text-4xl" />
       </div>
       <div className="mt-2 text-[17px] font-semibold leading-tight line-clamp-2 min-h-[2.8rem] text-body">{p.name}</div>
       <div className="text-[14px] text-dim truncate">{p.barcode || p.sku}</div>

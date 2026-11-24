@@ -12,6 +12,8 @@ import { EpaycoError } from "./epayco/adapter";
 import { openAttempt } from "./epayco/attempts";
 import { epaycoMissingEnv, getEpaycoConfig } from "./epayco/config";
 import { getPosConfig } from "./config";
+import { productsInCatalog } from "./catalog";
+import { effectiveWarehouse } from "./warehouse";
 import { epaycoInvoicingBlocker } from "./siigo/payment";
 import { initialChannel, payUrlFor, qrAvailable, type PayChannel } from "./epayco/channel";
 
@@ -83,6 +85,13 @@ export async function createKioskPayment(input: {
     [[...qty.keys()]]
   );
   if (prods.rows.length !== qty.size) return fail(400, "Alguno de los productos ya no está disponible");
+  // Bodega de Siigo del usuario (la decide el servidor; el kiosco no la ve ni la cambia). El kiosco solo vende lo que su catálogo muestra.
+  const roleRow = (await query<{ role: string }>("SELECT role FROM users WHERE id = $1", [input.userId])).rows[0];
+  const wh = await effectiveWarehouse(input.userId, roleRow?.role ?? "cliente");
+  if (source === "kiosco") {
+    const allowed = await productsInCatalog(input.userId, roleRow?.role ?? "cliente", prods.rows.map((p) => p.id));
+    if (allowed.size !== prods.rows.length) return fail(400, "Alguno de los productos ya no está disponible");
+  }
 
   const lines: CartLine[] = prods.rows.map((p) => ({
     productId: p.id, sku: p.sku, barcode: null, name: p.name,
@@ -144,9 +153,9 @@ export async function createKioskPayment(input: {
 
     await client.query(
       `INSERT INTO sales (id, local_number, cashier_id, customer_id, checkout_type, subtotal, tax_total, total, payment_method,
-                          status, created_at_device, source, payment_status, payment_expires_at, pay_token, notify_email, pay_channel, pay_channel_changed_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'epayco','esperando_pago',now(),$12,'esperando',$9,$10,$11,$13,now())`,
-      [saleId, localNumber, input.userId, customerId, checkoutType, totals.subtotal, totals.tax, totals.total, expiresAt, payToken, notifyEmail, source, channel]
+                          status, created_at_device, source, payment_status, payment_expires_at, pay_token, notify_email, pay_channel, pay_channel_changed_at, warehouse_id, warehouse_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'epayco','esperando_pago',now(),$12,'esperando',$9,$10,$11,$13,now(),$14,$15)`,
+      [saleId, localNumber, input.userId, customerId, checkoutType, totals.subtotal, totals.tax, totals.total, expiresAt, payToken, notifyEmail, source, channel, wh?.id ?? null, wh?.name ?? null]
     );
     await client.query("INSERT INTO sale_payments (sale_id, method, amount, ord) VALUES ($1,'epayco',$2,1)", [saleId, totals.total]);
     for (const l of lines) {

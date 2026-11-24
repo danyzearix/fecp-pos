@@ -5,6 +5,7 @@ import {
   buildIndex,
   fetchCatalog,
   loadCatalogMeta,
+  type CatalogWarehouse,
   loadLocalCatalog,
   normalize,
   requestIncrementalSync,
@@ -40,6 +41,8 @@ import CartPanel from "./CartPanel";
 import CheckoutModal, { type CheckoutResult } from "./CheckoutModal";
 import EpaycoCharge, { loadStoredSale, type EpaycoStart } from "./EpaycoCharge";
 import { IconSearch } from "./Icons";
+import ProductThumb from "@/components/ProductThumb";
+import WarehouseSwitcher from "./WarehouseSwitcher";
 import Sidebar from "./Sidebar";
 
 const CART_KEY = "fecp_cart_v1";
@@ -89,17 +92,22 @@ export default function CajaClient({
 
   // ---- Catálogo: primero localStorage (instantáneo), luego el servidor ----
   const catalogVersion = useRef<string>("");
+  // Bodega de Siigo con la que vende este usuario (la decide el servidor y viene con el catálogo)
+  const [warehouse, setWarehouse] = useState<CatalogWarehouse>(null);
+  const warehouseRef = useRef<CatalogWarehouse>(null);
   const [catalogUpdatedAt, setCatalogUpdatedAt] = useState<number | null>(null);
 
   /** Descarga el catálogo y lo deja en memoria y en localStorage, sin recargar la página. */
   const refreshCatalog = useCallback(async () => {
-    const { products: p, version } = await fetchCatalog();
+    const { products: p, version, warehouse: wh } = await fetchCatalog();
     setProducts(p);
     saveLocalCatalog(p);
     catalogVersion.current = version;
+    warehouseRef.current = wh ?? null;
+    setWarehouse(wh ?? null);
     const updatedAt = Date.now();
     setCatalogUpdatedAt(updatedAt);
-    saveCatalogMeta({ updatedAt, version });
+    saveCatalogMeta({ updatedAt, version, warehouse: wh ?? null });
     setCatalogState("ok");
   }, []);
 
@@ -110,6 +118,8 @@ export default function CajaClient({
     if (meta) {
       setCatalogUpdatedAt(meta.updatedAt);
       catalogVersion.current = meta.version;
+      warehouseRef.current = meta.warehouse ?? null;
+      setWarehouse(meta.warehouse ?? null);
     }
     refreshCatalog().catch(() => setCatalogState("offline"));
   }, [refreshCatalog]);
@@ -128,7 +138,7 @@ export default function CajaClient({
         else {
           const updatedAt = Date.now(); // sin cambios: sigue vigente
           setCatalogUpdatedAt(updatedAt);
-          saveCatalogMeta({ updatedAt, version });
+          saveCatalogMeta({ updatedAt, version, warehouse: warehouseRef.current });
         }
       } catch {
         /* se reintenta en el siguiente ciclo */
@@ -277,6 +287,8 @@ export default function CajaClient({
         local_number: nextLocalNumber(config.prefix),
         created_at_device: new Date().toISOString(),
         checkout_type: r.checkoutType,
+        // Bodega con la que se vende AHORA: viaja con la venta (también en la cola sin conexión) y el servidor la valida contra el usuario
+        warehouse_id: warehouseRef.current?.id ?? null,
         // Formato NUEVO: una línea por medio (el servidor valida que sumen el total que él calcula). Las ventas que ya estén
         // en la cola con el formato viejo (payment_method/cash_received) siguen enviándose: el servidor acepta los dos.
         payments: r.payments,
@@ -302,7 +314,7 @@ export default function CajaClient({
       }
 
       // La venta queda guardada en este equipo ANTES de enviarla
-      enqueue({ sale, cashierName: user.name, queuedAt: Date.now(), state: "pendiente" });
+      enqueue({ sale, cashierName: user.name, warehouseName: warehouseRef.current?.name ?? null, queuedAt: Date.now(), state: "pendiente" });
       setCart([]);
       setShowCheckout(false);
       setCartOpen(false);
@@ -327,7 +339,7 @@ export default function CajaClient({
           });
         }
         if (res.status === "invoiced") printTicket(sale.id);
-        else setLocalTicket(buildTicketFromSale(sale, user.name));
+        else setLocalTicket(buildTicketFromSale(sale, user.name, warehouseRef.current?.name));
       } else if (res.kind === "rejected") {
         markError(sale.id, res.error);
         beepError();
@@ -335,7 +347,7 @@ export default function CajaClient({
       } else {
         // Sin conexión / sesión vencida: queda en la cola y se envía sola después
         showToast(`Venta ${sale.local_number} guardada. Se enviará al volver la conexión.`, "ok");
-        setLocalTicket(buildTicketFromSale(sale, user.name));
+        setLocalTicket(buildTicketFromSale(sale, user.name, warehouseRef.current?.name));
       }
       setPending(pendingCount());
       setSaving(false);
@@ -460,6 +472,13 @@ export default function CajaClient({
       {/* Centro */}
       {/* pb-20 deja sitio al botón fijo "Ver carrito" que aparece por debajo de lg */}
       <main className="flex-1 min-w-0 flex flex-col p-3 sm:p-4 gap-3 pb-20 lg:pb-4">
+        {/* Bodega de Siigo: cajero y cliente la tienen fija; el admin puede cambiarla para su sesión (lo valida el servidor) */}
+        <WarehouseSwitcher
+          isAdmin={user.role === "admin"}
+          current={warehouse}
+          locked={cart.length > 0}
+          onChanged={() => refreshCatalog().catch(() => setCatalogState("offline"))}
+        />
         <div className="relative">
           <IconSearch className="absolute left-4 top-1/2 -translate-y-1/2 w-6 h-6 text-dim" />
           <input
@@ -631,12 +650,7 @@ function ProductCard({ p, qty, onAdd }: { p: IndexedProduct; qty?: number; onAdd
         </span>
       ) : null}
       <div className="h-16 flex items-center justify-center bg-subtle rounded-md overflow-hidden">
-        {p.image_url ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={p.image_url} alt="" loading="lazy" className="max-h-full max-w-full object-contain" />
-        ) : (
-          <span className="text-xl font-bold text-dim">{p.name.slice(0, 2).toUpperCase()}</span>
-        )}
+        <ProductThumb name={p.name} src={p.image_url} textClass="text-xl" />
       </div>
       <div className="mt-1.5 text-[13px] font-medium leading-4 line-clamp-2 min-h-8 text-body">{p.name}</div>
       <div className="text-xs leading-4 text-dim truncate">{p.sku ? p.barcode || p.sku : "Sin SKU"}</div>

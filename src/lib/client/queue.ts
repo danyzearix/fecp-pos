@@ -7,6 +7,8 @@ export const QUEUE_KEY = "fecp_sales_queue_v1";
 export type QueuedSale = {
   sale: SaleIn;
   cashierName: string;
+  /** nombre de la bodega con la que se vendió (para la tirilla provisional sin conexión) */
+  warehouseName?: string | null;
   queuedAt: number;
   state: "pendiente" | "error"; // 'error' = el servidor la rechazó; no se reintenta sola
   error?: string;

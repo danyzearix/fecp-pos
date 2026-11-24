@@ -41,7 +41,7 @@ export default function TicketPage({ saleId }: { saleId: string }) {
         config = JSON.parse(localStorage.getItem(POSCONFIG_KEY) ?? "null");
       } catch {}
       if (cancelled) return;
-      if (q && config) setLoaded({ data: buildTicketFromSale(q.sale, q.cashierName), config });
+      if (q && config) setLoaded({ data: buildTicketFromSale(q.sale, q.cashierName, q.warehouseName), config });
       else setError("No se encontró la venta.");
     })();
     return () => {

@@ -59,6 +59,8 @@ export type ParsedSale = Omit<SaleIn, "payments" | "payment_method" | "payment_r
   total: number;
   /** si la hora del equipo estaba fuera de rango (hace > 7 días o > 5 min en el futuro) se usó la del servidor y queda aquí la nota */
   time_note: string | null;
+  /** bodega que dice la caja (se valida en el servidor: warehouse.ts) */
+  warehouse_claimed: unknown;
 };
 
 /** Límites de la hora que manda el equipo: no más de 7 días atrás ni más de 5 minutos en el futuro. */
@@ -168,7 +170,7 @@ export function parseSale(body: unknown): ParsedSale | string {
   });
   if (!v.ok) return v.error;
 
-  return { id, local_number, created_at_device: createdIso, checkout_type, customer, items, lines: v.lines, total, time_note: timeNote };
+  return { id, local_number, created_at_device: createdIso, checkout_type, customer, items, lines: v.lines, total, time_note: timeNote, warehouse_claimed: b.warehouse_id ?? null };
 }
 
 /** "Maria Fernanda Lopez" → ["Maria Fernanda", "Lopez"] */
@@ -221,7 +223,7 @@ export async function upsertCashierCustomer(client: PoolClient, customer: Custom
  * Registra la venta. Idempotente: si el mismo UUID llega dos veces, la segunda vez no inserta nada
  * (INSERT ... ON CONFLICT (id) DO NOTHING) y devuelve el estado actual.
  */
-export async function createSale(sale: ParsedSale, cashierId: number): Promise<CreateSaleResult> {
+export async function createSale(sale: ParsedSale, cashierId: number, wh: { id: number | null; name: string | null } = { id: null, name: null }): Promise<CreateSaleResult> {
   const lines = sale.items.map(itemToLine);
   const totals = cartTotals(lines);
 
@@ -266,16 +268,16 @@ export async function createSale(sale: ParsedSale, cashierId: number): Promise<C
     const ins = await client.query(
       `INSERT INTO sales (id, local_number, cashier_id, customer_id, checkout_type, subtotal, tax_total, total,
                           payment_method, cash_received, change_given, status, created_at_device, payment_reference,
-                          price_review_status, price_review_detail, price_review_at, last_error, time_note)
+                          price_review_status, price_review_detail, price_review_at, last_error, time_note, warehouse_id, warehouse_name)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending',$12,$13,
-               $14, $15::jsonb, CASE WHEN $14::text IS NULL THEN NULL ELSE now() END, $16, $17)
+               $14, $15::jsonb, CASE WHEN $14::text IS NULL THEN NULL ELSE now() END, $16, $17, $18, $19)
        ON CONFLICT (id) DO NOTHING RETURNING id`,
       [
         sale.id, sale.local_number, cashierId, cust.rows[0].id, sale.checkout_type,
         totals.subtotal, totals.tax, totals.total,
         // columnas viejas (compatibilidad): el medio de la única línea o "mixto"; el efectivo y sus referencias
         saleMethodOf(payLines), cashLine?.cash_received ?? null, cashLine?.change_given ?? null, sale.created_at_device, joinedReference(payLines),
-        pc.flagged ? "pendiente" : null, pc.flagged ? JSON.stringify(pc.detail) : null, heldReason, sale.time_note,
+        pc.flagged ? "pendiente" : null, pc.flagged ? JSON.stringify(pc.detail) : null, heldReason, sale.time_note, wh.id, wh.name,
       ]
     );
 
@@ -353,7 +355,7 @@ type SaleRow = {
   id: string; local_number: string; status: string; created_at: Date; created_at_device: Date | null;
   subtotal: number; tax_total: number; total: number; payment_method: string; payment_reference: string | null;
   cash_received: number | null; change_given: number | null; invoice_name: string | null; cufe: string | null;
-  cashier_name: string; c_first: string | null; c_last: string | null; c_company: string | null; c_ident: string | null; c_id_type: string | null;
+  cashier_name: string; warehouse_name: string | null; c_first: string | null; c_last: string | null; c_company: string | null; c_ident: string | null; c_id_type: string | null;
   pay_lines: PayLine[] | null;
 };
 
@@ -362,7 +364,7 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
     `SELECT s.id, s.local_number, s.status, s.created_at, s.created_at_device,
             s.subtotal::float8 AS subtotal, s.tax_total::float8 AS tax_total, s.total::float8 AS total,
             s.payment_method, s.payment_reference, s.cash_received::float8 AS cash_received, s.change_given::float8 AS change_given,
-            s.invoice_name, s.cufe, u.name AS cashier_name,
+            s.invoice_name, s.cufe, u.name AS cashier_name, s.warehouse_name,
             c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company, c.identification AS c_ident, c.id_type AS c_id_type,
             ${PAY_LINES_SQL} AS pay_lines
        FROM sales s
@@ -423,6 +425,7 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
         : [{ method: s.payment_method as LineMethod, amount: s.total, reference: s.payment_reference, cash_received: s.cash_received, change_given: s.change_given, credit_days: null, due_date: null }],
     invoice_name: s.invoice_name,
     cufe: s.cufe,
+    warehouse_name: s.warehouse_name,
   };
 }
 
