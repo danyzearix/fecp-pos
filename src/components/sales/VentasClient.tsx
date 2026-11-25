@@ -23,10 +23,13 @@ const RECEIPT_FILTERS: [ReceiptFilter, string][] = [
 
 export default function VentasClient({
   user,
+  requirePhoto,
   today,
   yesterday,
 }: {
   user: { name: string; role: Role };
+  /** REQUIRE_RECEIPT_PHOTO: false = la foto es opcional ("sin comprobante" es solo un dato) */
+  requirePhoto: boolean;
   today: string;
   yesterday: string;
 }) {
@@ -122,7 +125,7 @@ export default function VentasClient({
 
         {/* Filtro de comprobantes */}
         <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Filtrar por comprobante">
-          {RECEIPT_FILTERS.map(([id, name]) => (
+          {RECEIPT_FILTERS.filter(([id]) => requirePhoto || id !== "pendiente").map(([id, name]) => (
             <button
               key={id}
               onClick={() => setReceiptFilter(id)}
@@ -143,7 +146,7 @@ export default function VentasClient({
             return (
               <div
                 key={s.id}
-                className={`rounded-xl border p-3 space-y-2 ${s.status === "anulada" ? "opacity-60" : ""} ${missingRequiredReceipt(s) ? "bg-warn-soft border-warn-line" : "bg-surface border-line"}`}
+                className={`rounded-xl border p-3 space-y-2 ${s.status === "anulada" ? "opacity-60" : ""} ${missingRequiredReceipt(s, requirePhoto) ? "bg-warn-soft border-warn-line" : "bg-surface border-line"}`}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
@@ -164,7 +167,7 @@ export default function VentasClient({
                   </div>
                   <div className="text-xl font-bold text-fg">{formatCOP(s.total)}</div>
                 </div>
-                <ReceiptCell s={s} isAdmin={isAdmin} onChanged={() => load(true)} />
+                <ReceiptCell s={s} isAdmin={isAdmin} requirePhoto={requirePhoto} onChanged={() => load(true)} />
                 <div className="flex items-center gap-2 flex-wrap pt-1">
                   <button onClick={() => printTicket(s.id)} className="px-3 min-h-11 rounded-lg border border-field text-[14px] font-medium text-body">
                     Reimprimir
@@ -209,7 +212,7 @@ export default function VentasClient({
                 const canSeeError = isAdmin && !!s.last_error;
                 return (
                   <FragmentRow key={s.id}>
-                    <tr className={`${s.status === "anulada" ? "text-dim" : ""} ${missingRequiredReceipt(s) ? "bg-warn-soft" : ""}`}>
+                    <tr className={`${s.status === "anulada" ? "text-dim" : ""} ${missingRequiredReceipt(s, requirePhoto) ? "bg-warn-soft" : ""}`}>
                       <td className="px-3 py-2 whitespace-nowrap">{fmtTime.format(new Date(s.created_at))}</td>
                       <td className="px-3 py-2 whitespace-nowrap">{s.local_number}</td>
                       <td className="px-3 py-2 whitespace-nowrap font-medium">{s.invoice_name ?? "—"}</td>
@@ -222,7 +225,7 @@ export default function VentasClient({
                         <PaymentCell s={s} />
                       </td>
                       <td className="px-3 py-2">
-                        <ReceiptCell s={s} isAdmin={isAdmin} onChanged={() => load(true)} />
+                        <ReceiptCell s={s} isAdmin={isAdmin} requirePhoto={requirePhoto} onChanged={() => load(true)} />
                       </td>
                       <td className="px-3 py-2 whitespace-nowrap">{s.cashier_name}</td>
                       <td className="px-3 py-2 whitespace-nowrap">

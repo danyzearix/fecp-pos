@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReceiptCapture from "@/components/ReceiptCapture";
 import { receiptAllowed, receiptRequired } from "@/lib/receipt-rules";
-import { bogotaDay, validatePaymentLines, type PayLineIn } from "@/lib/payment-lines";
+import { bogotaDay, CREDIT_DAYS_DEFAULT, validatePaymentLines, type PayLineIn } from "@/lib/payment-lines";
 import { DEPTS, citiesOf, EMAIL_RE, nitDv } from "@/lib/client/customer-form";
 import { finePointer } from "@/lib/client/pointer";
 import { formatCOP } from "@/lib/money";
@@ -95,7 +95,9 @@ export default function CheckoutModal({ totals, config, epaycoReady, busy, onClo
     if (receiptUrl) URL.revokeObjectURL(receiptUrl);
   }, [receiptUrl]);
   const receiptOk = receiptAllowed(methods); // transferencia (obligatorio) o tarjeta (opcional)
-  const receiptMust = receiptRequired(methods); // basta UNA línea de transferencia
+  // La foto es OPCIONAL (REQUIRE_RECEIPT_PHOTO=false por defecto). Con true vuelve a ser obligatoria con transferencia.
+  const receiptMust = receiptRequired(methods, !!config.requireReceiptPhoto);
+  const creditDays = config.creditoPlazoDias ?? CREDIT_DAYS_DEFAULT; // plazo único del Crédito FECP
   // En táctil no se enfoca solo: el teclado en pantalla taparía el modal al abrirlo
   const [autoFocusFields] = useState(() => (typeof window === "undefined" ? false : finePointer()));
   const [online, setOnline] = useState(true);
@@ -268,7 +270,7 @@ export default function CheckoutModal({ totals, config, epaycoReady, busy, onClo
       // Crédito FECP: cédula o NIT REALES (no Consumidor final, ni pasaporte)
       if (hasCredit && (!identified || !["13", "22", "31"].includes(customerIdType))) return "El Crédito FECP exige un cliente identificado con cédula o NIT";
       // La misma validación que hace el servidor (src/lib/payment-lines.ts), con el total de esta venta
-      const v = validatePaymentLines(toPayLinesIn(lines, totals.total), totals.total, { saleDay, customerIdentified: identified });
+      const v = validatePaymentLines(toPayLinesIn(lines, totals.total, creditDays), totals.total, { saleDay, customerIdentified: identified, creditDays });
       if (!v.ok) return v.error;
       const unverified = lines.find((l) => (l.method === "tarjeta" || l.method === "transferencia") && !l.verified);
       if (unverified) return `Marca la casilla de ${paymentShortLabel(unverified.method)}: verificaste el pago en el datáfono o en la cuenta`;
@@ -284,7 +286,7 @@ export default function CheckoutModal({ totals, config, epaycoReady, busy, onClo
       checkoutType,
       customer: buildCustomer(),
       paymentMethod: isEpayco ? "epayco" : lines.length > 1 ? "mixto" : lines[0].method,
-      payments: isEpayco ? [] : toPayLinesIn(lines, totals.total),
+      payments: isEpayco ? [] : toPayLinesIn(lines, totals.total, creditDays),
       receipt: receiptOk && !isEpayco ? receipt : null,
     });
   }
@@ -653,9 +655,9 @@ export default function CheckoutModal({ totals, config, epaycoReady, busy, onClo
               </div>
 
               {/* Medios de pago: una línea por medio (máx. 4). El servidor valida todo otra vez. */}
-              <PaymentLines total={totals.total} lines={lines} setLines={setLines} epaycoReady={epaycoReady} saleDay={saleDay} autoFocus={autoFocusFields} />
+              <PaymentLines total={totals.total} lines={lines} setLines={setLines} epaycoReady={epaycoReady} saleDay={saleDay} creditDays={creditDays} autoFocus={autoFocusFields} />
 
-              {/* Comprobante (evidencia): obligatorio con transferencia, opcional con tarjeta. NO reemplaza referencia ni casilla. */}
+              {/* Comprobante (evidencia): OPCIONAL en transferencia y tarjeta (obligatorio solo con REQUIRE_RECEIPT_PHOTO=true). NO reemplaza referencia ni casilla. */}
               {receiptOk && !isEpayco && (
                 <div className={`rounded-lg border px-3 py-2.5 space-y-2 ${receiptMust && !receipt ? "border-warn-line bg-warn-soft" : "border-line bg-subtle"}`}>
                   <div className="text-[13px] font-semibold text-body">

@@ -304,6 +304,17 @@ node --env-file=.env.local db/prueba-kiosco-precio.mjs http://127.0.0.1:3000
 - [ ] **Reportes:** filtro «Bodega» y tabla «Por bodega de Siigo».
 - [ ] La caja con catálogo grande (~1.800 productos) busca por nombre, SKU y código de barras sin trabarse.
 
+## 12f. Comprobante opcional, crédito a 60 días y tirilla
+
+- [ ] **Caja → Transferencia** sin foto: con la referencia y la casilla «Verifiqué el pago…» se puede confirmar; dice «Comprobante (opcional)». Sin la casilla o sin referencia **no** deja confirmar. Con foto también se acepta. Igual con **Tarjeta**.
+- [ ] En **/ventas** esa venta dice «Sin comprobante» (gris, sin alerta, sin «Comprobante pendiente») y tiene «Adjuntar comprobante». En **Reportes** no aparece nada de comprobantes pendientes.
+- [ ] Con `REQUIRE_RECEIPT_PHOTO=true` (reinicia con `dc up -d`): la transferencia exige la foto y la venta sin ella queda «Comprobante pendiente»; la tarjeta sigue siendo opcional.
+- [ ] Venta hecha **sin conexión** con la versión anterior (formato viejo en la cola): al volver la conexión se envía y se factura.
+- [ ] **Crédito FECP** (cliente con cédula/NIT y datos completos): muestra «60 días · vence el …» y no hay botones 14/30/90; la tirilla dice «Crédito (vence AAAA-MM-DD)».
+- [ ] **Tirilla** (imprime o usa la vista previa a 80 mm): logo centrado, nombre en negrita **con tildes**, NIT/dirección/teléfono, «Factura electrónica de venta» + número, fechas, cliente con «C.C.:»/«NIT:» (con DV)/«C.E.:», vendedor, ítems con letra de impuesto y «nombre / código», tabla de impuestos con leyenda, totales, forma y métodos de pago, CUFE y QR, avisos legales con la autorización de la resolución. Nada se corta ni sale «null»/«undefined».
+- [ ] Casos: Consumidor final · C.C. · NIT con DV · cliente sin teléfono · IVA 0 % y 19 % en la misma venta · pago dividido · crédito · **provisional** sin conexión («Comprobante provisional - no es factura», sin CUFE/QR) · reimpresión desde /ventas.
+- [ ] Sin el archivo `public/logo-fecp.png` la tirilla se imprime igual, sin logo.
+
 ## 13. Antes de pasar a producción
 - [ ] `RESOLUCION_DIAN_*`, `NEGOCIO_*` y `POS_ADDRESS` completos.
 - [ ] FECP corrigió (o aceptó) los productos de `docs/productos-iva-diferente.csv`.

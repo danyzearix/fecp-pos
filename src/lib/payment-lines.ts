@@ -9,13 +9,14 @@
 //     Los demás medios llevan el monto exacto y no pueden superar lo que falta por cubrir.
 //  4. Tarjeta y Transferencia exigen referencia por línea.
 //  5. Pago electrónico (ePayco) solo puede ser el ÚNICO medio y se cobra por su propio flujo (no entra por aquí).
-//  6. Crédito FECP exige cliente identificado (cédula o NIT real, no Consumidor final) y un plazo de 14/30/60/90 días;
-//     due_date = fecha de la venta + plazo. El POS no lleva cupo ni abonos: eso queda en Siigo.
+//  6. Crédito FECP exige cliente identificado (cédula o NIT real, no Consumidor final) y el plazo ÚNICO autorizado por gerencia
+//     (60 días; variable CREDITO_PLAZO_DIAS, ver src/lib/config.ts); el servidor rechaza cualquier otro. due_date = fecha de la venta + plazo. El POS no lleva cupo ni abonos: eso queda en Siigo.
 import { round2 } from "./money";
 import { isCardMethod, isCreditMethod, paymentLabel, requiresReference, type LineMethod } from "./payments";
 
 export const MAX_PAY_LINES = 4;
-export const CREDIT_DAYS_OPTIONS = [14, 30, 60, 90] as const;
+/** Plazo único del Crédito FECP por defecto (días). El valor real sale de CREDITO_PLAZO_DIAS y llega por `ctx.creditDays` / PosConfig. */
+export const CREDIT_DAYS_DEFAULT = 60;
 /** Medios que una línea de la CAJA puede usar (el electrónico tiene su propio flujo; los históricos solo vienen en ventas viejas) */
 export const SPLIT_METHODS: LineMethod[] = ["efectivo", "tarjeta", "transferencia", "credito_fecp"];
 const ALL_LINE_METHODS: string[] = [...SPLIT_METHODS, "epayco", "tarjeta_debito", "tarjeta_credito"];
@@ -28,7 +29,7 @@ export type PayLineIn = {
   reference?: string | null;
   /** solo efectivo: lo que entregó el cliente (≥ amount). Vacío = exacto */
   cash_received?: number | null;
-  /** solo crédito: 14, 30, 60 o 90 */
+  /** solo crédito: el plazo único autorizado (60 días) */
   credit_days?: number | null;
 };
 
@@ -65,6 +66,8 @@ export type LinesContext = {
   saleDay: string;
   /** ¿la venta tiene un cliente identificado con cédula/NIT real (no Consumidor final)? */
   customerIdentified: boolean;
+  /** plazo único del Crédito FECP en días (por defecto 60) */
+  creditDays?: number;
 };
 
 /**
@@ -113,8 +116,9 @@ export function validatePaymentLines(input: PayLineIn[], total: number, ctx: Lin
     let due: string | null = null;
     if (isCreditMethod(l.method)) {
       days = typeof l.credit_days === "number" ? l.credit_days : NaN;
-      if (!CREDIT_DAYS_OPTIONS.includes(days as (typeof CREDIT_DAYS_OPTIONS)[number])) {
-        return { ok: false, error: `El crédito exige un plazo de ${CREDIT_DAYS_OPTIONS.join(", ")} días` };
+      const allowed = ctx.creditDays ?? CREDIT_DAYS_DEFAULT;
+      if (days !== allowed) {
+        return { ok: false, error: `El Crédito FECP solo admite un plazo de ${allowed} días` };
       }
       if (!ctx.customerIdentified) {
         return { ok: false, error: "El Crédito FECP exige un cliente identificado con cédula o NIT (no Consumidor final)" };

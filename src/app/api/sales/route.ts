@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { guardApi } from "@/lib/auth";
 import { writeLog } from "@/lib/log";
 import { resolveSaleWarehouse } from "@/lib/warehouse";
+import { requireReceiptPhoto } from "@/lib/config";
 import { createSale, isDateStr, isReceiptFilter, listSales, parseSale, todayBogota, yesterdayBogota } from "@/lib/sales";
 import { invoiceSale, sweepStuckInvoicing } from "@/lib/siigo/invoice";
 
@@ -63,7 +64,7 @@ export async function GET(req: Request) {
   const today = todayBogota();
   const date = isDateStr(param) && (isAdmin || param === today || param === yesterdayBogota()) ? param : today;
   const rf = new URL(req.url).searchParams.get("comprobante");
-  const rows = await listSales(date, isAdmin ? null : user.uid, isReceiptFilter(rf) ? rf : "todos");
+  const rows = await listSales(date, isAdmin ? null : user.uid, isReceiptFilter(rf) ? rf : "todos", { requirePhoto: requireReceiptPhoto() });
 
   const sales = isAdmin ? rows : rows.map((r) => ({ ...r, last_error: null }));
   return NextResponse.json({ date, role: user.role, sales }, { headers: { "Cache-Control": "no-store" } });

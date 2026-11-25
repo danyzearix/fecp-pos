@@ -339,7 +339,7 @@ export default function CajaClient({
           });
         }
         if (res.status === "invoiced") printTicket(sale.id);
-        else setLocalTicket(buildTicketFromSale(sale, user.name, warehouseRef.current?.name));
+        else setLocalTicket(buildTicketFromSale(sale, user.name, warehouseRef.current?.name, config.creditoPlazoDias));
       } else if (res.kind === "rejected") {
         markError(sale.id, res.error);
         beepError();
@@ -347,12 +347,12 @@ export default function CajaClient({
       } else {
         // Sin conexión / sesión vencida: queda en la cola y se envía sola después
         showToast(`Venta ${sale.local_number} guardada. Se enviará al volver la conexión.`, "ok");
-        setLocalTicket(buildTicketFromSale(sale, user.name, warehouseRef.current?.name));
+        setLocalTicket(buildTicketFromSale(sale, user.name, warehouseRef.current?.name, config.creditoPlazoDias));
       }
       setPending(pendingCount());
       setSaving(false);
     },
-    [cart, config.prefix, saving, showToast, totals.total, user.name]
+    [cart, config.prefix, config.creditoPlazoDias, saving, showToast, totals.total, user.name]
   );
 
   // Tirilla local: imprimir cuando se arma

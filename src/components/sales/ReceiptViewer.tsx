@@ -12,10 +12,10 @@ import type { SaleListRow } from "@/lib/sales";
 const fmtDate = (iso: string) => new Date(iso).toLocaleString("es-CO", { timeZone: "America/Bogota", dateStyle: "medium", timeStyle: "short" });
 const fmtDay = (iso: string) => new Date(iso).toLocaleDateString("es-CO", { timeZone: "America/Bogota", dateStyle: "long" });
 
-/** Transferencia sin foto (pendiente o de antes de exigirla): se resalta en el historial. */
+/** Transferencia sin foto: se resalta en el historial SOLO si la foto es obligatoria (REQUIRE_RECEIPT_PHOTO=true). Si no, "sin comprobante" es solo un dato. */
 // El comprobante depende de los medios de las LÍNEAS de pago: transferencia = obligatorio; tarjeta = opcional.
 const methodsOf = (s: SaleListRow) => s.payments.map((p) => p.method);
-export const missingRequiredReceipt = (s: SaleListRow) => receiptRequired(methodsOf(s)) && s.receipt_status !== "activo" && s.receipt_status !== "eliminado";
+export const missingRequiredReceipt = (s: SaleListRow, requirePhoto: boolean) => receiptRequired(methodsOf(s), requirePhoto) && s.receipt_status !== "activo" && s.receipt_status !== "eliminado";
 
 const IconReceipt = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -26,7 +26,7 @@ const IconReceipt = () => (
 );
 
 /** Celda/acción de comprobante de una venta en el historial. */
-export function ReceiptCell({ s, isAdmin, onChanged }: { s: SaleListRow; isAdmin: boolean; onChanged: () => void }) {
+export function ReceiptCell({ s, isAdmin, requirePhoto, onChanged }: { s: SaleListRow; isAdmin: boolean; requirePhoto: boolean; onChanged: () => void }) {
   const [view, setView] = useState(false);
   const [attach, setAttach] = useState(false);
   const [msg, setMsg] = useState("");
@@ -59,7 +59,11 @@ export function ReceiptCell({ s, isAdmin, onChanged }: { s: SaleListRow; isAdmin
         </button>
       ) : receiptAllowed(methodsOf(s)) ? (
         <>
-          {s.receipt_status === "pendiente" && <span className="px-2 py-0.5 rounded-full text-[12px] font-semibold bg-warn-soft text-warn-ink">Comprobante pendiente</span>}
+          {requirePhoto && s.receipt_status === "pendiente" ? (
+            <span className="px-2 py-0.5 rounded-full text-[12px] font-semibold bg-warn-soft text-warn-ink">Comprobante pendiente</span>
+          ) : (
+            <span className="text-[12px] text-dim" data-testid="sin-comprobante">Sin comprobante</span>
+          )}
           <button
             onClick={() => setAttach(true)}
             disabled={busy}

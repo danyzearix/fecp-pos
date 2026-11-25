@@ -41,7 +41,7 @@ export default function TicketPage({ saleId }: { saleId: string }) {
         config = JSON.parse(localStorage.getItem(POSCONFIG_KEY) ?? "null");
       } catch {}
       if (cancelled) return;
-      if (q && config) setLoaded({ data: buildTicketFromSale(q.sale, q.cashierName, q.warehouseName), config });
+      if (q && config) setLoaded({ data: buildTicketFromSale(q.sale, q.cashierName, q.warehouseName, config.creditoPlazoDias), config });
       else setError("No se encontró la venta.");
     })();
     return () => {
@@ -57,8 +57,18 @@ export default function TicketPage({ saleId }: { saleId: string }) {
       else window.close();
     };
     window.addEventListener("afterprint", done, { once: true });
-    const t = setTimeout(() => window.print(), 250);
+    // Se imprime cuando el logo y el QR ya cargaron (máximo 2 s de espera: sin logo se imprime igual)
+    let cancelled = false;
+    const started = Date.now();
+    const tick = () => {
+      if (cancelled) return;
+      const pending = [...document.images].some((i) => !i.complete);
+      if (!pending || Date.now() - started > 2000) window.print();
+      else setTimeout(tick, 100);
+    };
+    const t = setTimeout(tick, 250);
     return () => {
+      cancelled = true;
       clearTimeout(t);
       window.removeEventListener("afterprint", done);
     };

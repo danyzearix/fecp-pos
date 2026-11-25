@@ -64,7 +64,10 @@ Abre `.env.local` y completa los valores. **Nunca subas este archivo a un reposi
 | `POS_ADDRESS`, `POS_STATE_CODE`, `POS_CITY_CODE` | Dirección y códigos DANE del punto de venta (dirección por defecto cuando un cliente no tiene) |
 | `NEXT_PUBLIC_CAJA_PREFIX` | Prefijo del número de venta de esta caja (`C01` → `C01-000123`) |
 | `NEGOCIO_*` | Nombre, NIT, dirección y teléfono que salen en la tirilla |
-| `RESOLUCION_DIAN_*` | Número, fecha, rango y vigencia de la resolución de facturación (salen en la tirilla; Siigo no los entrega por API) |
+| `RESOLUCION_DIAN_*` | Número, fecha, rango y vigencia de la resolución de facturación (salen en la tirilla; Siigo no los entrega por API). `RESOLUCION_DIAN_RANGO`: se leen los dos últimos números como «desde» y «hasta» (ej. `1-50000`) |
+| `TICKET_REGIMEN`, `TICKET_ACTIVIDAD_ECONOMICA`, `TICKET_PROVEEDOR_SOFTWARE`, `TICKET_NOMBRE_SOFTWARE` | Opcionales: avisos legales al pie de la tirilla. Por defecto «Régimen Especial», «8559», «Siigo S.A.S - Nit: 830.048.145-8» y «Siigo Nube» |
+| `REQUIRE_RECEIPT_PHOTO` | `false` (por defecto) = la foto del comprobante es **opcional** con Transferencia y Tarjeta · `true` = vuelve a ser obligatoria con Transferencia (la referencia y la casilla de verificación son obligatorias siempre) |
+| `CREDITO_PLAZO_DIAS` | Plazo **único** del Crédito FECP en días (**60** por defecto, lo autorizó gerencia). El servidor rechaza cualquier otro |
 | `SOFTWARE_NOMBRE`, `SOFTWARE_FABRICANTE` | Pie de la factura |
 | `EPAYCO_PUBLIC_KEY`, `EPAYCO_PRIVATE_KEY` | Llaves de la API de ePayco (APIFY): crean el cobro |
 | `EPAYCO_P_CUST_ID_CLIENTE`, `EPAYCO_P_KEY` | Identifican al comercio y firman/verifican las transacciones |
@@ -392,7 +395,7 @@ Con **varios medios** (cobro dividido): si hay **una línea de Transferencia**, 
 3. **Efectivo** es el único que recibe más de lo aplicado: `cash_received` y `change_given` solo en esa línea. Los demás llevan el monto exacto y no pueden superar lo que falta por cubrir.
 4. **Tarjeta** y **Transferencia** exigen referencia por línea (y la casilla *“Verifiqué el pago…”*).
 5. **Pago electrónico** solo puede ser el **único** medio, por el total, y se cobra por su propio flujo (el kiosco no cambia).
-6. **Crédito FECP**: exige cliente identificado con **cédula o NIT real** (no Consumidor final ni pasaporte), **datos completos** (aunque la venta sea < 5 UVT) y un plazo de **14, 30, 60 o 90 días**; guarda `due_date` = fecha de la venta + plazo. **No hay cupo ni abonos:** el POS no lleva saldos, eso queda en Siigo.
+6. **Crédito FECP**: exige cliente identificado con **cédula o NIT real** (no Consumidor final ni pasaporte), **datos completos** (aunque la venta sea < 5 UVT) y el plazo **único de 60 días** (`CREDITO_PLAZO_DIAS`; la caja no deja elegir otro y el servidor rechaza cualquier otro); guarda `due_date` = fecha de la venta + plazo. **No hay cupo ni abonos:** el POS no lleva saldos, eso queda en Siigo.
 
 **En la caja:** el modal muestra siempre **“Falta por cubrir: $X”** y solo deja confirmar cuando es **0**. Empieza con una línea de efectivo que cubre el total; **“Dividir el pago”** agrega medios, y la línea automática se completa sola con lo que falta (el efectivo trae botones de billetes, *Exacto* y el cambio en grande).
 
@@ -502,6 +505,23 @@ El monto **ya no decide** el tipo de checkout. Siempre se identifica al cliente 
 3. Qué hacer con los productos **sin control de inventario** (199 en Siigo) y con **existencias negativas** (17): el POS no bloquea ventas por inventario.
 4. Los **servicios** (31 en Siigo: IBP Virtual, etc.) quedan fuera del catálogo por defecto; si se incluyen, se venden sin existencias.
 5. Los **55 productos con IVA distinto** entre WooCommerce y Siigo siguen usando el IVA de Siigo al facturar (regla de siempre) y las cifras de WooCommerce en pantalla.
+
+## 11h. Comprobante opcional, crédito a 60 días y tirilla estilo Siigo POS
+
+### Foto del comprobante opcional
+- Con **Transferencia** y **Tarjeta (datáfono)** la foto del comprobante es **opcional**, en la caja y en el servidor: el cliente valida las transacciones con su propio método interno. La **referencia** y la casilla *«Verifiqué el pago…»* siguen siendo **obligatorias** (sirven para conciliar). Con Efectivo, Crédito FECP y ePayco no cambia nada.
+- `REQUIRE_RECEIPT_PHOTO=true` en `.env.production` vuelve a **exigir** la foto con Transferencia (la venta queda «Comprobante pendiente» hasta adjuntarla). La foto de la Tarjeta siempre fue opcional.
+- Una venta sin foto **no** es error ni «pendiente»: en `/ventas` aparece **«Sin comprobante»** como dato (y se puede adjuntar después); el filtro «Comprobante pendiente» solo existe si la foto es obligatoria; en Reportes no aparece. Las filas «pendiente» viejas se muestran como «Sin comprobante». Las ventas en cola sin conexión con el formato anterior se siguen aceptando.
+
+### Crédito FECP: un solo plazo
+Gerencia autorizó **60 días**. La caja muestra «60 días · vence el …» (sin botones 14/30/90) y el servidor responde 400 («El Crédito FECP solo admite un plazo de 60 días») a cualquier otro. El valor está en `CREDITO_PLAZO_DIAS`. `SIIGO_PAYMENT_CREDITO_ID` no cambia. Las ventas ya hechas con otros plazos conservan el suyo; una venta en cola sin conexión con 14/30/90 días se rechaza al enviarse.
+
+### Tirilla de 80 mm (modelo Siigo POS)
+Orden: **logo** (`public/logo-fecp.png`, blanco y negro, ~30 mm; si el archivo no existe se imprime sin logo) · nombre en negrita (`NEGOCIO_NOMBRE`, en mayúsculas) · NIT con DV, dirección, ciudad y teléfono (`NEGOCIO_*`) · «Factura electrónica de venta», «No. <prefijo>-<número>» (lo que devuelve Siigo), fecha de generación y de expedición · cliente (nombre, **tipo y número de documento** con su etiqueta —«C.C.:», «NIT:» con DV, «C.E.:», «Pasaporte:»… según el tipo real—, dirección, teléfono) y **vendedor** (el cajero) · ítems con `Ít., Cant., Vr. Unit, Valor, ID` y debajo «nombre / código» · tabla de impuestos (`ID, %, Base, Impuesto`, letras A, B… según las tarifas de la venta, con su leyenda) · totales (Total ítems, Total bruto, Descuentos, Subtotal, IVA por tarifa, **Total a pagar**) · forma de pago (**Contado** o **Crédito (vence AAAA-MM-DD)**) y un renglón por método con su valor (más Recibido/Cambio en efectivo) · bodega, discreta · CUFE completo y QR de la DIAN · avisos legales (régimen y actividad, letra de cambio Ley 1231/2008, **número de autorización** con `RESOLUCION_DIAN_*`, fabricante del software de Siigo).
+- Consumidor final: «Cliente: Consumidor final» y «Documento: 222222222222». Los campos vacíos (teléfono, dirección) se omiten.
+- **Provisional** (sin conexión o antes de facturar): mismo diseño con «Comprobante provisional - no es factura»; sin número de factura, CUFE, QR ni avisos de la factura.
+- El mismo componente se usa en la reimpresión de `/ventas`, la caja y el kiosco. En pantalla es un papel blanco con texto negro (también en modo oscuro) y se imprime siempre en blanco y negro.
+- Los textos legales fijos están en `src/config/ticket-text.ts`; los demás datos vienen de variables o de Siigo. **El nombre del encabezado sale de `NEGOCIO_NOMBRE`: si en el `.env` está mal escrito («FUNDADACION EDUCACION…»), así sale en la tirilla.**
 
 ## 12. Comandos útiles
 

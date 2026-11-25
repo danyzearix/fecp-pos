@@ -7,6 +7,7 @@ import { getPosConfig } from "./config";
 import { itemToLine } from "./ticket";
 import { resolveSaleCustomer } from "./customer-resolve";
 import { receiptRequired, type ReceiptStatus } from "./receipt-rules";
+import { creditoPlazoDias, requireReceiptPhoto } from "./config";
 import { checkPrices } from "./price-check";
 import { bogotaDay, joinedReference, MAX_PAY_LINES, methodsOf, saleMethodOf, validatePaymentLines, type PayLine, type PayLineIn } from "./payment-lines";
 import {
@@ -167,6 +168,7 @@ export function parseSale(body: unknown): ParsedSale | string {
   const v = validatePaymentLines(linesIn, total, {
     saleDay: bogotaDay(createdIso),
     customerIdentified: !!customer && customer.identification !== CONSUMIDOR_FINAL_ID,
+    creditDays: creditoPlazoDias(), // plazo ÚNICO del Crédito FECP: cualquier otro se rechaza
   });
   if (!v.ok) return v.error;
 
@@ -231,7 +233,7 @@ export async function createSale(sale: ParsedSale, cashierId: number, wh: { id: 
   const recheck = validatePaymentLines(
     sale.lines.map((l) => ({ method: l.method, amount: l.amount, reference: l.reference, cash_received: l.cash_received, credit_days: l.credit_days })),
     totals.total,
-    { saleDay: bogotaDay(sale.created_at_device), customerIdentified: !!sale.customer && sale.customer.identification !== CONSUMIDOR_FINAL_ID }
+    { saleDay: bogotaDay(sale.created_at_device), customerIdentified: !!sale.customer && sale.customer.identification !== CONSUMIDOR_FINAL_ID, creditDays: creditoPlazoDias() }
   );
   if (!recheck.ok) return { ok: false, error: recheck.error };
   const payLines = recheck.lines;
@@ -295,7 +297,8 @@ export async function createSale(sale: ParsedSale, cashierId: number, wh: { id: 
     }
     // Si hay una línea de Transferencia, el comprobante es obligatorio. La foto se sube DESPUÉS de que la venta exista (puede
     // venir de la cola sin conexión); mientras no llegue, la venta queda con "Comprobante pendiente".
-    if (inserted && receiptRequired(methodsOf(payLines))) {
+    // (con REQUIRE_RECEIPT_PHOTO=false —lo normal— una venta sin foto NO queda "pendiente": simplemente no tiene comprobante)
+    if (inserted && receiptRequired(methodsOf(payLines), requireReceiptPhoto())) {
       await client.query("INSERT INTO sale_receipts (sale_id, status) VALUES ($1, 'pendiente') ON CONFLICT (sale_id) DO NOTHING", [sale.id]);
     }
     if (inserted) {
@@ -355,7 +358,7 @@ type SaleRow = {
   id: string; local_number: string; status: string; created_at: Date; created_at_device: Date | null;
   subtotal: number; tax_total: number; total: number; payment_method: string; payment_reference: string | null;
   cash_received: number | null; change_given: number | null; invoice_name: string | null; cufe: string | null;
-  cashier_name: string; warehouse_name: string | null; c_first: string | null; c_last: string | null; c_company: string | null; c_ident: string | null; c_id_type: string | null;
+  cashier_name: string; warehouse_name: string | null; c_check: string | null; c_address: string | null; c_phone: string | null; inv_date: string | null; inv_created: string | null; c_first: string | null; c_last: string | null; c_company: string | null; c_ident: string | null; c_id_type: string | null;
   pay_lines: PayLine[] | null;
 };
 
@@ -365,6 +368,8 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
             s.subtotal::float8 AS subtotal, s.tax_total::float8 AS tax_total, s.total::float8 AS total,
             s.payment_method, s.payment_reference, s.cash_received::float8 AS cash_received, s.change_given::float8 AS change_given,
             s.invoice_name, s.cufe, u.name AS cashier_name, s.warehouse_name,
+            s.raw_response->>'date' AS inv_date, s.raw_response->'metadata'->>'created' AS inv_created,
+            c.check_digit AS c_check, c.address AS c_address, c.phone AS c_phone,
             c.first_name AS c_first, c.last_name AS c_last, c.company_name AS c_company, c.identification AS c_ident, c.id_type AS c_id_type,
             ${PAY_LINES_SQL} AS pay_lines
        FROM sales s
@@ -377,9 +382,9 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
   if (!s) return null;
 
   const items = await query<{
-    name: string; quantity: number; unit_price: number; line_total: number; tax_rate: number; prices_include_tax: boolean;
+    name: string; sku: string | null; quantity: number; unit_price: number; line_total: number; tax_rate: number; prices_include_tax: boolean;
   }>(
-    `SELECT name, quantity::float8 AS quantity, unit_price::float8 AS unit_price, line_total::float8 AS line_total,
+    `SELECT name, sku, quantity::float8 AS quantity, unit_price::float8 AS unit_price, line_total::float8 AS line_total,
             tax_rate, prices_include_tax
        FROM sale_items WHERE sale_id = $1 ORDER BY id`,
     [id]
@@ -407,8 +412,13 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
     customer_name: isCF ? "Consumidor final" : s.c_company || [s.c_first, s.c_last].filter(Boolean).join(" ") || s.c_ident!,
     customer_id_type: ID_TYPE_LABELS[isCF ? "13" : (s.c_id_type ?? "13")] ?? s.c_id_type ?? "",
     customer_identification: isCF ? CONSUMIDOR_FINAL_ID : s.c_ident!,
+    customer_id_code: isCF ? "13" : (s.c_id_type ?? "13"),
+    customer_check_digit: isCF ? null : s.c_check || null,
+    customer_address: isCF ? null : s.c_address || null,
+    customer_phone: isCF ? null : s.c_phone || null,
     items: items.rows.map((i) => ({
-      name: i.name, quantity: i.quantity, unit_price: i.unit_price, line_total: i.line_total, tax_rate: i.tax_rate,
+      name: i.name,
+      code: i.sku, quantity: i.quantity, unit_price: i.unit_price, line_total: i.line_total, tax_rate: i.tax_rate,
     })),
     subtotal: s.subtotal,
     tax_total: s.tax_total,
@@ -426,6 +436,8 @@ export async function getTicketData(id: string): Promise<TicketData | null> {
     invoice_name: s.invoice_name,
     cufe: s.cufe,
     warehouse_name: s.warehouse_name,
+    invoice_date: s.inv_date,
+    invoice_created: s.inv_created,
   };
 }
 
@@ -473,13 +485,14 @@ export type SaleListRow = {
 export type ReceiptFilter = "todos" | "con" | "sin" | "pendiente";
 export const isReceiptFilter = (v: unknown): v is ReceiptFilter => v === "todos" || v === "con" || v === "sin" || v === "pendiente";
 
-export async function listSales(date: string, cashierId: number | null, receipt: ReceiptFilter = "todos"): Promise<SaleListRow[]> {
+export async function listSales(date: string, cashierId: number | null, receipt: ReceiptFilter = "todos", opts: { requirePhoto?: boolean } = {}): Promise<SaleListRow[]> {
   // "Con comprobante" = tiene foto (o la tuvo y se eliminó por retención); "Pendiente" = transferencia aún sin foto;
   // "Sin comprobante" = nunca tuvo (ni pendiente).
   const rf =
     receipt === "con" ? "AND r.status IN ('activo','eliminado')" :
-    receipt === "pendiente" ? "AND r.status = 'pendiente'" :
-    receipt === "sin" ? "AND r.sale_id IS NULL" : "";
+    receipt === "pendiente" ? (opts.requirePhoto ? "AND r.status = 'pendiente'" : "AND FALSE") : // con la foto opcional no existe "pendiente"
+    
+    receipt === "sin" ? (opts.requirePhoto ? "AND r.sale_id IS NULL" : "AND (r.sale_id IS NULL OR r.status = 'pendiente')") : "";
   const { rows } = await query<
     Omit<SaleListRow, "receipt_uploaded_at" | "receipt_deleted_at" | "payments" | "price_review_status"> & {
       price_review_status: SaleListRow["price_review_status"];

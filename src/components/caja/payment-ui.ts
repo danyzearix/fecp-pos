@@ -1,7 +1,7 @@
 // Estado y cálculos (puros) de las líneas de pago del modal de cobro. La VALIDACIÓN real vive en src/lib/payment-lines.ts
 // (la misma que usa el servidor); aquí solo se arma lo que la pantalla necesita.
 import { round2 } from "@/lib/money";
-import type { PayLineIn } from "@/lib/payment-lines";
+import { CREDIT_DAYS_DEFAULT, type PayLineIn } from "@/lib/payment-lines";
 import type { LineMethod } from "@/lib/payments";
 
 /**
@@ -17,7 +17,7 @@ export type LineUi = {
   verified: boolean;
   /** efectivo: lo que entregó el cliente (texto de dígitos). Vacío = exacto */
   cashStr: string;
-  /** crédito: 14 | 30 | 60 | 90 */
+  /** crédito: (ya no se elige) el plazo único se pone al armar la venta */
   days: number | null;
 };
 
@@ -38,14 +38,14 @@ export const missingOf = (lines: LineUi[], total: number) => round2(total - reso
 export const parseDigits = (s: string) => Number(s.replace(/\D/g, "")) || 0;
 
 /** Lo que se manda al servidor (que lo vuelve a validar todo) */
-export function toPayLinesIn(lines: LineUi[], total: number): PayLineIn[] {
+export function toPayLinesIn(lines: LineUi[], total: number, creditDays: number = CREDIT_DAYS_DEFAULT): PayLineIn[] {
   const amounts = resolveAmounts(lines, total);
   return lines.map((l, i) => ({
     method: l.method,
     amount: amounts[i],
     reference: l.reference.trim() || null,
     cash_received: l.method === "efectivo" && l.cashStr ? parseDigits(l.cashStr) : null,
-    credit_days: l.method === "credito_fecp" ? l.days : null,
+    credit_days: l.method === "credito_fecp" ? creditDays : null, // un solo plazo autorizado: no se elige
   }));
 }
 

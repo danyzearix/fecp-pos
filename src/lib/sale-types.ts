@@ -37,6 +37,12 @@ export const ID_TYPE_LABELS: Record<string, string> = {
   "91": "NUIP",
 };
 
+/** Etiqueta CORTA del tipo de documento para la tirilla ("C.C.:", "NIT:"…). Según la tabla de tipos de la DIAN que ya usa el POS (ID_TYPE_LABELS). */
+export const ID_TYPE_TICKET_LABEL: Record<string, string> = {
+  "11": "R.C.:", "12": "T.I.:", "13": "C.C.:", "21": "T.E.:", "22": "C.E.:", "31": "NIT:", "41": "Pasaporte:",
+  "42": "Doc. extranjero:", "43": "Sin ident. exterior:", "47": "PEP:", "48": "PPT:", "50": "NIT otro país:", "91": "NUIP:",
+};
+
 export type CustomerIn = {
   /** solo del navegador (tirilla provisional sin conexión): el servidor lo ignora */
   display_name?: string;
@@ -101,6 +107,12 @@ export type PosConfig = {
   software: { nombre: string; fabricante: string };
   /** Resolución DIAN de facturación (Siigo no la entrega por API: viene del .env) */
   resolucion: { numero: string; fecha: string; rango: string; vigencia: string };
+  /** Avisos legales y datos fijos de la tirilla (variables TICKET_*; ver src/lib/config.ts). Opcional: una configuración vieja guardada en el equipo no los trae. */
+  tirilla?: { regimen: string; actividad: string; proveedorSoftware: string; nombreSoftware: string };
+  /** REQUIRE_RECEIPT_PHOTO: false (por defecto) = la foto del comprobante es OPCIONAL en Transferencia y Tarjeta */
+  requireReceiptPhoto?: boolean;
+  /** CREDITO_PLAZO_DIAS: único plazo del Crédito FECP (60 por defecto) */
+  creditoPlazoDias?: number;
 };
 
 /** Todo lo necesario para dibujar una tirilla */
@@ -114,7 +126,13 @@ export type TicketData = {
   /** nombre del tipo de documento ("Cédula de ciudadanía", "NIT"…): va en su propia línea de la tirilla, antes del número */
   customer_id_type: string;
   customer_identification: string;
-  items: { name: string; quantity: number; unit_price: number; line_total: number; tax_rate: number }[];
+  /** código DIAN del tipo de documento ("13", "31"…): la tirilla muestra "C.C.:", "NIT:"… */
+  customer_id_code?: string;
+  /** dígito de verificación (NIT) */
+  customer_check_digit?: string | null;
+  customer_address?: string | null;
+  customer_phone?: string | null;
+  items: { name: string; /** código (SKU) del producto */ code?: string | null; quantity: number; unit_price: number; line_total: number; tax_rate: number }[];
   subtotal: number;
   tax_total: number;
   total: number;
@@ -130,6 +148,9 @@ export type TicketData = {
   cufe: string | null;
   /** bodega de Siigo con la que se vendió (si la hay) */
   warehouse_name?: string | null;
+  /** fecha de la factura que devuelve Siigo (YYYY-MM-DD) y cuándo la creó (ISO); solo en facturas ya emitidas */
+  invoice_date?: string | null;
+  invoice_created?: string | null;
 };
 
 export type { PaymentMethod as SalePaymentMethod };

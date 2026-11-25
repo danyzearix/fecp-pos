@@ -2,7 +2,7 @@
 
 // Cobro DIVIDIDO: medios de pago de la venta. Una línea por medio (máx. 4). La caja muestra siempre "Falta por cubrir".
 // Esta pantalla solo ayuda al cajero: el SERVIDOR vuelve a validar todo (src/lib/payment-lines.ts) con su propio total.
-import { addDays, CREDIT_DAYS_OPTIONS, MAX_PAY_LINES } from "@/lib/payment-lines";
+import { addDays, CREDIT_DAYS_DEFAULT, MAX_PAY_LINES } from "@/lib/payment-lines";
 import { PAYMENT_METHODS, paymentShortLabel, type LineMethod } from "@/lib/payments";
 import { round2 } from "@/lib/money";
 import { formatMoney, missingOf, newLine, parseDigits, resolveAmounts, type LineUi } from "./payment-ui";
@@ -25,6 +25,7 @@ export default function PaymentLines({
   setLines,
   epaycoReady,
   saleDay,
+  creditDays = CREDIT_DAYS_DEFAULT,
   autoFocus,
 }: {
   total: number;
@@ -33,6 +34,8 @@ export default function PaymentLines({
   epaycoReady: boolean;
   /** hoy (Bogotá): para mostrar el vencimiento del crédito */
   saleDay: string;
+  /** plazo único del Crédito FECP (CREDITO_PLAZO_DIAS; 60 por defecto) */
+  creditDays?: number;
   autoFocus: boolean;
 }) {
   const amounts = resolveAmounts(lines, total);
@@ -244,26 +247,10 @@ export default function PaymentLines({
             {l.method === "credito_fecp" && (
               <div className="space-y-2">
                 <div className={labelCls}>Plazo</div>
-                <div className="grid grid-cols-4 gap-2" role="group" aria-label="Plazo del crédito">
-                  {CREDIT_DAYS_OPTIONS.map((d) => (
-                    <button
-                      key={d}
-                      type="button"
-                      onClick={() => patch(l.key, { days: d })}
-                      aria-pressed={l.days === d}
-                      className={`min-h-12 rounded-lg border text-[15px] font-semibold ${l.days === d ? "bg-brand border-brand text-white" : "bg-surface border-field text-body hover:bg-hover"}`}
-                    >
-                      {d} días
-                    </button>
-                  ))}
-                </div>
-                {l.days ? (
-                  <p className="text-[14px] text-fg">
-                    Vence el <b>{dueText(addDays(saleDay, l.days))}</b>
-                  </p>
-                ) : (
-                  <p className="text-[13px] text-warn-ink">Elige el plazo del crédito.</p>
-                )}
+                {/* Gerencia autorizó UN solo plazo: no se elige (el servidor rechaza cualquier otro) */}
+                <p className="text-[15px] text-fg" data-testid="credit-term">
+                  <b>{creditDays} días</b> · vence el <b>{dueText(addDays(saleDay, creditDays))}</b>
+                </p>
                 <p className="text-[12px] text-dim">
                   El POS no lleva cupo ni abonos: el saldo se maneja en Siigo. Exige un cliente identificado con cédula o NIT y sus datos completos.
                 </p>
